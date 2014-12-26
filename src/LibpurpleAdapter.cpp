@@ -967,7 +967,7 @@ static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 	/*
 	 * cancel the connect timeout for this account
 	 */
-	guint timerHandle = (guint)g_hash_table_lookup(s_accountLoginTimers, accountKey);
+	guint timerHandle = GPOINTER_TO_UINT(g_hash_table_lookup(s_accountLoginTimers, accountKey));
 
 	purple_timeout_remove(timerHandle);
 	g_hash_table_remove(s_accountLoginTimers, accountKey);
@@ -1107,7 +1107,7 @@ static void account_login_failed_cb(PurpleConnection* gc, PurpleConnectionError 
 		/*
 		 * cancel the connect timeout for this account
 		 */
-		guint timerHandle = (guint)g_hash_table_lookup(s_accountLoginTimers, accountKey);
+		guint timerHandle = GPOINTER_TO_UINT(g_hash_table_lookup(s_accountLoginTimers, accountKey));
 		purple_timeout_remove(timerHandle);
 		g_hash_table_remove(s_accountLoginTimers, accountKey);
 
@@ -1649,7 +1649,7 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams* params, Login
 		 * Create a timer for this account's login so it can fail the login after a timeout.
 		 */
 		guint timerHandle = purple_timeout_add_seconds(CONNECT_TIMEOUT_SECONDS, connectTimeoutCallback, accountKey);
-		g_hash_table_insert(s_accountLoginTimers, accountKey, (gpointer)timerHandle);
+		g_hash_table_insert(s_accountLoginTimers, accountKey, GUINT_TO_POINTER(timerHandle));
 
 		PurpleStatusPrimitive prim = getPurpleAvailabilityFromPalmAvailability(params->availability);
 		PurpleSavedStatus* savedStatus = purple_savedstatus_new(NULL, prim);
