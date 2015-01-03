@@ -25,9 +25,7 @@
 
 #include "IMMessage.h"
 #include "IMServiceHandler.h"
-#if 0
 #include "sanitize.h"
-#endif
 
 const char* IMMessage::statusStrings[] = {
 	"successful",
@@ -81,7 +79,6 @@ MojErr IMMessage::initFromCallback(const char* serviceName, const char* username
 	//    unsanitized: <a>foo</a>
 	//    removed: foo
 
-#if 0
 	// first unescape since gtalk sends everything escaped
 	// message is const char* - need a char* version
 	char *unescapedMessage = unsanitizeHtml((char*)message);
@@ -93,22 +90,15 @@ MojErr IMMessage::initFromCallback(const char* serviceName, const char* username
 	//          last element must be a null. You need to include both beginning and ending
 	//          tag if you want both removed (i.e. "b", "/b", "i", "/i")
 	char *sanitizedMessage = sanitizeHtml(unescapedMessage, (char**)IMMessage::trustedTags, true);
-#endif
 
 	// can't keep this log...
 	//MojLogInfo(IMServiceApp::s_log, _T("original message: %s, unescaped message: %s, sanitized message: %s"), message, unescapedMessage, sanitizedMessage);
 
-#if 0
 	err = msgText.assign(sanitizedMessage);
-#else
-	err = msgText.assign(message);
-#endif
 	MojErrCheck(err);
-#if 0
 	// cleanup
 	free(unescapedMessage);
 	free(sanitizedMessage);
-#endif
 
 	// remove blanks and convert to lowercase
 	// for AOL, this is screen name with no "@aol.com"...

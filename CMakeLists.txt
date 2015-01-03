@@ -47,6 +47,8 @@ file(GLOB SOURCES
     src/IMServiceApp.cpp
     src/ConnectionStateHandler.cpp
     src/IMMessage.cpp
+    src/sanitize.cpp
+    src/entities.cpp
     src/SendOneCommandHandler.cpp
     src/OutgoingIMCommandHandler.cpp
     src/IncomingIMHandler.cpp)
@@ -57,7 +59,7 @@ add_executable(imlibpurpleservice ${SOURCES})
 target_link_libraries(imlibpurpleservice
     ${GLIB2_LDFLAGS} ${LUNASERVICE2_LDFLAGS}
     ${GIO2_LDFLAGS} ${GIO-UNIX_LDFLAGS}
-    ${MOJODB_LDFLAGS} ${PURPLE_LDFLAGS} rt pthread)
+    ${MOJODB_LDFLAGS} ${PURPLE_LDFLAGS} tidy rt pthread)
 
 webos_build_daemon()
 webos_build_system_bus_files()
