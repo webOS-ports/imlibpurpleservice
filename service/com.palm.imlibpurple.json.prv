@@ -1,6 +1,6 @@
 {
 	"role": {
-		"exeName":"/usr/bin/imlibpurpletransport",
+		"exeName":"/usr/sbin/imlibpurpletransport",
 		"type":"regular",
 		"allowedNames":["com.palm.imlibpurple"]
 	},
@@ -10,6 +10,7 @@
 			"com.palm.imlibpurple",
 			"com.palm.activitymanager",
 			"com.palm.app.messaging",
+			"org.webosports.app.messaging",			
 			"com.palm.service.accounts"
 		],
 		"outbound": [
