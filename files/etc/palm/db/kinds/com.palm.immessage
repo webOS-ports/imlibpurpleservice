@@ -1,0 +1,13 @@
+{
+    "extends": [
+        "com.palm.message:1"
+    ],
+    "id": "com.palm.immessage:1",
+    "owner": "com.palm.app.messaging",
+    "indexes": [
+        {
+            "name": "byrevision",
+            "props": [{"name":"_rev"}]
+        }
+    ]
+}

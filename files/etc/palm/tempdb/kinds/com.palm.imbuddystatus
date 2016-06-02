@@ -1,0 +1,40 @@
+{
+    "id": "com.palm.imbuddystatus:1",
+    "owner": "com.palm.app.messaging",
+    "indexes": [
+        {
+            "name": "buddyexist",
+            "props": [{"name": "accountId"},{"name": "username"}]
+        },
+        {
+            "name": "byusername",
+            "props": [{"name": "username"},{"name": "serviceName"}]
+        },
+        {
+            "name": "availabilityRevSet",
+            "props": [{"name": "availabilityRevSet"}]
+        },
+        {
+            "name": "byperson",
+            "props": [{"name": "personId","default": null}]
+        },
+        {
+            "name": "bydisplayname",
+            "props": [{"name": "displayName","default": ""}]
+        },
+        {
+            "name": "bygroupavailability",
+            "props": [{"name": "primary","default": false},{"name": "offline","default": false},{"name": "groupAvailability","default": null, "collate":"secondary"},{"name": "displayName","default": "", "collate":"secondary"}]
+        },
+        {
+            "name": "fortypedownsearch",
+            "props": [{"name": "primary","default": false},{"name": "offline","default": false},{"name": "displayName", "collate":"primary", "tokenize":"all"}]
+        }
+    ],
+    "revSets": [
+        {
+            "name": "availabilityRevSet",
+            "props": [{"name": "availability"}]
+        }
+    ]
+}

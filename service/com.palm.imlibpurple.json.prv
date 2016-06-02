@@ -1,6 +1,6 @@
 {
 	"role": {
-		"exeName":"/usr/sbin/imlibpurpletransport",
+		"exeName":"/usr/sbin/imlibpurpleservice",
 		"type":"regular",
 		"allowedNames":["com.palm.imlibpurple"]
 	},

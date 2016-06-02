@@ -1,0 +1,31 @@
+{
+    "extends": ["com.palm.message:1"],
+    "id": "com.palm.iminvitation:1",
+    "owner": "com.palm.app.messaging",
+    "indexes": [
+        {
+            "name": "byrevision",
+            "props": [{"name": "_rev"}]
+        },
+        {
+            "name": "bycommandId",
+            "props": [{"name": "commandId"}]
+        },
+        {
+            "name": "bychat",
+            "props": [{"name": "conversations","default": null}]
+        },
+        {
+            "name": "byreadRevSet",
+            "props": [{"name": "readRevSet"}]
+        },
+        {
+            "name": "bynewincoming",
+            "props": [{"name": "folder"}, {"name": "_rev"}]
+        },
+        {
+            "name": "byaccountId",
+            "props": [{"name": "accountId"}]
+        }
+    ] 
+}

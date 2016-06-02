@@ -1,0 +1,41 @@
+{
+    "id": "com.palm.imgroupchat:1",
+    "owner": "com.palm.app.messaging",
+    "indexes": [
+        {
+            "name": "chatThreadRevision",
+            "props": [{"name": "chatthreadRevSet"}]
+        },
+        {
+            "name": "displayNameRevision",
+            "props": [{"name": "displayNameRevSet"}]
+        },
+        {
+            "name": "locked",
+            "props": [{"name": "lockedRevSet"}]
+        },
+        {
+            "name": "bygroupname",
+            "props": [{"name": "groupName"}]
+        },
+        {
+            "name": "deleted",
+            "incDel":true,
+            "props": [{"name": "_del"},{"name": "_rev"}]
+        }
+    ],
+    "revSets": [
+        {
+            "name": "chatthreadRevSet",
+            "props": [{"name": "chatThreadId"}]
+        },
+        {
+            "name": "displayNameRevSet",
+            "props": [{"name": "displayName"}]
+        },
+        {
+            "name": "lockedRevSet",
+            "props": [{"name": "flags.locked"}]
+        }
+    ]
+}

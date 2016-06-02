@@ -1,0 +1,18 @@
+{
+    "id": "com.palm.imcommand:1",
+    "owner": "com.palm.app.messaging",
+    "indexes": [
+        {
+            "name": "byrevision",
+            "props": [{"name": "_rev"}]
+        },
+        {
+            "name": "buddyquery",
+            "props": [{"name": "command"},{"name": "fromUsername"},{"name": "serviceName"},{"name": "handler"},{"name": "targetUsername"}]
+        },
+        {
+            "name": "commandhandlerrev",
+            "props": [{"name": "command"},{"name": "handler"},{"name": "_rev"}]
+        }
+    ]
+}

@@ -1,0 +1,15 @@
+{
+    "id": "com.palm.imloginstate:1",
+    "owner": "com.palm.app.messaging",
+    "sync": true,
+    "indexes": [
+        {
+            "name": "bystate",
+            "props": [{"name": "state"}]
+        },
+        {
+            "name": "byrevision",
+            "props": [{"name": "_rev"}]
+        }
+    ]
+}
