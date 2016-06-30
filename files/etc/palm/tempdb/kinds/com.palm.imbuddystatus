@@ -1,6 +1,6 @@
 {
     "id": "com.palm.imbuddystatus:1",
-    "owner": "com.palm.app.messaging",
+    "owner": "org.webosports.app.messaging",
     "indexes": [
         {
             "name": "buddyexist",
