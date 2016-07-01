@@ -26,6 +26,25 @@
             "update": "allow"
         }
     },
+	{
+        "type": "db.kind",
+        "object": "com.palm.immessage:1",
+        "caller": "org.webosports.*",
+        "operations": {
+            "extend": "allow",
+            "read": "allow"
+        }
+    },
+    {
+        "type": "db.kind",
+        "object": "com.palm.immessage:1",
+        "caller": "org.webosports.app.messaging",
+        "operations": {
+            "delete": "allow",
+            "read": "allow",
+            "update": "allow"
+        }
+    },
     {
         "type": "db.kind",
         "object": "com.palm.immessage:1",

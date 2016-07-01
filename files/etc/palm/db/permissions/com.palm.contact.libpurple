@@ -7,5 +7,14 @@
             "read": "allow",
             "update": "allow"
         }
+	},
+	{
+		"type":"db.kind",
+		"object":"com.palm.contact.libpurple:1",
+        "caller": "org.webosports.*",
+        "operations": {
+            "read": "allow",
+            "update": "allow"
+        }
 	}
 ]
