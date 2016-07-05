@@ -21,7 +21,7 @@
 					"from": "com.palm.imcommand.libpurple:1",
 					"where": [
 						{"op":"=","prop":"handler","val":"transport"},
-						{"op":"=","prop":"status","val":"pending"},
+						{"op":"=","prop":"status","val":"pending"}
 						]
 				}
 			}
