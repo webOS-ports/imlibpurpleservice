@@ -74,7 +74,7 @@ MojErr OnEnabledHandler::start(const MojObject& payload)
 		MojLogError(IMServiceApp::s_log, _T("OnEnabledHandler enabled missing, assuming 'false'"));
 		m_enable = false;
 	}
-	
+
 	err = payload.getRequired(_T("capabilityProviderId"), m_capabilityProviderId);
 	if (err != MojErrNone) {
 		MojLogError(IMServiceApp::s_log, _T("OnEnabledHandler capabilityProviderId missing so bailing. error %d"), err);
@@ -128,7 +128,7 @@ MojErr  OnEnabledHandler::getAccountInfoResult(MojObject& payload, MojErr result
 		return err;
 	}
 
-	getServiceNameFromCapabilityId(m_serviceName);
+	getServiceNameFromCapabilityId(result, m_serviceName);
 	if (m_serviceName.empty()) {
 		MojLogError(IMServiceApp::s_log, _T("OnEnabledHandler::getAccountInfoResult serviceName empty"));
 		return err;
@@ -162,13 +162,25 @@ MojErr OnEnabledHandler::getDefaultServiceName(const MojObject& accountResult, M
 	return err;
 }
 
-void OnEnabledHandler::getServiceNameFromCapabilityId(MojString& serviceName) 
+void OnEnabledHandler::getServiceNameFromCapabilityId(const MojObject& accountResult, MojString& serviceName)
 {
-	if (m_capabilityProviderId == CAPABILITY_GTALK)
-		serviceName.assign(SERVICENAME_GTALK);	
-	else if (m_capabilityProviderId == CAPABILITY_AIM)
-		serviceName.assign(SERVICENAME_AIM);
+	MojObject capabilityProviders;
+	MojErr err = accountResult.getRequired("capabilityProviders", capabilityProviders);
 
+	if (err != MojErrNone) {
+		MojLogError(IMServiceApp::s_log, _T("OnEnabledHandler capabilityProviders not found in accountResult %d"), err);
+	} else {
+		MojObject messagingObj;
+		err = getMessagingCapabilityObject(capabilityProviders, messagingObj);
+		if (err != MojErrNone) {
+			MojLogError(IMServiceApp::s_log, _T("OnEnabledHandler messsaging capabilityProvider not found %d"), err);
+		} else {
+			err = messagingObj.getRequired("serviceName", serviceName);
+			if (err != MojErrNone) {
+				MojLogError(IMServiceApp::s_log, _T("OnEnabledHandler serviceName not found in capabilityProvider %d"), err);
+			}
+		}
+	}
 }
 
 /*
