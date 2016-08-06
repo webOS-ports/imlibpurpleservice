@@ -68,7 +68,7 @@ private:
 	MojErr accountDisabled();
 	MojErr getMessagingCapabilityObject(const MojObject& capabilityProviders, MojObject& messagingObj);
 	MojErr getDefaultServiceName(const MojObject& accountResult, MojString& serviceName);
-	void getServiceNameFromCapabilityId(MojString& serviceName);
+	void getServiceNameFromCapabilityId(const MojObject& accountResult, MojString& serviceName);
 
 	MojService* m_service;
 	MojDbServiceClient m_dbClient;
