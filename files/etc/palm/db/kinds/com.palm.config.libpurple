@@ -1,0 +1,9 @@
+{
+    "id": "com.palm.config.libpurple:1",
+    "indexes": [
+        {
+            "name": "byAccountId",
+            "props": [{"name": "accountId"}]
+        }
+    ]
+}
