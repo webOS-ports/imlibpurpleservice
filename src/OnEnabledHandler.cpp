@@ -128,11 +128,17 @@ MojErr  OnEnabledHandler::getAccountInfoResult(MojObject& payload, MojErr result
 		return err;
 	}
 
-	getServiceNameFromCapabilityId(result, m_serviceName);
-	if (m_serviceName.empty()) {
-		MojLogError(IMServiceApp::s_log, _T("OnEnabledHandler::getAccountInfoResult serviceName empty"));
-		return err;
-	}
+    {
+        MojObject capabilities;
+        MojObject messagingObject;
+        result.get("capabilityProviders", capabilities);
+        getMessagingCapabilityObject(capabilities, messagingObject);
+        err = messagingObject.getRequired("serviceName", m_serviceName);
+        if (m_serviceName.empty()) {
+            MojLogError(IMServiceApp::s_log, _T("OnEnabledHandler::getAccountInfoResult serviceName empty"));
+            return err;
+        }
+    }
 
 	if (m_enable) {
 		err = accountEnabled();
@@ -141,46 +147,6 @@ MojErr  OnEnabledHandler::getAccountInfoResult(MojObject& payload, MojErr result
 	}
 
 	return err;
-}
-
-MojErr OnEnabledHandler::getDefaultServiceName(const MojObject& accountResult, MojString& serviceName)
-{
-	MojString templateId;
-	MojErr err = accountResult.getRequired("templateId", templateId);
-	if (err != MojErrNone) {
-		MojLogError(IMServiceApp::s_log, _T("OnEnabledHandler templateId empty or error %d"), err);
-	} else {
-		if (templateId == "com.palm.google")
-			serviceName.assign(SERVICENAME_GTALK);
-		else if (templateId == "com.palm.aol")
-			serviceName.assign(SERVICENAME_AIM);
-		else if (templateId == "com.palm.icq")
-			serviceName.assign(SERVICENAME_ICQ);
-		else
-			err = MojErrNotImpl;
-	}
-	return err;
-}
-
-void OnEnabledHandler::getServiceNameFromCapabilityId(const MojObject& accountResult, MojString& serviceName)
-{
-	MojObject capabilityProviders;
-	MojErr err = accountResult.getRequired("capabilityProviders", capabilityProviders);
-
-	if (err != MojErrNone) {
-		MojLogError(IMServiceApp::s_log, _T("OnEnabledHandler capabilityProviders not found in accountResult %d"), err);
-	} else {
-		MojObject messagingObj;
-		err = getMessagingCapabilityObject(capabilityProviders, messagingObj);
-		if (err != MojErrNone) {
-			MojLogError(IMServiceApp::s_log, _T("OnEnabledHandler messsaging capabilityProvider not found %d"), err);
-		} else {
-			err = messagingObj.getRequired("serviceName", serviceName);
-			if (err != MojErrNone) {
-				MojLogError(IMServiceApp::s_log, _T("OnEnabledHandler serviceName not found in capabilityProvider %d"), err);
-			}
-		}
-	}
 }
 
 /*
@@ -410,6 +376,7 @@ MojErr OnEnabledHandler::findImLoginStateResult(MojObject& payload, MojErr err)
 		imLoginState.put(_T("accountId"), m_accountId);
 		imLoginState.put(_T("serviceName"), m_serviceName);
 		imLoginState.put(_T("username"), m_username);
+        imLoginState.put(_T("capabilityId"), m_capabilityProviderId);
 		imLoginState.putString(_T("state"), LOGIN_STATE_OFFLINE);
 		imLoginState.putInt(_T("availability"), PalmAvailability::ONLINE); //default to online so we automatically login at first
 		MojErr err = m_dbClient.put(m_addImLoginStateSlot, imLoginState);

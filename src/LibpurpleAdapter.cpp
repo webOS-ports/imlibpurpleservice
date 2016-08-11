@@ -120,6 +120,12 @@ typedef struct _auth_and_add
 	PurpleAccount *account;
 } AuthRequest;
 
+struct AccountMetaData
+{
+    char *account_key;
+    char *servicename;
+};
+
 static void incoming_message_cb(PurpleConversation *conv, const char *who, const char *alias, const char *message,	PurpleMessageFlags flags, time_t mtime);
 static void adapterUIInit(void);
 static GHashTable* getClientInfo(void);
@@ -301,13 +307,13 @@ guint adapterIOAdd(gint fd, PurpleInputCondition purpleCondition, PurpleInputFun
  * Helper methods
  */
 
-static char* stripResourceFromGtalkUsername(const char* username, const char* serviceName)
+static char* stripResourceFromJabberUsername(const char* username, const char* serviceName)
 {
 	if (!username)
 	{
 		return strdup("");
 	}
-	if (strcmp(serviceName, SERVICENAME_GTALK) != 0)
+	if (strcmp(serviceName, "type_jabber") != 0)
 	{
 		return strdup(username);
 	}
@@ -322,6 +328,28 @@ static char* stripResourceFromGtalkUsername(const char* username, const char* se
 	char* mojoFriendlyUsernameToReturn = strdup(mojoFriendlyUsername->str);
 	g_string_free(mojoFriendlyUsername, TRUE);
 	return mojoFriendlyUsernameToReturn;
+}
+
+/*
+ * Given mojo-friendly serviceName, it will return prpl-specific protocol_id (e.g. given "type_aim", it will return "prpl-aim")
+ * Free the returned string when you're done with it
+ */
+static char* getPrplProtocolIdFromServiceName(const char* serviceName)
+{
+	if (!serviceName || serviceName[0] == 0)
+	{
+		MojLogError(IMServiceApp::s_log, _T("getPrplProtocolIdFromServiceName called with empty serviceName"));
+		return strdup("");
+	}
+	GString* prplProtocolId = g_string_new("prpl-");
+
+	const char* stringChopper = serviceName;
+	stringChopper += strlen("type_");
+	g_string_append(prplProtocolId, stringChopper);
+
+	char* prplProtocolIdToReturn = strdup(prplProtocolId->str);
+	g_string_free(prplProtocolId, TRUE);
+	return prplProtocolIdToReturn;
 }
 
 static const char* getMojoFriendlyErrorCode(PurpleConnectionError type)
@@ -349,63 +377,6 @@ static const char* getMojoFriendlyErrorCode(PurpleConnectionError type)
 		mojoFriendlyErrorCode = ERROR_GENERIC_ERROR;
 	}
 	return mojoFriendlyErrorCode;
-}
-
-/*
- * Given mojo-friendly serviceName, it will return prpl-specific protocol_id (e.g. given "type_aim", it will return "prpl-aim")
- * Free the returned string when you're done with it
- */
-static char* getPrplProtocolIdFromServiceName(const char* serviceName)
-{
-	if (!serviceName || serviceName[0] == 0)
-	{
-		MojLogError(IMServiceApp::s_log, _T("getPrplProtocolIdFromServiceName called with empty serviceName"));
-		return strdup("");
-	}
-	GString* prplProtocolId = g_string_new("prpl-");
-
-	if (strcmp(serviceName, SERVICENAME_GTALK) == 0)
-	{
-		// Special case for gtalk where the mojo serviceName is "type_gtalk" and the prpl protocol_id is "prpl-jabber"
-		g_string_append(prplProtocolId, "jabber");
-	}
-	else
-	{
-		const char* stringChopper = serviceName;
-		stringChopper += strlen("type_");
-		g_string_append(prplProtocolId, stringChopper);
-	}
-	char* prplProtocolIdToReturn = strdup(prplProtocolId->str);
-	g_string_free(prplProtocolId, TRUE);
-	return prplProtocolIdToReturn;
-}
-
-/*
- * Given the prpl-specific protocol_id, it will return mojo-friendly serviceName (e.g. given "prpl-aim", it will return "type_aim")
- * Free the returned string when you're done with it
- */
-static char* getServiceNameFromPrplProtocolId(char* prplProtocolId)
-{
-	if (!prplProtocolId)
-	{
-		MojLogError(IMServiceApp::s_log, _T("getServiceNameFromPrplProtocolId called with empty protocolId"));
-		return strdup("type_default");
-	}
-	char* stringChopper = prplProtocolId;
-	stringChopper += strlen("prpl-");
-	GString* serviceName = g_string_new(stringChopper);
-
-	if (strcmp(serviceName->str, "jabber") == 0)
-	{
-		// Special case for gtalk where the mojo serviceName is "type_gtalk" and the prpl protocol_id is "jabber-purple"
-		g_string_free(serviceName, TRUE);
-		serviceName = g_string_new("gtalk");
-	}
-	char* serviceNameToReturn = NULL;
-	// asprintf allocates appropriate-sized buffer
-	asprintf(&serviceNameToReturn, "type_%s", serviceName->str);
-	g_string_free(serviceName, TRUE);
-	return serviceNameToReturn;
 }
 
 static char* getAccountKey(const char* username, const char* serviceName)
@@ -447,17 +418,24 @@ static char* getAuthRequestKey(const char* username, const char* serviceName, co
 
 static char* getAccountKeyFromPurpleAccount(PurpleAccount* account)
 {
-	if (!account)
+	if (!account || !account->ui_data)
 	{
 		MojLogError(IMServiceApp::s_log, _T("getAccountKeyFromPurpleAccount called with empty account"));
 		return strdup("");
 	}
-	char* serviceName = getServiceNameFromPrplProtocolId(account->protocol_id);
-	char* accountKey = getAccountKey(account->username, serviceName);
 
-	free(serviceName);
+    return strdup(((AccountMetaData*)account->ui_data)->account_key);
+}
 
-	return accountKey;
+static char* getServiceNameFromPurpleAccount(PurpleAccount* account)
+{
+	if (!account || !account->ui_data)
+	{
+		MojLogError(IMServiceApp::s_log, _T("getAccountKeyFromPurpleAccount called with empty account"));
+		return strdup("");
+	}
+
+	return strdup(((AccountMetaData*)account->ui_data)->servicename);
 }
 
 /**
@@ -705,7 +683,7 @@ static void buddy_signed_on_off_cb(PurpleBuddy* buddy, gpointer data)
 		return;
 	}
 
-	char* serviceName = getServiceNameFromPrplProtocolId(account->protocol_id);
+	char* serviceName = getServiceNameFromPurpleAccount(account);
 	PurpleStatus* activeStatus = purple_presence_get_active_status(purple_buddy_get_presence(buddy));
 	/*
 	 * Getting the new availability
@@ -785,7 +763,7 @@ static void buddy_status_changed_cb(PurpleBuddy* buddy, PurpleStatus* old_status
 		free(accountKey);
 		return;
 	}
-	char* serviceName = getServiceNameFromPrplProtocolId(account->protocol_id);
+	char* serviceName = getServiceNameFromPurpleAccount(account);
 
 	PurpleBuddyIcon* icon = purple_buddy_get_icon(buddy);
 	char* buddyAvatarLocation = NULL;
@@ -870,7 +848,7 @@ static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 	PurpleAccount* loggedInAccount = purple_connection_get_account(gc);
 	g_return_if_fail(loggedInAccount != NULL);
 
-	char* serviceName = getServiceNameFromPrplProtocolId(loggedInAccount->protocol_id);
+	char* serviceName = getServiceNameFromPurpleAccount(loggedInAccount);
 	char* accountKey = getAccountKey(loggedInAccount->username, serviceName);
 
 	if (g_hash_table_lookup(s_onlineAccountData, accountKey) != NULL)
@@ -972,7 +950,7 @@ static void account_signed_off_cb(PurpleConnection* gc, gpointer loginState)
 	// reply with signed off
 	if (loginState)
 	{
-		char* serviceName = getServiceNameFromPrplProtocolId(account->protocol_id);
+		char* serviceName = getServiceNameFromPurpleAccount(account);
 		((LoginCallbackInterface*)loginState)->loginResult(serviceName, account->username, LoginCallbackInterface::LOGIN_SIGNED_OFF, false, ERROR_NO_ERROR, true);
 		free(serviceName);
 	}
@@ -998,8 +976,8 @@ static void account_login_failed_cb(PurpleConnection* gc, PurpleConnectionError 
 
 	gboolean loggedOut = FALSE;
 	bool noRetry = true;
-	char* serviceName = getServiceNameFromPrplProtocolId(account->protocol_id);
-	char* accountKey = getAccountKey(account->username, serviceName);
+	char* serviceName = getServiceNameFromPurpleAccount(account);
+	char* accountKey = getAccountKeyFromPurpleAccount(account);
 
 	if (g_hash_table_lookup(s_onlineAccountData, accountKey) != NULL)
 	{
@@ -1110,7 +1088,7 @@ static void account_auth_deny_cb(PurpleAccount* account, const char* remote_user
 
 	// TODO this needs to happen when remote user declines our invite, not here...
 //	char* serviceName = getServiceNameFromPrplProtocolId(account->protocol_id);
-//	char* usernameFromStripped = stripResourceFromGtalkUsername(remote_user, serviceName);
+//	char* usernameFromStripped = stripResourceFromJabberUsername(remote_user, serviceName);
 //
 //	// tell transport to delete the buddy and contacts
 //	s_imServiceHandler->buddyInviteDeclined(serviceName, account->username, usernameFromStripped);
@@ -1157,7 +1135,7 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 	PurpleAccount* account = purple_conversation_get_account(conv);
 
 	// these never return null...
-	char* serviceName = getServiceNameFromPrplProtocolId(account->protocol_id);
+	char* serviceName = getServiceNameFromPurpleAccount(account);
 
 	if (strcmp(account->username, usernameFrom) == 0) // TODO: should this compare use account->username?
 	{
@@ -1166,17 +1144,7 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 		return;
 	}
 
-	if (strcmp(serviceName, SERVICENAME_AIM) == 0 && (strcmp(usernameFrom, "aolsystemmsg") == 0 || strcmp(usernameFrom,
-			"AOL System Msg") == 0))
-	{
-		/*
-		 * ignore messages from aolsystemmsg telling us that we're logged in somewhere else
-		 */
-		free(serviceName);
-		return;
-	}
-
-	char* usernameFromStripped = stripResourceFromGtalkUsername(usernameFrom, serviceName);
+	char* usernameFromStripped = stripResourceFromJabberUsername(usernameFrom, serviceName);
 
 	// call the transport service incoming message handler
 	s_imServiceHandler->incomingIM(serviceName, account->username, usernameFromStripped, message);
@@ -1198,8 +1166,8 @@ static void *request_authorize_cb (PurpleAccount *account, const char *remote_us
 	MojLogInfo(IMServiceApp::s_log, _T("request_authorize_cb called. remote user: %s, id: %s, message: %s"), remote_user, id, message);
 
 	// these never return null...
-	char* serviceName = getServiceNameFromPrplProtocolId(account->protocol_id);
-	char* usernameFromStripped = stripResourceFromGtalkUsername(remote_user, serviceName);
+	char* serviceName = getServiceNameFromPurpleAccount(account);
+	char* usernameFromStripped = stripResourceFromJabberUsername(remote_user, serviceName);
 
 	// Save off the authorize/deny callbacks to use later
 	AuthRequest *aa = g_new0(AuthRequest, 1);
@@ -1268,7 +1236,7 @@ gboolean connectTimeoutCallback(gpointer data)
 
 	if (s_loginState)
 	{
-		char* serviceName = getServiceNameFromPrplProtocolId(account->protocol_id);
+		char* serviceName = getServiceNameFromPurpleAccount(account);
 
 		// TODO - should noRetry be false here in other cases?
 		// Can't really tell - we will get here if the proper sa security certificate is not installed, which is a permanent failure.
@@ -1500,7 +1468,7 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams* params, Login
 			g_hash_table_insert(s_connectionTypeData, accountKey, strdup(params->connectionType));
 		}
 
-		prplProtocolId = getPrplProtocolIdFromServiceName(params->serviceName);
+		char *prplProtocolId = getPrplProtocolIdFromServiceName(params->serviceName);
 
 		/*
 		 * If we've already logged in to this account before then re-use the old PurpleAccount struct
@@ -1516,17 +1484,18 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams* params, Login
 				result = FAILED;
 				goto error;
 			}
+
+            // TODO: If the account did exist before we get a leak here,
+            //       look into this (when do we have to delete
+            //       account->ui_data? Is there a destructor for
+            //       purple_accounts?)
+			AccountMetaData* amd = new AccountMetaData;
+			amd->account_key = strdup(accountKey);
+			amd->servicename = strdup(params->serviceName);
+
+			account->ui_data = (void*)amd;
 		}
 
-		if (strcmp(prplProtocolId, "prpl-jabber") == 0 && g_str_has_suffix(params->username, "@gmail.com") == FALSE &&
-			g_str_has_suffix(params->username, "@googlemail.com") == FALSE)
-		{
-			/*
-			 * Special case for gmail... don't try to connect to mydomain.com if the username is me@mydomain.com. They might not have
-			 * setup the SRV record. Always connect to gmail.
-			 */
-			purple_account_set_string(account, "connect_server", "talk.google.com");
-		}
 		MojLogInfo(IMServiceApp::s_log, _T("Logging in..."));
 
 		purple_account_set_password(account, params->password);
@@ -2272,12 +2241,10 @@ bool LibpurpleAdapter::deviceConnectionClosed(bool all, const char* ipAddress)
 		for (accountIterator = accountToLogoutList; accountIterator != NULL; accountIterator = accountIterator->next)
 		{
 			account = (PurpleAccount*) accountIterator->data;
-			char* serviceName = getServiceNameFromPrplProtocolId(account->protocol_id);
-			char* accountKey = getAccountKey(account->username, serviceName);
+			char* accountKey = getAccountKeyFromPurpleAccount(account);
 
 			g_hash_table_remove(s_ipAddressesBoundTo, accountKey);
 
-			free(serviceName);
 			free(accountKey);
 		}
 	}
