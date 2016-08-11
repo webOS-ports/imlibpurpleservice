@@ -1,0 +1,24 @@
+[
+    {
+        "type":"db.kind",
+        "object":"com.palm.config.libpurple:1",
+        "caller": "com.palm.*",
+        "operations": {
+            "create": "allow",
+            "delete": "allow",
+            "read": "allow",
+            "update": "allow"
+        }
+    },
+    {
+        "type":"db.kind",
+        "object":"com.palm.config.libpurple:1",
+        "caller": "org.webosports.*",
+        "operations": {
+            "create": "allow",
+            "delete": "allow",
+            "read": "allow",
+            "update": "allow"
+        }
+    }
+]
