@@ -47,6 +47,7 @@ public:
 	MojString getUsername() const { return m_username; }
 	MojString getServiceName() const { return m_serviceName; }
     MojString getCapabilityId() const { return m_capabilityId; }
+    MojObject getConfig() const { return m_config; }
 	const MojUInt32 getAvailability() const { return m_availability; }
 	MojString getCustomMessage() const { return m_customMessage; }
 	void setState(const MojString& state) { m_state = state; }
@@ -73,6 +74,7 @@ private:
 	MojString m_username;
 	MojString m_serviceName;
     MojString m_capabilityId;
+    MojObject m_config;
 	MojUInt32 m_availability;
 	MojString m_state;
 	MojString m_customMessage;

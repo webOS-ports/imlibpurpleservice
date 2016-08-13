@@ -32,7 +32,7 @@ pkg_check_modules(PURPLE REQUIRED purple)
 include_directories(${PURPLE_INCUDE_DIRS})
 webos_add_compiler_flags(ALL ${PURPLE_CFLAGS})
 
-webos_add_compiler_flags(ALL "-DMOJ_LINUX -fno-rtti")
+webos_add_compiler_flags(ALL "-DMOJ_LINUX -fno-rtti -std=c++11")
 
 file(GLOB SOURCES
     src/OnEnabledHandler.cpp
@@ -51,7 +51,8 @@ file(GLOB SOURCES
     src/entities.cpp
     src/SendOneCommandHandler.cpp
     src/OutgoingIMCommandHandler.cpp
-    src/IncomingIMHandler.cpp)
+    src/IncomingIMHandler.cpp
+    src/Util.cpp)
 
 include_directories(${CMAKE_SOURCE_DIR}/inc)
 

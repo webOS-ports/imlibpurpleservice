@@ -33,8 +33,8 @@
 #include "PalmImCommon.h"
 #include "core/MojService.h"
 
-#define CUSTOM_USER_DIRECTORY  "/dev/null"
-#define CUSTOM_PLUGIN_PATH     ""
+#define CUSTOM_USER_DIRECTORY  "/var/preferences/com.palm.purple/transport"
+#define CUSTOM_PLUGIN_PATH     APP_PATH "/plugins"
 #define PLUGIN_SAVE_PREF       "/purple/nullclient/plugins/saved"
 #define UI_ID                  "adapter"
 
@@ -95,7 +95,7 @@ public:
 	static void init();
 	static void assignIMLoginState(LoginCallbackInterface* loginState);
 	static void assignIMServiceHandler(IMServiceCallbackInterface* incomingIMHandler);
-	static LoginResult login(LoginParams* params, LoginCallbackInterface* loginState);
+	static LoginResult login(LoginParams const& params, LoginCallbackInterface* loginState);
 	// return false if already logged out
 	static bool logout(const char* serviceName, const char* username, LoginCallbackInterface* loginState);
 	static bool getFullBuddyList(const char* serviceName, const char* username);

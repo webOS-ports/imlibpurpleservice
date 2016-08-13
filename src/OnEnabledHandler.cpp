@@ -32,6 +32,7 @@
 
 OnEnabledHandler::OnEnabledHandler(MojService* service, IMServiceApp::Listener* listener)
 : m_getAccountInfoSlot(this, &OnEnabledHandler::getAccountInfoResult),
+  m_getAccountConfigSlot(this, &OnEnabledHandler::getAccountConfigResult),
   m_findImLoginStateSlot(this, &OnEnabledHandler::findImLoginStateResult),
   m_addImLoginStateSlot(this, &OnEnabledHandler::addImLoginStateResult),
   m_deleteImLoginStateSlot(this, &OnEnabledHandler::deleteImLoginStateResult),
@@ -137,6 +138,42 @@ MojErr  OnEnabledHandler::getAccountInfoResult(MojObject& payload, MojErr result
         if (m_serviceName.empty()) {
             MojLogError(IMServiceApp::s_log, _T("OnEnabledHandler::getAccountInfoResult serviceName empty"));
             return err;
+        }
+    }
+
+    if (m_enable)
+    {
+        MojDbQuery query;
+        query.from("com.palm.config.purple:1");
+        query.where("accountId", MojDbQuery::OpEq, m_accountId);
+        query.limit(1);
+        err = m_dbClient.find(m_getAccountConfigSlot, query);
+    }
+    else
+    {
+        err = accountDisabled();
+    }
+
+	return err;
+}
+
+MojErr OnEnabledHandler::getAccountConfigResult(MojObject& payload, MojErr err)
+{
+    MojLogTrace(IMServiceApp::s_log);
+
+    if (err != MojErrNone) {
+        MojString error;
+        MojErrToString(err, error);
+        MojLogCritical(IMServiceApp::s_log, "getAccountConfig failed: error %d - %s", err, error.data());
+    }
+    else
+    {
+        MojObject results;
+        payload.get("results", results);
+
+        if (!results.empty())
+        {
+            m_config = *results.arrayBegin();
         }
     }
 
@@ -379,6 +416,7 @@ MojErr OnEnabledHandler::findImLoginStateResult(MojObject& payload, MojErr err)
         imLoginState.put(_T("capabilityId"), m_capabilityProviderId);
 		imLoginState.putString(_T("state"), LOGIN_STATE_OFFLINE);
 		imLoginState.putInt(_T("availability"), PalmAvailability::ONLINE); //default to online so we automatically login at first
+        imLoginState.put(_T("config"), m_config);
 		MojErr err = m_dbClient.put(m_addImLoginStateSlot, imLoginState);
 		if (err != MojErrNone) {
 			MojString error;
