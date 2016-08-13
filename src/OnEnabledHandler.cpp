@@ -144,7 +144,7 @@ MojErr  OnEnabledHandler::getAccountInfoResult(MojObject& payload, MojErr result
     if (m_enable)
     {
         MojDbQuery query;
-        query.from("com.palm.config.purple:1");
+        query.from("com.palm.config.libpurple:1");
         query.where("accountId", MojDbQuery::OpEq, m_accountId);
         query.limit(1);
         err = m_dbClient.find(m_getAccountConfigSlot, query);

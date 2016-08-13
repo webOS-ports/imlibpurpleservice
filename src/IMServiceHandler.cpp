@@ -104,7 +104,7 @@ MojErr IMServiceHandler::onCreate(MojServiceMessage* serviceMsg, const MojObject
     MojObject res;
     res.putString("accountId", accountId);
     res.put("config", config);
-    res.putString("_kind", "com.palm.config.purple:1");
+    res.putString("_kind", "com.palm.config.libpurple:1");
 
     // Write config to db:
     m_dbClient.put(m_putConfigSlot, res);
@@ -126,7 +126,7 @@ MojErr IMServiceHandler::onDelete(MojServiceMessage* serviceMsg, const MojObject
 	}
 
     MojDbQuery query;
-    query.from("com.palm.config.purple:1");
+    query.from("com.palm.config.libpurple:1");
     query.where("accountId", MojDbQuery::OpEq, accountId);
 
     m_dbClient.del(m_deleteConfigSlot, query);
