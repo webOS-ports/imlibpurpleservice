@@ -32,30 +32,21 @@
 #define LOGIN_STATE_ONLINE   			"online"
 #define LOGIN_STATE_LOGGING_OFF  		"logging-off"
 
+#include <core/MojString.h>
+#include <core/MojObject.h>
 
-#define SERVICENAME_AIM "type_aim"
-#define SERVICENAME_GTALK "type_gtalk"
-#define SERVICENAME_ICQ "type_icq"
-#define SERVICENAME_YAHOO "type_yahoo"
-#define SERVICENAME_SKYPE "type_skype"
-#define SERVICENAME_WINOWSLIVE "type_msn"
-
-// capability providor ids
-#define CAPABILITY_GTALK "com.palm.google.talk"
-#define CAPABILITY_AIM "com.palm.aol.aim"
-
-
-typedef struct
+struct LoginParams
 {
-	const char *accountId;
-	const char *serviceName;
-	const char *username;
-	const char *password;
+	MojString accountId;
+	MojString serviceName;
+	MojString username;
+    MojString password;
 	int availability;
-	const char *customMessage;
-	const char *localIpAddress;
-	const char *connectionType;
-} LoginParams;
+	MojString customMessage;
+	MojString localIpAddress;
+	MojString connectionType;
+    MojObject config;
+};
 
 
 class PalmAvailability {

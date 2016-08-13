@@ -32,6 +32,7 @@
 
 OnEnabledHandler::OnEnabledHandler(MojService* service, IMServiceApp::Listener* listener)
 : m_getAccountInfoSlot(this, &OnEnabledHandler::getAccountInfoResult),
+  m_getAccountConfigSlot(this, &OnEnabledHandler::getAccountConfigResult),
   m_findImLoginStateSlot(this, &OnEnabledHandler::findImLoginStateResult),
   m_addImLoginStateSlot(this, &OnEnabledHandler::addImLoginStateResult),
   m_deleteImLoginStateSlot(this, &OnEnabledHandler::deleteImLoginStateResult),
@@ -128,11 +129,53 @@ MojErr  OnEnabledHandler::getAccountInfoResult(MojObject& payload, MojErr result
 		return err;
 	}
 
-	getServiceNameFromCapabilityId(result, m_serviceName);
-	if (m_serviceName.empty()) {
-		MojLogError(IMServiceApp::s_log, _T("OnEnabledHandler::getAccountInfoResult serviceName empty"));
-		return err;
-	}
+    {
+        MojObject capabilities;
+        MojObject messagingObject;
+        result.get("capabilityProviders", capabilities);
+        getMessagingCapabilityObject(capabilities, messagingObject);
+        err = messagingObject.getRequired("serviceName", m_serviceName);
+        if (m_serviceName.empty()) {
+            MojLogError(IMServiceApp::s_log, _T("OnEnabledHandler::getAccountInfoResult serviceName empty"));
+            return err;
+        }
+    }
+
+    if (m_enable)
+    {
+        MojDbQuery query;
+        query.from("com.palm.config.libpurple:1");
+        query.where("accountId", MojDbQuery::OpEq, m_accountId);
+        query.limit(1);
+        err = m_dbClient.find(m_getAccountConfigSlot, query);
+    }
+    else
+    {
+        err = accountDisabled();
+    }
+
+	return err;
+}
+
+MojErr OnEnabledHandler::getAccountConfigResult(MojObject& payload, MojErr err)
+{
+    MojLogTrace(IMServiceApp::s_log);
+
+    if (err != MojErrNone) {
+        MojString error;
+        MojErrToString(err, error);
+        MojLogCritical(IMServiceApp::s_log, "getAccountConfig failed: error %d - %s", err, error.data());
+    }
+    else
+    {
+        MojObject results;
+        payload.get("results", results);
+
+        if (!results.empty())
+        {
+            m_config = *results.arrayBegin();
+        }
+    }
 
 	if (m_enable) {
 		err = accountEnabled();
@@ -141,46 +184,6 @@ MojErr  OnEnabledHandler::getAccountInfoResult(MojObject& payload, MojErr result
 	}
 
 	return err;
-}
-
-MojErr OnEnabledHandler::getDefaultServiceName(const MojObject& accountResult, MojString& serviceName)
-{
-	MojString templateId;
-	MojErr err = accountResult.getRequired("templateId", templateId);
-	if (err != MojErrNone) {
-		MojLogError(IMServiceApp::s_log, _T("OnEnabledHandler templateId empty or error %d"), err);
-	} else {
-		if (templateId == "com.palm.google")
-			serviceName.assign(SERVICENAME_GTALK);
-		else if (templateId == "com.palm.aol")
-			serviceName.assign(SERVICENAME_AIM);
-		else if (templateId == "com.palm.icq")
-			serviceName.assign(SERVICENAME_ICQ);
-		else
-			err = MojErrNotImpl;
-	}
-	return err;
-}
-
-void OnEnabledHandler::getServiceNameFromCapabilityId(const MojObject& accountResult, MojString& serviceName)
-{
-	MojObject capabilityProviders;
-	MojErr err = accountResult.getRequired("capabilityProviders", capabilityProviders);
-
-	if (err != MojErrNone) {
-		MojLogError(IMServiceApp::s_log, _T("OnEnabledHandler capabilityProviders not found in accountResult %d"), err);
-	} else {
-		MojObject messagingObj;
-		err = getMessagingCapabilityObject(capabilityProviders, messagingObj);
-		if (err != MojErrNone) {
-			MojLogError(IMServiceApp::s_log, _T("OnEnabledHandler messsaging capabilityProvider not found %d"), err);
-		} else {
-			err = messagingObj.getRequired("serviceName", serviceName);
-			if (err != MojErrNone) {
-				MojLogError(IMServiceApp::s_log, _T("OnEnabledHandler serviceName not found in capabilityProvider %d"), err);
-			}
-		}
-	}
 }
 
 /*
@@ -410,8 +413,10 @@ MojErr OnEnabledHandler::findImLoginStateResult(MojObject& payload, MojErr err)
 		imLoginState.put(_T("accountId"), m_accountId);
 		imLoginState.put(_T("serviceName"), m_serviceName);
 		imLoginState.put(_T("username"), m_username);
+        imLoginState.put(_T("capabilityId"), m_capabilityProviderId);
 		imLoginState.putString(_T("state"), LOGIN_STATE_OFFLINE);
 		imLoginState.putInt(_T("availability"), PalmAvailability::ONLINE); //default to online so we automatically login at first
+        imLoginState.put(_T("config"), m_config);
 		MojErr err = m_dbClient.put(m_addImLoginStateSlot, imLoginState);
 		if (err != MojErrNone) {
 			MojString error;

@@ -1,5 +1,6 @@
 {
     "id": "com.palm.config.libpurple:1",
+    "owner": "com.palm.imlibpurple",
     "indexes": [
         {
             "name": "byAccountId",

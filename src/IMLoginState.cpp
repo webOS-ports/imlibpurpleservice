@@ -34,6 +34,8 @@
 #include "IMServiceHandler.h"
 #include "IMMessage.h"
 
+#include "Util.h"
+
 /*
  * IMLoginState
  */
@@ -252,16 +254,16 @@ void IMLoginStateHandler::loginForTesting(MojServiceMessage* serviceMsg, const M
 		return;
 	}
 
-	loginParams.username = username.data();
-	loginParams.password = password.data();
-	loginParams.serviceName = "type_gtalk";
+	loginParams.username = username;
+	loginParams.password = password;
+	loginParams.serviceName.assign("type_gtalk");
 
 	loginParams.availability = PalmAvailability::ONLINE;
-	loginParams.customMessage = "";
-	loginParams.connectionType = "wifi";
-	loginParams.localIpAddress = NULL;
-	loginParams.accountId = "";
-	LibpurpleAdapter::login(&loginParams, m_loginStateController);
+	loginParams.customMessage.assign("");
+	loginParams.connectionType.assign("wifi");
+	loginParams.localIpAddress.assign("");
+	loginParams.accountId.assign("");
+	LibpurpleAdapter::login(loginParams, m_loginStateController);
 	serviceMsg->replySuccess();
 }
 /*
@@ -345,7 +347,7 @@ MojErr IMLoginStateHandler::handleConnectionChanged(const MojObject payload)
 		err = m_dbClient.merge(m_ignoreUpdateLoginStateSlot, query, mergeProps);
 
 		// Also tell libpurple to disconnect
-		LibpurpleAdapter::deviceConnectionClosed(false, ConnectionState::wanIpAddress().data());
+		LibpurpleAdapter::deviceConnectionClosed(false, ConnectionState::wanIpAddress());
 	}
 	else if (wifiConnected == false)
 	{
@@ -361,7 +363,7 @@ MojErr IMLoginStateHandler::handleConnectionChanged(const MojObject payload)
 		err = m_dbClient.merge(m_ignoreUpdateLoginStateSlot, query, mergeProps);
 
 		// Also tell libpurple to disconnect
-		LibpurpleAdapter::deviceConnectionClosed(false, ConnectionState::wifiIpAddress().data());
+		LibpurpleAdapter::deviceConnectionClosed(false, ConnectionState::wifiIpAddress());
 	}
 
 	return MojErrNone;
@@ -480,14 +482,13 @@ MojErr IMLoginStateHandler::handleBadCredentials(const MojString& serviceName, c
 	// update the syncState record for this account so account dashboard can display errors
 	// first we need to find our account id
 	LoginStateData state;
-	MojString accountId, service, user;
+	MojString service, user;
 	service.assign(serviceName);
 	user.assign(username);
 	bool found = m_loginStateController->getLoginStateData(service, user, state);
 	if (found) {
-		accountId = state.getAccountId();
 		MojRefCountedPtr<IMLoginSyncStateHandler> syncStateHandler(new IMLoginSyncStateHandler(m_service));
-		syncStateHandler->updateSyncStateRecord(serviceName, accountId, LoginCallbackInterface::LOGIN_FAILED, err);
+		syncStateHandler->updateSyncStateRecord(serviceName, state.getAccountId(), state.getCapabilityId(), LoginCallbackInterface::LOGIN_FAILED, err);
 	}
 	else {
 		MojLogError(IMServiceApp::s_log, _T("handleBadCredentials: could not find account Id in cached login states map. No syncState record created."));
@@ -553,19 +554,20 @@ MojErr IMLoginStateHandler::getCredentialsResult(MojObject& payload, MojErr resu
 			// We're about to log in, so set the state to "logging in"
 			updateLoginStateNoResponse(serviceName, username, LOGIN_STATE_LOGGING_ON, localIpAddress.data());
 
-			loginParams.password = password.data();
-			loginParams.accountId = m_workingLoginState.getAccountId().data();
-			loginParams.username = username.data();
-			loginParams.serviceName = serviceName.data();
+			loginParams.password = password;
+			loginParams.accountId = m_workingLoginState.getAccountId();
+			loginParams.username = username;
+			loginParams.serviceName = serviceName;
 			loginParams.availability = m_workingLoginState.getAvailability();
 			loginParams.customMessage = m_workingLoginState.getCustomMessage();
-			loginParams.connectionType = connectionType.data();
-			loginParams.localIpAddress = localIpAddress.data();
+			loginParams.connectionType = connectionType;
+			loginParams.localIpAddress = localIpAddress;
+            loginParams.config = m_workingLoginState.getConfig();
 
 			// Login may be asynchronous with the result callback in loginResult().
 			// Also deal with immediate results
 			LibpurpleAdapter::LoginResult result;
-			result = LibpurpleAdapter::login(&loginParams, m_loginStateController);
+			result = LibpurpleAdapter::login(loginParams, m_loginStateController);
 			if (result == LibpurpleAdapter::FAILED)
 			{
 				handleBadCredentials(serviceName, username, ERROR_GENERIC_ERROR);
@@ -1135,14 +1137,13 @@ void IMLoginStateHandler::loginResult(const char* serviceName, const char* usern
 	// update the syncState record for this account so account dashboard can display errors
 	// first we need to find our account id
 	LoginStateData loginState;
-	MojString accountId, service, user;
+	MojString service, user;
 	service.assign(serviceName);
 	user.assign(username);
 	bool foundLoginState = m_loginStateController->getLoginStateData(service, user, loginState);
 	if (foundLoginState) {
-		accountId = loginState.getAccountId();
 		MojRefCountedPtr<IMLoginSyncStateHandler> syncStateHandler(new IMLoginSyncStateHandler(m_service));
-		syncStateHandler->updateSyncStateRecord(serviceName, accountId, type, errorCodeMoj);
+		syncStateHandler->updateSyncStateRecord(serviceName, loginState.getAccountId(), loginState.getCapabilityId(), type, errorCodeMoj);
 	}
 	else {
 		MojLogError(IMServiceApp::s_log, _T("loginResult: could not find account Id in cached login states map. No syncState record created."));
@@ -1223,9 +1224,11 @@ MojErr LoginStateData::assignFromDbRecord(MojObject& record)
 		return err;
 	}
 
+    record.get("config", m_config);
 	record.get("username", m_username, found);
 	record.get("accountId", m_accountId, found);
 	record.get("serviceName", m_serviceName, found);
+    record.get("capabilityId", m_capabilityId, found);
 	err = record.get("state", m_state, found);
 	if (err != MojErrNone || found == false)
 	{
@@ -1443,7 +1446,7 @@ IMLoginSyncStateHandler::IMLoginSyncStateHandler(MojService* service)
  *     delete any existing syncState record. Covers the case when login succeeds
  *     if the login failed due to bad password, need to add a syncState record with the correct account error code
  */
-void IMLoginSyncStateHandler::updateSyncStateRecord(const char* serviceName, MojString accountId, LoginCallbackInterface::LoginResult type, const char* errCode)
+void IMLoginSyncStateHandler::updateSyncStateRecord(const char* serviceName, MojString accountId, MojString capabilityId, LoginCallbackInterface::LoginResult type, const char* errCode)
 {
 	// syncState record:
 		/*
@@ -1458,20 +1461,7 @@ void IMLoginSyncStateHandler::updateSyncStateRecord(const char* serviceName, Moj
 		 }
 		 */
 
-
-	// get the capabilityProvidor id from the service
-	// TODO - should read this out of template ID...
-	if (strcmp(serviceName, SERVICENAME_GTALK) == 0) {
-		m_capabilityId.assign(CAPABILITY_GTALK);
-	}
-	else if (strcmp(serviceName, SERVICENAME_AIM) == 0){
-		m_capabilityId.assign(CAPABILITY_AIM);
-	}
-	else {
-		MojLogError(IMServiceApp::s_log, _T("updateSyncStateRecord: unknown serviceName %s. No syncState record created."), serviceName);
-		// can we do anything here??
-		return;
-	}
+        m_capabilityId.assign(capabilityId);
 
 	// save the input parameters
 	m_accountId = accountId;

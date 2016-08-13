@@ -46,6 +46,8 @@ public:
 	const MojUInt64 getRevision() const { return m_revision; }
 	MojString getUsername() const { return m_username; }
 	MojString getServiceName() const { return m_serviceName; }
+    MojString getCapabilityId() const { return m_capabilityId; }
+    MojObject getConfig() const { return m_config; }
 	const MojUInt32 getAvailability() const { return m_availability; }
 	MojString getCustomMessage() const { return m_customMessage; }
 	void setState(const MojString& state) { m_state = state; }
@@ -71,6 +73,8 @@ private:
 	MojUInt64 m_revision;
 	MojString m_username;
 	MojString m_serviceName;
+    MojString m_capabilityId;
+    MojObject m_config;
 	MojUInt32 m_availability;
 	MojString m_state;
 	MojString m_customMessage;
@@ -272,7 +276,7 @@ class IMLoginSyncStateHandler : public MojSignalHandler {
 
 public:
 	IMLoginSyncStateHandler(MojService* service);
-	void updateSyncStateRecord(const char* serviceName, MojString accountId, LoginCallbackInterface::LoginResult type, const char* errCode);
+	void updateSyncStateRecord(const char* serviceName, MojString accountId, MojString capabilityId, LoginCallbackInterface::LoginResult type, const char* errCode);
 
 
 private:

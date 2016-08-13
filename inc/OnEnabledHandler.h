@@ -43,6 +43,9 @@ private:
 	MojDbClient::Signal::Slot<OnEnabledHandler> m_getAccountInfoSlot;
 	MojErr getAccountInfoResult(MojObject& payload, MojErr err);
 
+    MojDbClient::Signal::Slot<OnEnabledHandler> m_getAccountConfigSlot;
+    MojErr getAccountConfigResult(MojObject& payload, MojErr err);
+
 	MojDbClient::Signal::Slot<OnEnabledHandler> m_findImLoginStateSlot;
 	MojErr findImLoginStateResult(MojObject& payload, MojErr err);
 
@@ -67,8 +70,6 @@ private:
 	MojErr accountEnabled();
 	MojErr accountDisabled();
 	MojErr getMessagingCapabilityObject(const MojObject& capabilityProviders, MojObject& messagingObj);
-	MojErr getDefaultServiceName(const MojObject& accountResult, MojString& serviceName);
-	void getServiceNameFromCapabilityId(const MojObject& accountResult, MojString& serviceName);
 
 	MojService* m_service;
 	MojDbServiceClient m_dbClient;
@@ -78,6 +79,7 @@ private:
 	MojString m_accountId;
 	MojString m_username;
 	MojString m_serviceName;
+    MojObject m_config;
 
 
 	// listener to tell when we are ready to shutdown
