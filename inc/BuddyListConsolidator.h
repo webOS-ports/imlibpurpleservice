@@ -30,6 +30,7 @@
 #include <map>
 #include "core/MojService.h"
 #include "db/MojDbServiceClient.h"
+#include "db/MojDb.h"
 
 /**
  * This in an interface for helper classes used to create the add, merge, and delete lists

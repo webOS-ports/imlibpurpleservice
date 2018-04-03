@@ -30,6 +30,7 @@
 #include "core/MojService.h"
 #include "core/MojServiceMessage.h"
 #include "db/MojDbServiceClient.h"
+#include "db/MojDb.h"
 #include "IMLoginState.h"
 #include "ConnectionStateHandler.h"
 #include "IMServiceApp.h"

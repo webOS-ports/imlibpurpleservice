@@ -32,6 +32,7 @@
 #include <syslog.h>
 #include "PalmImCommon.h"
 #include "core/MojService.h"
+#include "db/MojDb.h"
 
 #define CUSTOM_USER_DIRECTORY  "/var/preferences/com.palm.purple/transport"
 #define CUSTOM_PLUGIN_PATH     APP_PATH "/plugins"

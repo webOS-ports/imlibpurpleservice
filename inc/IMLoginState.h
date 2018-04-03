@@ -31,6 +31,7 @@
 #include "core/MojService.h"
 #include "core/MojServiceMessage.h"
 #include "db/MojDbServiceClient.h"
+#include "db/MojDb.h"
 #include "LibpurpleAdapter.h"
 #include "BuddyListConsolidator.h"
 #include "IMServiceApp.h"
