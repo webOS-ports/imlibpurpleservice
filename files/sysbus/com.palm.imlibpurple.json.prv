@@ -15,6 +15,8 @@
                 "com.palm.app.messaging",
                 "org.webosports.app.messaging",
                 "com.palm.display",
+                "com.palm.db",
+                "com.palm.tempdb",
                 "com.palm.service.accounts"
             ],
             "outbound":[
