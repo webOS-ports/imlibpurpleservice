@@ -8,7 +8,16 @@
             "update": "allow"
         }
     },
-	{
+    {
+        "type": "db.kind",
+        "object": "com.palm.imloginstate.libpurple:1",
+        "caller": "com.webos.*",
+        "operations": {
+            "read": "allow",
+            "update": "allow"
+        }
+    },
+    {
         "type": "db.kind",
         "object": "com.palm.imloginstate.libpurple:1",
         "caller": "org.webosports.*",
