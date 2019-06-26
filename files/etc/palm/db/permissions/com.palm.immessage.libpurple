@@ -11,6 +11,15 @@
     {
         "type": "db.kind",
         "object": "com.palm.immessage.libpurple:1",
+        "caller": "com.webos.*",
+        "operations": {
+            "read": "allow",
+            "update": "allow"
+        }
+    },
+    {
+        "type": "db.kind",
+        "object": "com.palm.immessage.libpurple:1",
         "caller": "com.palm.app.messaging",
         "operations": {
             "create": "allow",
@@ -19,7 +28,7 @@
             "update": "allow"
         }
     },
-	{
+    {
         "type": "db.kind",
         "object": "com.palm.immessage.libpurple:1",
         "caller": "org.webosports.*",
