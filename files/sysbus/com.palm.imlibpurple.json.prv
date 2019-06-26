@@ -10,7 +10,8 @@
 			"com.palm.imlibpurple",
 			"com.palm.activitymanager",
 			"com.palm.app.messaging",
-			"org.webosports.app.messaging",			
+			"org.webosports.app.messaging",
+			"com.palm.display",
 			"com.palm.service.accounts"
 		],
 		"outbound": [
