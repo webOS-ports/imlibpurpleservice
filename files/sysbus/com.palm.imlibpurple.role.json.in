@@ -1,11 +1,7 @@
 {
-    "role":{
-        "exeName":"/usr/sbin/imlibpurpleservice",
-        "type":"regular",
-        "allowedNames":[
-            "com.palm.imlibpurple"
-        ]
-    },
+    "exeName":"@WEBOS_INSTALL_SBINDIR@/imlibpurpleservice",
+    "type":"regular",
+    "allowedNames":["com.palm.imlibpurple"],
     "permissions":[
         {
             "service":"com.palm.imlibpurple",
