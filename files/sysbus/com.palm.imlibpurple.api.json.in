@@ -1,0 +1,20 @@
+{
+    "applications": [
+        "com.palm.imlibpurple/loginForTesting",
+        "com.palm.imlibpurple/onCreate",
+        "com.palm.imlibpurple/onDelete",
+        "com.palm.imlibpurple/onEnabled",
+        "com.palm.imlibpurple/loginStateChanged",
+        "com.palm.imlibpurple/sendIM",
+        "com.palm.imlibpurple/sendCommand"
+    ],
+    "services": [
+        "com.palm.imlibpurple/loginForTesting",
+        "com.palm.imlibpurple/onCreate",
+        "com.palm.imlibpurple/onDelete",
+        "com.palm.imlibpurple/onEnabled",
+        "com.palm.imlibpurple/loginStateChanged",
+        "com.palm.imlibpurple/sendIM",
+        "com.palm.imlibpurple/sendCommand"
+    ]
+}

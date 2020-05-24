@@ -1,0 +1,10 @@
+{
+    "com.palm.imlibpurple": [
+        "services",
+        "applications",
+        "applications.internal",
+        "database",
+        "database.internal",
+        "activities.manage"
+    ]
+}
