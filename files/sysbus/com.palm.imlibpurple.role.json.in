@@ -1,5 +1,6 @@
 {
     "exeName":"@WEBOS_INSTALL_SBINDIR@/imlibpurpleservice",
+    "trustLevel" : "oem",
     "type":"regular",
     "allowedNames":["com.palm.imlibpurple"],
     "permissions":[
