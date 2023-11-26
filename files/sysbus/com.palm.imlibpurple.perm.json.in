@@ -1,6 +1,8 @@
 {
     "com.palm.imlibpurple": [
         "imlibpurple-service.operation",
+        "accountsservice.management",
+        "luna-sysmgr.operation",
         "database.operation",
         "activity.operation"
     ]
