@@ -32,7 +32,7 @@ pkg_check_modules(PURPLE REQUIRED purple)
 include_directories(${PURPLE_INCUDE_DIRS})
 webos_add_compiler_flags(ALL ${PURPLE_CFLAGS})
 
-webos_add_compiler_flags(ALL "-DMOJ_LINUX -fno-rtti -std=c++11")
+webos_add_compiler_flags(ALL "-DMOJ_LINUX -fno-rtti -std=c++17")
 
 file(GLOB SOURCES
     src/OnEnabledHandler.cpp
