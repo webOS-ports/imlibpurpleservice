@@ -98,6 +98,7 @@ MojErr IMServiceHandler::onCreate(MojServiceMessage* serviceMsg, const MojObject
 		return err;
 	}
 
+#ifndef IMLIBPURPLE_LEGACY_DB8
     MojObject config;
     payload.get("config", config);
 
@@ -108,6 +109,7 @@ MojErr IMServiceHandler::onCreate(MojServiceMessage* serviceMsg, const MojObject
 
     // Write config to db:
     m_dbClient.put(m_putConfigSlot, res);
+#endif // !IMLIBPURPLE_LEGACY_DB8
 
     serviceMsg->replySuccess();
     return MojErrNone;
@@ -125,11 +127,13 @@ MojErr IMServiceHandler::onDelete(MojServiceMessage* serviceMsg, const MojObject
 		return err;
 	}
 
+#ifndef IMLIBPURPLE_LEGACY_DB8
     MojDbQuery query;
     query.from("com.palm.config.libpurple:1");
     query.where("accountId", MojDbQuery::OpEq, accountId);
 
     m_dbClient.del(m_deleteConfigSlot, query);
+#endif // !IMLIBPURPLE_LEGACY_DB8
 
     serviceMsg->replySuccess();
     return MojErrNone;

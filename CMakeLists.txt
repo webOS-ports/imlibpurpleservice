@@ -34,6 +34,15 @@ webos_add_compiler_flags(ALL ${PURPLE_CFLAGS})
 
 webos_add_compiler_flags(ALL "-DMOJ_LINUX -fno-rtti -std=c++17")
 
+# Legacy db8 (e.g. webOS 3.0.5) has no com.palm.config.libpurple:1 kind, so the
+# modern per-account config-management path (config lookup on account enable +
+# config put/del on create/delete) would fail there and block login. Enable this
+# to bypass it and fall back to the classic pre-config-management behaviour.
+option(IMLIBPURPLE_LEGACY_DB8 "Bypass modern config-management db8 kind (legacy webOS)" OFF)
+if(IMLIBPURPLE_LEGACY_DB8)
+    webos_add_compiler_flags(ALL "-DIMLIBPURPLE_LEGACY_DB8")
+endif()
+
 file(GLOB SOURCES
     src/OnEnabledHandler.cpp
     src/IMLoginState.cpp
