@@ -73,6 +73,13 @@
 static const guint PURPLE_GLIB_READ_COND  = (G_IO_IN | G_IO_HUP | G_IO_ERR);
 static const guint PURPLE_GLIB_WRITE_COND = (G_IO_OUT | G_IO_HUP | G_IO_ERR | G_IO_NVAL);
 static const guint CONNECT_TIMEOUT_SECONDS = 45;
+/* Discord's QR / remote-auth login waits for the user to scan the code and approve
+ * sign-in on a second device (their phone), which routinely takes well over 45s. If
+ * the normal connect timeout fires during that window it disconnects the account and
+ * kills the in-flight ticket->token exchange HTTP request ("no json node"), so the
+ * login silently fails and loops back to a fresh QR. Give interactive QR logins a much
+ * longer grace period. */
+static const guint QR_CONNECT_TIMEOUT_SECONDS = 300;
 
 static LoginCallbackInterface* s_loginState = NULL;
 static IMServiceCallbackInterface* s_imServiceHandler = NULL;
@@ -330,6 +337,15 @@ static std::string stripResourceFromJabberUsername(std::string const& username, 
  */
 static std::string getPrplProtocolIdFromServiceName(std::string const& serviceName)
 {
+	// webOS Teams port: the personal (Teams-for-Life) libpurple plugin registers
+	// as "prpl-teams-personal", which the generic "prpl-" + <type> transform below
+	// cannot derive from the "type_teams" service name. Map it explicitly so
+	// purple_account_new() finds the loaded prpl. Keep the service name "type_teams"
+	// (baked into db8 kinds / capability ids) decoupled from the plugin id.
+	if (serviceName == "type_teams")
+	{
+		return "prpl-teams-personal";
+	}
 	std::string prplProtocolIdToReturn = "prpl-" + serviceName.substr(strlen("type_"), std::string::npos);
 	return prplProtocolIdToReturn;
 }
@@ -810,6 +826,27 @@ static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 	PurpleAccount* loggedInAccount = purple_connection_get_account(gc);
 	g_return_if_fail(loggedInAccount != NULL);
 
+	/* webOS: an account can reach "signed-on" WITHOUT going through
+	 * LibpurpleAdapter::login() -- e.g. purple auto-login of an account persisted in
+	 * accounts.xml when the transport (re)starts. In that case ui_data (which carries
+	 * the account_key + serviceName) was never set, so the account would be registered
+	 * under an empty key and every sendMessage would fail with "not logged in". Repair
+	 * ui_data here from the account itself so registration is always keyed correctly. */
+	if (loggedInAccount->ui_data == NULL)
+	{
+		const char* prpl = loggedInAccount->protocol_id ? loggedInAccount->protocol_id : "";
+		std::string svc;
+		if (strncmp(prpl, "prpl-", 5) == 0)
+			svc = std::string("type_") + (prpl + 5);
+		std::string uname = loggedInAccount->username ? loggedInAccount->username : "";
+
+		AccountMetaData* amd = new AccountMetaData;
+		amd->servicename = svc;
+		amd->account_key = getAccountKey(uname, svc);
+		loggedInAccount->ui_data = (void*)amd;
+		MojLogInfo(IMServiceApp::s_log, _T("account_logged_in_cb: repaired missing ui_data (auto-login); accountKey %s"), amd->account_key.c_str());
+	}
+
 	std::string const& serviceName = getServiceNameFromPurpleAccount(loggedInAccount);
 	std::string const& accountKey = getAccountKeyFromPurpleAccount(loggedInAccount);
 
@@ -832,7 +869,10 @@ static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 	}
 
 	MojLogInfo(IMServiceApp::s_log, _T("account_logged_in_cb: inserting account into onlineAccountData hash table. accountKey %s"), accountKey.c_str());
-	s_onlineAccountData[accountKey] = s_pendingAccountData[accountKey];
+	/* Use the actually-connected account. For a normal login() this equals
+	 * s_pendingAccountData[accountKey]; for an auto-login (not in pending) that lookup
+	 * would insert a NULL, so key off loggedInAccount directly. */
+	s_onlineAccountData[accountKey] = loggedInAccount;
 	s_pendingAccountData.erase(accountKey);
 
 	MojLogInfo(IMServiceApp::s_log, _T("Account connected..."));
@@ -1083,8 +1123,49 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 
 	std::string usernameFromStripped = stripResourceFromJabberUsername(usernameFrom, serviceName);
 
+	// webOS Servers/Rooms (Milestone 0): detect multi-user chat (MUC) conversations - e.g.
+	// Discord guild channels, IRC channels, Teams channels. libpurple delivers these through the
+	// same write_conv slot as 1:1 IMs, so branch on the conversation type. For a chat we resolve
+	// the parent "server" (Discord guild / IRC network) from the room's buddy-list group, which
+	// purple-discord sets to the guild name. channelName/serverName are forwarded onto the
+	// immessage so the ChatThreader/UI can group channels under their server. 1:1 IMs are
+	// unaffected: both pointers stay NULL and the stored record is identical to before.
+	const char* channelName = NULL;
+	std::string serverNameStr;   // guild / network - the room's blist group
+	if (purple_conversation_get_type(conv) == PURPLE_CONV_TYPE_CHAT)
+	{
+		channelName = purple_conversation_get_name(conv);
+		if (channelName && *channelName)
+		{
+			PurpleChat* chat = purple_blist_find_chat(account, channelName);
+			if (chat != NULL)
+			{
+				// The chat's parent blist node is its group; for purple-discord that group
+				// is the guild (server). Use direct field access (public struct member) so we
+				// don't depend on any particular libpurple accessor version.
+				PurpleBlistNode* parent = ((PurpleBlistNode*)chat)->parent;
+				if (parent != NULL && PURPLE_BLIST_NODE_IS_GROUP(parent))
+				{
+					const char* groupName = purple_group_get_name((PurpleGroup*)parent);
+					if (groupName != NULL)
+						serverNameStr = groupName;
+				}
+			}
+		}
+		MojLogInfo(IMServiceApp::s_log,
+			_T("incoming_message_cb: group-chat message. channel: %s server(guild): %s sender: %s"),
+			channelName ? channelName : "", serverNameStr.c_str(), usernameFromStripped.c_str());
+	}
+
 	// call the transport service incoming message handler
-	s_imServiceHandler->incomingIM(serviceName.c_str(), account->username, usernameFromStripped.c_str(), message);
+	// webOS Teams port: forward the libpurple message time (mtime, secs) so history/
+	// offline messages are stored with their original send time, not the arrival time.
+	// webOS Servers/Rooms: forward channel + server (both NULL for 1:1 IMs). serverId has no
+	// stable value from the blist group alone, so mirror serverName for now - Milestone 1 will
+	// pull the real guild id from the chat's components.
+	const char* serverName = serverNameStr.empty() ? NULL : serverNameStr.c_str();
+	s_imServiceHandler->incomingIM(serviceName.c_str(), account->username, usernameFromStripped.c_str(),
+			message, mtime, channelName, serverName, serverName);
 }
 
 /*
@@ -1241,6 +1322,50 @@ static void initializeLibpurple()
  */
 
 /*
+ * webOS Teams port: called from IMServiceHandler::onDelete when a webOS account is
+ * removed. Finds the persisted PurpleAccount tagged with this webOS accountId and
+ * deletes it, so accounts.xml, the buddy list (blist.xml) and the stored OAuth
+ * refresh_token are all removed for a genuinely clean re-add. Returns true if an
+ * account was found and deleted.
+ */
+bool LibpurpleAdapter::deleteAccountByWebosId(const char* accountId, std::string* outUsername, std::string* outServiceName)
+{
+	if (accountId == NULL || *accountId == '\0')
+		return false;
+
+	/* Ensure accounts.xml is loaded so the persisted account is enumerable even if
+	 * the transport was just activated for this delete (idempotent — guarded init). */
+	if (!s_libpurpleInitialized)
+	{
+		initializeLibpurple();
+	}
+
+	for (GList* l = purple_accounts_get_all(); l != NULL; l = l->next)
+	{
+		PurpleAccount* account = (PurpleAccount*)l->data;
+		const char* aid = purple_account_get_string(account, "webosAccountId", NULL);
+		if (aid != NULL && strcmp(aid, accountId) == 0)
+		{
+			/* Capture username + serviceName BEFORE deleting so the caller can purge
+			 * this account's db8 chat records (keyed by username/serviceName). */
+			if (outUsername != NULL && account->username != NULL)
+				outUsername->assign(account->username);
+			if (outServiceName != NULL)
+			{
+				const char* prpl = account->protocol_id ? account->protocol_id : "";
+				if (strncmp(prpl, "prpl-", 5) == 0)
+					outServiceName->assign(std::string("type_") + (prpl + 5));
+			}
+			MojLogInfo(IMServiceApp::s_log, _T("LibpurpleAdapter::deleteAccountByWebosId removing persisted account for %s"), accountId);
+			purple_accounts_delete(account);
+			return true;
+		}
+	}
+	MojLogInfo(IMServiceApp::s_log, _T("LibpurpleAdapter::deleteAccountByWebosId no persisted account for %s"), accountId);
+	return false;
+}
+
+/*
  * Service methods
  */
 LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params, LoginCallbackInterface* loginState)
@@ -1386,11 +1511,21 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 		{
 			/* Create the account */
     		std::string prplProtocolId = getPrplProtocolIdFromServiceName(params.serviceName.data());
-			account = Util::createPurpleAccount(params.username.data(), prplProtocolId.c_str(), params.config);
+
+			/* webOS Teams port: persist the PurpleAccount in accounts.xml so the rotated
+			 * OAuth refresh_token (the prpl stores it as the account password) and the
+			 * buddy list survive transport restarts natively — no out-of-band token files.
+			 * Reuse the persisted account across restarts; only create+add a fresh one. */
+			account = purple_accounts_find(params.username.data(), prplProtocolId.c_str());
 			if (!account)
 			{
-				MojLogError(IMServiceApp::s_log, _T("LibpurpleAdapter::login failed to create new Purple account"));
-				return FAILED;
+				account = Util::createPurpleAccount(params.username.data(), prplProtocolId.c_str(), params.config);
+				if (!account)
+				{
+					MojLogError(IMServiceApp::s_log, _T("LibpurpleAdapter::login failed to create new Purple account"));
+					return FAILED;
+				}
+				purple_accounts_add(account);
 			}
 
             // TODO: If the account did exist before we get a leak here,
@@ -1402,11 +1537,28 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 			amd->servicename = params.serviceName.data();
 
 			account->ui_data = (void*)amd;
+
+			/* Record the webOS accountId as a persisted account setting so onDelete
+			 * can find and remove exactly this account later (accounts.xml survives
+			 * restarts; the in-memory ui_data does not). */
+			if (!params.accountId.empty())
+				purple_account_set_string(account, "webosAccountId", params.accountId.data());
 		}
 
 		MojLogInfo(IMServiceApp::s_log, _T("Logging in..."));
 
-		purple_account_set_password(account, params.password.data());
+		/* Don't clobber a persisted refresh_token (stored as the password by the prpl
+		 * on a previous successful login) with the initial webOS credential. Set the
+		 * password from the webOS credential only when the account has none yet — first
+		 * login, or after an invalid_grant cleared it — so steady-state logins take the
+		 * silent-refresh path instead of restarting the device-code flow every time. */
+		{
+			const char* existingPw = purple_account_get_password(account);
+			if (existingPw == NULL || *existingPw == '\0')
+			{
+				purple_account_set_password(account, params.password.data());
+			}
+		}
 	}
 
 	if (result == OK)
@@ -1432,7 +1584,13 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
          *      delete the string-ptr on removal. Need to implement our own
          *      EventUiOps that handle this.
          */
-        guint timerHandle = purple_timeout_add_seconds(CONNECT_TIMEOUT_SECONDS, connectTimeoutCallback, new std::string(accountKey));
+        /* Discord logs in via an interactive QR / remote-auth flow that waits on the
+         * user's phone; use the longer grace period so we don't tear the account down
+         * mid-handshake. Other protocols keep the normal timeout. */
+        const char* protoId = purple_account_get_protocol_id(account);
+        guint connectTimeout = (protoId != NULL && strcmp(protoId, "prpl-discord") == 0)
+                               ? QR_CONNECT_TIMEOUT_SECONDS : CONNECT_TIMEOUT_SECONDS;
+        guint timerHandle = purple_timeout_add_seconds(connectTimeout, connectTimeoutCallback, new std::string(accountKey));
         s_accountLoginTimers[accountKey] = timerHandle;
 
 		PurpleStatusPrimitive prim = getPurpleAvailabilityFromPalmAvailability(params.availability);

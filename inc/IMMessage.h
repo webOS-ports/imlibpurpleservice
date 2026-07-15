@@ -27,6 +27,7 @@
 #define INCOMINGIMMESSAGE_H_
 
 #include "core/MojObject.h"
+#include <time.h>
 
 // Status is used to describe if the message is pending, has a failure or was successfully sent/received.
 // Default is successful. When messages are moved to the outbox, we change the status to pending. The transports
@@ -70,6 +71,14 @@ typedef enum {
 #define MOJDB_ERROR_CODE	        _T("errorCode")
 #define MOJDB_ERROR_CATEGORY	    _T("errorCategory")
 
+// webOS Servers/Rooms: multi-user-chat (MUC) properties. Only written for group-chat messages
+// (Discord channels, IRC channels, ...); absent on 1:1 IMs. db8 is schemaless so these need no
+// kind change; query indexes are added in Milestone 1.
+#define MOJDB_CHAT_TYPE             _T("chatType")     // "groupchat" for MUC messages
+#define MOJDB_CHANNEL_NAME          _T("channelName")  // room name within the server
+#define MOJDB_SERVER_ID             _T("serverId")     // parent server id (e.g. Discord guild id)
+#define MOJDB_SERVER_NAME           _T("serverName")   // parent server display name (guild/network)
+
 // libpurple transport property names
 #define XPORT_SERVICE_TYPE          _T("serviceName") // gmail, aol etc
 #define XPORT_FROM_ADDRESS 			_T("usernameFrom")
@@ -93,7 +102,10 @@ public:
 	IMMessage();
 	virtual ~IMMessage();
 
-	MojErr initFromCallback(const char* serviceName, const char* username, const char* usernameFrom, const char* message);
+	// webOS Servers/Rooms: channelName/serverId/serverName describe a multi-user-chat (MUC)
+	// message's room + parent server; NULL for ordinary 1:1 IMs.
+	MojErr initFromCallback(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp = 0,
+			const char* channelName = NULL, const char* serverId = NULL, const char* serverName = NULL);
 	MojErr createDBObject(MojObject& returnObject);
 	MojErr unformatFromAddress(const MojString formattedScreenName, MojString& unformattedName);
 
@@ -115,6 +127,13 @@ private:
 
 	// gmail, aol etc
     MojString msgType;
+
+	// webOS Servers/Rooms: multi-user-chat (MUC) metadata. isGroupChat gates whether the fields
+	// below (and the MUC db8 properties) are written; all empty/false for ordinary 1:1 IMs.
+	bool isGroupChat;
+	MojString channelName;   // room name (e.g. Discord channel id/name)
+	MojString serverId;      // parent server id (Discord guild id) - mirrors serverName until M1
+	MojString serverName;    // parent server display name (Discord guild / IRC network)
 
 };
 

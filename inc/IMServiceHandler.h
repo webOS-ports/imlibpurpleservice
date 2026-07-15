@@ -47,7 +47,10 @@ public:
 	MojErr init();
 
 	// libpurple callback
-	virtual bool incomingIM(const char* serviceName, const char* username, const char* usernameFrom, const char* message);
+	// webOS Servers/Rooms: channelName/serverId/serverName are set for multi-user-chat (MUC)
+	// messages (Discord channels etc.), NULL for 1:1 IMs.
+	virtual bool incomingIM(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp = 0,
+			const char* channelName = NULL, const char* serverId = NULL, const char* serverName = NULL);
 	virtual bool updateBuddyStatus(const char* accountId, const char* serviceName, const char* username, int availability,
 			const char* customMessage, const char* groupName, const char* buddyAvatarLoc);
 	virtual bool receivedBuddyInvite(const char* serviceName, const char* username, const char* usernameFrom, const char* message);
@@ -71,11 +74,30 @@ private:
 
 	// Database client used to make any requests (put, watch, find, etc.) to Mojo DB
 	MojDbServiceClient m_dbClient;
+	// Temp DB client (com.palm.tempdb) - imbuddystatus lives there
+	MojDbServiceClient m_tempdbClient;
 
     MojDbClient::Signal::Slot<IMServiceHandler> m_deleteConfigSlot;
     MojErr deleteConfigResult(MojObject& payload, MojErr err);
     MojDbClient::Signal::Slot<IMServiceHandler> m_putConfigSlot;
     MojErr putConfigResult(MojObject& payload, MojErr err);
+
+    /* On account delete, purge the account's db8 chat data so the Messaging app
+     * doesn't keep showing old conversations after the account is gone. Mirrors
+     * OnEnabledHandler::accountDisabled() but driven from onDelete (the disable path
+     * does not reliably run on delete - the account is already gone from the account
+     * manager, so its username/serviceName can't be resolved there). */
+    MojErr purgeAccountData(const char* accountId, const char* username, const char* serviceName);
+    MojDbClient::Signal::Slot<IMServiceHandler> m_deleteImLoginStateSlot;
+    MojErr deleteImLoginStateResult(MojObject& payload, MojErr err);
+    MojDbClient::Signal::Slot<IMServiceHandler> m_deleteImMessagesSlot;
+    MojErr deleteImMessagesResult(MojObject& payload, MojErr err);
+    MojDbClient::Signal::Slot<IMServiceHandler> m_deleteImCommandsSlot;
+    MojErr deleteImCommandsResult(MojObject& payload, MojErr err);
+    MojDbClient::Signal::Slot<IMServiceHandler> m_deleteContactsSlot;
+    MojErr deleteContactsResult(MojObject& payload, MojErr err);
+    MojDbClient::Signal::Slot<IMServiceHandler> m_deleteImBuddyStatusSlot;
+    MojErr deleteImBuddyStatusResult(MojObject& payload, MojErr err);
 
 	IMLoginState* m_loginState;
 	ConnectionState m_connectionState;

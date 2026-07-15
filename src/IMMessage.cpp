@@ -54,6 +54,8 @@ IMMessage::IMMessage()
 	serverTimestamp = 0;
 	status = Successful;
 	folder = Inbox;
+	// webOS Servers/Rooms: default to a 1:1 IM; set true only when channelName is supplied.
+	isGroupChat = false;
 }
 
 IMMessage::~IMMessage() {
@@ -69,7 +71,8 @@ IMMessage::~IMMessage() {
  *
  *
  */
-MojErr IMMessage::initFromCallback(const char* serviceName, const char* username, const char* usernameFrom, const char* message) {
+MojErr IMMessage::initFromCallback(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp,
+		const char* channelName, const char* serverId, const char* serverName) {
 
 	MojErr err;
 
@@ -113,13 +116,35 @@ MojErr IMMessage::initFromCallback(const char* serviceName, const char* username
 	err = msgType.assign(serviceName);
 	MojErrCheck(err);
 
-	// set time stamp to current time - seconds since 1/1/1970
+	// set time stamp - seconds since 1/1/1970
 	// for some reason multiplying a time_t by 1000 doesn't work - you have to convert to a long first...
 	//deviceTimestamp = time (NULL) * 1000;
-	MojInt64 sec = time (NULL);
+	// webOS Teams port: prefer the libpurple message time (composetime of the actual
+	// message) when the caller supplied one, so history/offline messages keep their
+	// original send time instead of appearing with the current (arrival) time. A
+	// non-positive timestamp means "unknown" -> fall back to now.
+	MojInt64 sec = (timestamp > 0) ? (MojInt64) timestamp : (MojInt64) time (NULL);
 	deviceTimestamp = sec * 1000;
 	// server timestamp is new Date().getTime()
 	serverTimestamp = sec * 1000;
+
+	// webOS Servers/Rooms (Milestone 0): capture multi-user-chat (MUC) metadata. When channelName
+	// is supplied the message belongs to a room (Discord channel etc.) rather than a 1:1 IM;
+	// serverId/serverName identify the parent server (guild/network). Stored so ChatThreader can
+	// group channels under their server. Left empty for ordinary 1:1 IMs.
+	isGroupChat = (channelName != NULL && *channelName != '\0');
+	if (isGroupChat) {
+		err = this->channelName.assign(channelName);
+		MojErrCheck(err);
+		if (serverName != NULL && *serverName != '\0') {
+			err = this->serverName.assign(serverName);
+			MojErrCheck(err);
+		}
+		if (serverId != NULL && *serverId != '\0') {
+			err = this->serverId.assign(serverId);
+			MojErrCheck(err);
+		}
+	}
 
 	return MojErrNone;
 }
@@ -176,6 +201,25 @@ MojErr IMMessage::createDBObject(MojObject& returnObj) {
 	// incoming server
 	err = returnObj.putInt(MOJDB_SERVER_TIMESTAMP, serverTimestamp);
 	MojErrCheck(err);
+
+	// webOS Servers/Rooms (Milestone 0): tag multi-user-chat messages with their room + parent
+	// server so ChatThreader/the Messaging app can group channels under a server. Only written for
+	// group-chat messages; 1:1 IMs are stored exactly as before. db8 is schemaless, so these extra
+	// properties need no kind change (query indexes come in Milestone 1).
+	if (isGroupChat) {
+		err = returnObj.putString(MOJDB_CHAT_TYPE, _T("groupchat"));
+		MojErrCheck(err);
+		err = returnObj.putString(MOJDB_CHANNEL_NAME, channelName);
+		MojErrCheck(err);
+		if (!serverName.empty()) {
+			err = returnObj.putString(MOJDB_SERVER_NAME, serverName);
+			MojErrCheck(err);
+		}
+		if (!serverId.empty()) {
+			err = returnObj.putString(MOJDB_SERVER_ID, serverId);
+			MojErrCheck(err);
+		}
+	}
 
 	IMServiceHandler::privatelogIMMessage(_T("DB Message object %s:"), returnObj, MOJDB_MSG_TEXT);
 

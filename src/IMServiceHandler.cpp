@@ -25,12 +25,14 @@
 
 
 #include "IMServiceHandler.h"
+#include "LibpurpleAdapter.h"
 #include "IncomingIMHandler.h"
 #include "IMMessage.h"
 #include "OutgoingIMCommandHandler.h"
 #include "OnEnabledHandler.h"
 #include "IMServiceApp.h"
 #include "BuddyStatusHandler.h"
+#include "IMDefines.h"
 
 #define IMVersionString  "IMLibpurpleService 7-13 12:30pm starting...."
 
@@ -47,8 +49,14 @@ const IMServiceHandler::Method IMServiceHandler::s_methods[] = {
 IMServiceHandler::IMServiceHandler(MojService* service)
 : m_service(service),
   m_dbClient(service),
+  m_tempdbClient(service, MojDbServiceDefs::TempServiceName),
   m_deleteConfigSlot(this, &IMServiceHandler::deleteConfigResult),
   m_putConfigSlot(this, &IMServiceHandler::putConfigResult),
+  m_deleteImLoginStateSlot(this, &IMServiceHandler::deleteImLoginStateResult),
+  m_deleteImMessagesSlot(this, &IMServiceHandler::deleteImMessagesResult),
+  m_deleteImCommandsSlot(this, &IMServiceHandler::deleteImCommandsResult),
+  m_deleteContactsSlot(this, &IMServiceHandler::deleteContactsResult),
+  m_deleteImBuddyStatusSlot(this, &IMServiceHandler::deleteImBuddyStatusResult),
   m_connectionState(service)
 {
 	MojLogTrace(IMServiceApp::s_log);
@@ -127,6 +135,22 @@ MojErr IMServiceHandler::onDelete(MojServiceMessage* serviceMsg, const MojObject
 		return err;
 	}
 
+    /* webOS Teams port: remove the persisted PurpleAccount (accounts.xml + buddy list
+     * + stored OAuth refresh_token) tagged with this webOS accountId, so re-adding the
+     * account starts from a genuinely clean state. Grab the username + serviceName first
+     * so we can purge this account's db8 chat data below. */
+    std::string delUsername, delServiceName;
+    LibpurpleAdapter::deleteAccountByWebosId(accountId.data(), &delUsername, &delServiceName);
+
+    /* Purge the account's db8 chat records so the Messaging app doesn't keep showing old
+     * conversations/contacts after the account is deleted. The disable path
+     * (OnEnabledHandler::accountDisabled) does this on toggle-off, but on a real delete
+     * the account is already gone from the account manager, so its username/serviceName
+     * can't be resolved there and the purge never runs. Do it explicitly here. */
+    purgeAccountData(accountId.data(),
+                     delUsername.empty() ? NULL : delUsername.c_str(),
+                     delServiceName.empty() ? NULL : delServiceName.c_str());
+
 #ifndef IMLIBPURPLE_LEGACY_DB8
     MojDbQuery query;
     query.from("com.palm.config.libpurple:1");
@@ -137,6 +161,122 @@ MojErr IMServiceHandler::onDelete(MojServiceMessage* serviceMsg, const MojObject
 
     serviceMsg->replySuccess();
     return MojErrNone;
+}
+
+/*
+ * Purge all db8 records belonging to a deleted account. Mirrors
+ * OnEnabledHandler::accountDisabled():
+ *   - imloginstate / contact / imbuddystatus  keyed by accountId
+ *   - immessage / imcommand                    keyed by username (+serviceName)
+ * The immessage/imcommand records carry username + serviceName (not accountId), so those
+ * are only purged when we managed to resolve the username from the PurpleAccount. The
+ * ChatThreader service removes the now-empty chats.
+ */
+MojErr IMServiceHandler::purgeAccountData(const char* accountId, const char* username, const char* serviceName)
+{
+	MojLogInfo(IMServiceApp::s_log, _T("purgeAccountData: accountId=%s username=%s serviceName=%s"),
+	           accountId ? accountId : "", username ? username : "", serviceName ? serviceName : "");
+
+	MojErr err;
+
+	// MojDbQuery::where takes a MojObject; MojObject's const char* ctor is private, so
+	// wrap raw strings in MojString (which converts to MojObject implicitly, as elsewhere).
+	MojString accountIdStr;
+	err = accountIdStr.assign(accountId ? accountId : "");
+	MojErrCheck(err);
+
+	// imloginstate - keyed by accountId
+	MojDbQuery queryLoginState;
+	queryLoginState.from(IM_LOGINSTATE_KIND);
+	queryLoginState.where(_T("accountId"), MojDbQuery::OpEq, accountIdStr);
+	err = m_dbClient.del(m_deleteImLoginStateSlot, queryLoginState);
+	MojErrCheck(err);
+
+	// contact - keyed by accountId
+	MojDbQuery queryContact;
+	queryContact.from(IM_CONTACT_KIND);
+	queryContact.where(_T("accountId"), MojDbQuery::OpEq, accountIdStr);
+	err = m_dbClient.del(m_deleteContactsSlot, queryContact);
+	MojErrCheck(err);
+
+	// imbuddystatus - keyed by accountId, lives in tempdb
+	MojDbQuery queryBuddyStatus;
+	queryBuddyStatus.from(IM_BUDDYSTATUS_KIND);
+	queryBuddyStatus.where(_T("accountId"), MojDbQuery::OpEq, accountIdStr);
+	err = m_tempdbClient.del(m_deleteImBuddyStatusSlot, queryBuddyStatus);
+	MojErrCheck(err);
+
+	// immessage + imcommand are keyed by username (the account owner), not accountId.
+	if (username != NULL && *username != '\0')
+	{
+		MojString usernameStr;
+		err = usernameStr.assign(username);
+		MojErrCheck(err);
+		bool haveService = (serviceName != NULL && *serviceName != '\0');
+		MojString serviceNameStr;
+		if (haveService)
+		{
+			err = serviceNameStr.assign(serviceName);
+			MojErrCheck(err);
+		}
+
+		MojDbQuery queryMessage;
+		queryMessage.from(IM_IMMESSAGE_KIND);
+		if (haveService)
+			queryMessage.where(_T("serviceName"), MojDbQuery::OpEq, serviceNameStr);
+		queryMessage.where(_T("username"), MojDbQuery::OpEq, usernameStr);
+		err = m_dbClient.del(m_deleteImMessagesSlot, queryMessage);
+		MojErrCheck(err);
+
+		MojDbQuery queryCommand;
+		queryCommand.from(IM_IMCOMMAND_KIND);
+		if (haveService)
+			queryCommand.where(_T("serviceName"), MojDbQuery::OpEq, serviceNameStr);
+		queryCommand.where(_T("fromUsername"), MojDbQuery::OpEq, usernameStr);
+		err = m_dbClient.del(m_deleteImCommandsSlot, queryCommand);
+		MojErrCheck(err);
+	}
+	else
+	{
+		MojLogError(IMServiceApp::s_log, _T("purgeAccountData: no username resolved - immessage/imcommand not purged for accountId %s"), accountId ? accountId : "");
+	}
+
+	return MojErrNone;
+}
+
+MojErr IMServiceHandler::deleteImLoginStateResult(MojObject& payload, MojErr err)
+{
+	if (err != MojErrNone)
+		MojLogError(IMServiceApp::s_log, _T("purgeAccountData: del(imloginstate) failed: %d"), err);
+	return MojErrNone;
+}
+
+MojErr IMServiceHandler::deleteImMessagesResult(MojObject& payload, MojErr err)
+{
+	if (err != MojErrNone)
+		MojLogError(IMServiceApp::s_log, _T("purgeAccountData: del(immessage) failed: %d"), err);
+	return MojErrNone;
+}
+
+MojErr IMServiceHandler::deleteImCommandsResult(MojObject& payload, MojErr err)
+{
+	if (err != MojErrNone)
+		MojLogError(IMServiceApp::s_log, _T("purgeAccountData: del(imcommand) failed: %d"), err);
+	return MojErrNone;
+}
+
+MojErr IMServiceHandler::deleteContactsResult(MojObject& payload, MojErr err)
+{
+	if (err != MojErrNone)
+		MojLogError(IMServiceApp::s_log, _T("purgeAccountData: del(contact) failed: %d"), err);
+	return MojErrNone;
+}
+
+MojErr IMServiceHandler::deleteImBuddyStatusResult(MojObject& payload, MojErr err)
+{
+	if (err != MojErrNone)
+		MojLogError(IMServiceApp::s_log, _T("purgeAccountData: del(imbuddystatus) failed: %d"), err);
+	return MojErrNone;
 }
 
 MojErr IMServiceHandler::onEnabled(MojServiceMessage* serviceMsg, const MojObject payload)
@@ -318,20 +458,23 @@ MojErr IMServiceHandler::IMSendCmd(MojServiceMessage* serviceMsg, const MojObjec
 /*
  * New incoming IM message
  */
-bool IMServiceHandler::incomingIM(const char* serviceName, const char* username, const char* usernameFrom, const char* message)
+bool IMServiceHandler::incomingIM(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp,
+		const char* channelName, const char* serverId, const char* serverName)
 {
 
 	MojLogTrace(IMServiceApp::s_log);
 
 	// log the parameters
 	// don't log the message text
-	MojLogInfo (IMServiceApp::s_log, _T("incomingIM - IM received. serviceName: %s username: %s usernameFrom: %s"), serviceName, username, usernameFrom);
+	// webOS Servers/Rooms: also log channel/server for multi-user-chat messages
+	MojLogInfo (IMServiceApp::s_log, _T("incomingIM - IM received. serviceName: %s username: %s usernameFrom: %s channel: %s server: %s"),
+			serviceName, username, usernameFrom, channelName ? channelName : "", serverName ? serverName : "");
 
 	// no error - process the IM
 	MojRefCountedPtr<IMMessage> imMessage(new IMMessage);
 
 	// set the message fields based on the incoming parameters
-	MojErr err = imMessage->initFromCallback(serviceName, username, usernameFrom, message);
+	MojErr err = imMessage->initFromCallback(serviceName, username, usernameFrom, message, timestamp, channelName, serverId, serverName);
 
 	if (!err) {
 		// handle the message

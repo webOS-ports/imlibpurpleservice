@@ -30,6 +30,7 @@
 #include <purple.h>
 //#include <lunaservice.h> //TODO remove this once LS is removed from the adapter
 #include <syslog.h>
+#include <string>
 #include "PalmImCommon.h"
 #include "core/MojService.h"
 #include "db/MojDb.h"
@@ -68,7 +69,12 @@ public:
 		RECEIVE_FAILED, //
 	} ReceiveResult;
 
-	virtual bool incomingIM(const char* serviceName, const char* username, const char* usernameFrom, const char* message) = 0;
+	// webOS Teams port: timestamp is the libpurple message time (write_conv mtime, secs);
+	// 0 => use current time. Preserves original send time for history/offline messages.
+	// webOS Servers/Rooms: channelName/serverId/serverName tag a multi-user-chat (MUC) message
+	// with its room + parent server (Discord guild, IRC network). All NULL for ordinary 1:1 IMs.
+	virtual bool incomingIM(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp = 0,
+				const char* channelName = NULL, const char* serverId = NULL, const char* serverName = NULL) = 0;
 	virtual bool updateBuddyStatus(const char* accountId, const char* serviceName, const char* username, int availability,
 				const char* customMessage, const char* groupName, const char* buddyAvatarLoc) = 0;
 	virtual bool receivedBuddyInvite(const char* serviceName, const char* username, const char* usernameFrom, const char* message) = 0;
@@ -99,6 +105,12 @@ public:
 	static LoginResult login(LoginParams const& params, LoginCallbackInterface* loginState);
 	// return false if already logged out
 	static bool logout(const char* serviceName, const char* username, LoginCallbackInterface* loginState);
+	// webOS Teams port: remove the persisted PurpleAccount (accounts.xml + blist +
+	// stored refresh_token) tagged with this webOS accountId, on account deletion.
+	// If outUsername/outServiceName are non-NULL they receive the account's username and
+	// serviceName ("type_<suffix>") BEFORE it is deleted, so the caller can purge that
+	// account's db8 chat data (which is keyed by username/serviceName, not webOS accountId).
+	static bool deleteAccountByWebosId(const char* accountId, std::string* outUsername = NULL, std::string* outServiceName = NULL);
 	static bool getFullBuddyList(const char* serviceName, const char* username);
 	static bool setMyAvailability(const char* serviceName, const char* username, int availability);
 	static bool setMyCustomMessage(const char* serviceName, const char* username, const char* customMessage);
