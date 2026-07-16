@@ -75,7 +75,8 @@ IMMessage::~IMMessage() {
  *
  */
 MojErr IMMessage::initFromCallback(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp,
-		const char* channelName, const char* channelDisplayName, const char* serverId, const char* serverName, bool muted) {
+		const char* channelName, const char* channelDisplayName, const char* serverId, const char* serverName, bool muted,
+		const char* usernameFromDisplay) {
 
 	// Remember whether the source conversation is muted; createDBObject turns this into
 	// flags.noNotification so the Messaging app stores the message but skips the banner.
@@ -183,14 +184,16 @@ MojErr IMMessage::initFromCallback(const char* serviceName, const char* username
 			MojErrCheck(err);
 		}
 
-		// webOS Servers/Rooms: in a group/channel message usernameFrom is the SENDER'S DISPLAY NAME
-		// (tdlib getIncomingGroupchatSenderPurpleName -> account.getDisplayName, e.g. "Pine64 Protocol
-		// Bot"); fromAddress above is its unformatted match key. Keep the readable name as from.name so
-		// the Messaging app can label each group message with who sent it. If usernameFrom carried
-		// astral emoji, fromDisplayName was already set to the encoded form above - leave that. For 1:1
-		// IMs we don't set this: the conversation already resolves to a single person.
-		if (fromDisplayName.empty() && usernameFrom != NULL && *usernameFrom != '\0') {
-			err = fromDisplayName.assign(usernameFrom);
+		// webOS Servers/Rooms: keep the sender's readable DISPLAY name as from.name so the Messaging app
+		// can label each group message with who sent it (fromAddress above stays the routable match key).
+		// Telegram passes the routable id as usernameFrom and the human name separately as
+		// usernameFromDisplay; Discord/IRC put the human name directly in usernameFrom. Encode astral
+		// emoji (display-only, like channelDisplayName/serverName). from.addr is unaffected.
+		const char* dispName = (usernameFromDisplay != NULL && *usernameFromDisplay != '\0') ? usernameFromDisplay : usernameFrom;
+		if (dispName != NULL && *dispName != '\0') {
+			char *safeSender = encodeAstralEntities(dispName);
+			err = fromDisplayName.assign(safeSender ? safeSender : dispName);
+			if (safeSender) free(safeSender);
 			MojErrCheck(err);
 		}
 	}

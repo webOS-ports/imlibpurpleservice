@@ -1364,6 +1364,23 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 	else
 		usernameFrom = "";
 
+	// webOS Servers/Rooms: tdlib-purple smuggles a group message sender as "id<userId>\x1f<Display Name>"
+	// through the single `who` slot. Split it so usernameFrom becomes the routable id (-> from.addr, so
+	// the app can open a 1:1 with the sender) and the display name is forwarded separately (-> from.name).
+	// Non-group messages and other prpls have no \x1f and are unaffected.
+	std::string usernameFromBuf;
+	std::string usernameFromDisplayBuf;
+	{
+		const char* sep = (usernameFrom && *usernameFrom) ? strchr(usernameFrom, '\x1f') : NULL;
+		if (sep != NULL)
+		{
+			usernameFromBuf.assign(usernameFrom, sep - usernameFrom); // "id<userId>"
+			usernameFromDisplayBuf.assign(sep + 1);                   // "Display Name"
+			usernameFrom = usernameFromBuf.c_str();
+		}
+	}
+	const char* usernameFromDisplay = usernameFromDisplayBuf.empty() ? NULL : usernameFromDisplayBuf.c_str();
+
 	if ((flags & PURPLE_MESSAGE_RECV) != PURPLE_MESSAGE_RECV)
 	{
 		/* this is a sent message. ignore it. */
@@ -1455,7 +1472,7 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 	// pull the real guild id from the chat's components.
 	const char* serverName = serverNameStr.empty() ? NULL : serverNameStr.c_str();
 	s_imServiceHandler->incomingIM(serviceName.c_str(), account->username, usernameFromStripped.c_str(),
-			message, mtime, channelName, channelDisplayName, serverName, serverName, muted);
+			message, mtime, channelName, channelDisplayName, serverName, serverName, muted, usernameFromDisplay);
 }
 
 /*

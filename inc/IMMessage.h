@@ -106,7 +106,8 @@ public:
 	// webOS Servers/Rooms: channelName/serverId/serverName describe a multi-user-chat (MUC)
 	// message's room + parent server; NULL for ordinary 1:1 IMs.
 	MojErr initFromCallback(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp = 0,
-			const char* channelName = NULL, const char* channelDisplayName = NULL, const char* serverId = NULL, const char* serverName = NULL, bool muted = false);
+			const char* channelName = NULL, const char* channelDisplayName = NULL, const char* serverId = NULL, const char* serverName = NULL, bool muted = false,
+			const char* usernameFromDisplay = NULL);
 	MojErr createDBObject(MojObject& returnObject);
 	MojErr unformatFromAddress(const MojString formattedScreenName, MojString& unformattedName);
 
