@@ -40,6 +40,8 @@
 #define PLUGIN_SAVE_PREF       "/purple/nullclient/plugins/saved"
 #define UI_ID                  "adapter"
 
+class AuthChannel;
+
 
 /*
  * The adapter callbacks interface
@@ -73,8 +75,10 @@ public:
 	// 0 => use current time. Preserves original send time for history/offline messages.
 	// webOS Servers/Rooms: channelName/serverId/serverName tag a multi-user-chat (MUC) message
 	// with its room + parent server (Discord guild, IRC network). All NULL for ordinary 1:1 IMs.
+	// muted: source conversation is muted server-side (e.g. a muted Telegram chat) -> the message
+	// is stored with flags.noNotification so the Messaging app suppresses the banner. Default false.
 	virtual bool incomingIM(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp = 0,
-				const char* channelName = NULL, const char* serverId = NULL, const char* serverName = NULL) = 0;
+				const char* channelName = NULL, const char* serverId = NULL, const char* serverName = NULL, bool muted = false) = 0;
 	virtual bool updateBuddyStatus(const char* accountId, const char* serviceName, const char* username, int availability,
 				const char* customMessage, const char* groupName, const char* buddyAvatarLoc) = 0;
 	virtual bool receivedBuddyInvite(const char* serviceName, const char* username, const char* usernameFrom, const char* message) = 0;
@@ -102,6 +106,18 @@ public:
 	static void init();
 	static void assignIMLoginState(LoginCallbackInterface* loginState);
 	static void assignIMServiceHandler(IMServiceCallbackInterface* incomingIMHandler);
+	// Interactive-login (Discord QR) challenge channel. See AuthChannel.
+	static void assignAuthChannel(AuthChannel* authChannel);
+	// Start a disposable, not-yet-persisted remote-auth login purely to obtain a QR /
+	// token (create-after-confirm). The QR is surfaced through the AuthChannel; on
+	// remote-auth success the obtained token is pushed as the confirmed credential.
+	static LoginResult startQRLogin(const char* serviceName, const char* username);
+	// Tear down a pending QR-preview login (user cancelled / refreshing the code).
+	static void cancelQRLogin(const char* serviceName, const char* username);
+	// Feed a solved captcha response token back to the prpl's pending request_fields
+	// callback (Discord remote-auth hCaptcha). Returns true if a pending captcha request
+	// was found and its callback invoked.
+	static bool submitCaptcha(const char* serviceName, const char* username, const char* captchaKey);
 	static LoginResult login(LoginParams const& params, LoginCallbackInterface* loginState);
 	// return false if already logged out
 	static bool logout(const char* serviceName, const char* username, LoginCallbackInterface* loginState);

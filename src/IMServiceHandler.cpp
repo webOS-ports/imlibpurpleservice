@@ -44,6 +44,9 @@ const IMServiceHandler::Method IMServiceHandler::s_methods[] = {
 	{_T("loginStateChanged"), (Callback) &IMServiceHandler::handleLoginStateChange},
 	{_T("sendIM"), (Callback) &IMServiceHandler::IMSend}, // callback for activity manager
 	{_T("sendCommand"), (Callback) &IMServiceHandler::IMSendCmd}, // callback for activity manager
+	{_T("startQRLogin"), (Callback) &IMServiceHandler::startQRLogin},
+	{_T("getAuthChallenge"), (Callback) &IMServiceHandler::getAuthChallenge},
+	{_T("submitAuthInput"), (Callback) &IMServiceHandler::submitAuthInput},
 	{NULL, NULL} };
 
 IMServiceHandler::IMServiceHandler(MojService* service)
@@ -64,6 +67,7 @@ IMServiceHandler::IMServiceHandler(MojService* service)
 	m_activeProcesses = 0;
 	m_shutdownCallbackId = 0;
 	m_displayController = NULL;
+	m_authChannel = NULL;
 }
 
 IMServiceHandler::~IMServiceHandler()
@@ -71,6 +75,7 @@ IMServiceHandler::~IMServiceHandler()
 	MojLogTrace(IMServiceApp::s_log);
 	delete m_loginState;
 	delete m_displayController;
+	delete m_authChannel;
 }
 
 
@@ -92,6 +97,10 @@ MojErr IMServiceHandler::init()
 	// create the display controller to keep track of screen changes
 	m_displayController = new DisplayController(m_service);
 	m_displayController->createSubscription();
+
+	// create the interactive-login (QR) challenge channel and hand it to the adapter
+	m_authChannel = new AuthChannel(m_service);
+	LibpurpleAdapter::assignAuthChannel(m_authChannel);
 
 	return MojErrNone;
 }
@@ -459,7 +468,7 @@ MojErr IMServiceHandler::IMSendCmd(MojServiceMessage* serviceMsg, const MojObjec
  * New incoming IM message
  */
 bool IMServiceHandler::incomingIM(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp,
-		const char* channelName, const char* serverId, const char* serverName)
+		const char* channelName, const char* serverId, const char* serverName, bool muted)
 {
 
 	MojLogTrace(IMServiceApp::s_log);
@@ -467,14 +476,16 @@ bool IMServiceHandler::incomingIM(const char* serviceName, const char* username,
 	// log the parameters
 	// don't log the message text
 	// webOS Servers/Rooms: also log channel/server for multi-user-chat messages
-	MojLogInfo (IMServiceApp::s_log, _T("incomingIM - IM received. serviceName: %s username: %s usernameFrom: %s channel: %s server: %s"),
-			serviceName, username, usernameFrom, channelName ? channelName : "", serverName ? serverName : "");
+	MojLogInfo (IMServiceApp::s_log, _T("incomingIM - IM received. serviceName: %s username: %s usernameFrom: %s channel: %s server: %s muted: %d"),
+			serviceName, username, usernameFrom, channelName ? channelName : "", serverName ? serverName : "", muted);
 
 	// no error - process the IM
 	MojRefCountedPtr<IMMessage> imMessage(new IMMessage);
 
-	// set the message fields based on the incoming parameters
-	MojErr err = imMessage->initFromCallback(serviceName, username, usernameFrom, message, timestamp, channelName, serverId, serverName);
+	// set the message fields based on the incoming parameters. muted (chat muted on the server
+	// side, e.g. a muted Telegram chat) becomes flags.noNotification so the Messaging app stores
+	// the message but suppresses the notification banner.
+	MojErr err = imMessage->initFromCallback(serviceName, username, usernameFrom, message, timestamp, channelName, serverId, serverName, muted);
 
 	if (!err) {
 		// handle the message
@@ -580,6 +591,86 @@ MojErr IMServiceHandler::handleLoginStateChange(MojServiceMessage* serviceMsg, c
 	}
 
 	return m_loginState->handleLoginStateChange(serviceMsg, payload);
+}
+
+/*
+ * Discord QR / interactive-login channel. See AuthChannel.
+ *
+ * startQRLogin: kick off a PENDING (disposable) prpl remote-auth login so the prpl
+ * generates the QR. The QR + subsequent state are surfaced over getAuthChallenge.
+ */
+MojErr IMServiceHandler::startQRLogin(MojServiceMessage* serviceMsg, const MojObject payload)
+{
+	MojString serviceName, username;
+	MojErr err = payload.getRequired(_T("serviceName"), serviceName);
+	MojErrCheck(err);
+	err = payload.getRequired(_T("username"), username);
+	MojErrCheck(err);
+
+	MojLogInfo(IMServiceApp::s_log, _T("startQRLogin serviceName=%s username=%s"), serviceName.data(), username.data());
+	LibpurpleAdapter::startQRLogin(serviceName.data(), username.data());
+
+	MojObject reply;
+	err = reply.putBool(_T("returnValue"), true);
+	MojErrCheck(err);
+	return serviceMsg->replySuccess(reply);
+}
+
+// getAuthChallenge: register a (subscription) snapshot feed for this account key.
+MojErr IMServiceHandler::getAuthChallenge(MojServiceMessage* serviceMsg, const MojObject payload)
+{
+	MojString serviceName, username;
+	MojErr err = payload.getRequired(_T("serviceName"), serviceName);
+	MojErrCheck(err);
+	err = payload.getRequired(_T("username"), username);
+	MojErrCheck(err);
+
+	if (m_authChannel == NULL)
+		return serviceMsg->replyError(MojErrNotInitialized, _T("auth channel not ready"));
+
+	return m_authChannel->subscribe(serviceMsg, serviceName.data(), username.data());
+}
+
+// submitAuthInput: the UI's answer to a challenge. For QR we only support
+// refresh (get a fresh code) and cancel (tear the pending login down).
+MojErr IMServiceHandler::submitAuthInput(MojServiceMessage* serviceMsg, const MojObject payload)
+{
+	MojString serviceName, username;
+	MojErr err = payload.getRequired(_T("serviceName"), serviceName);
+	MojErrCheck(err);
+	err = payload.getRequired(_T("username"), username);
+	MojErrCheck(err);
+
+	MojString action;
+	bool found = false;
+	payload.get(_T("action"), action, found);
+	const char* act = found ? action.data() : "";
+
+	MojLogInfo(IMServiceApp::s_log, _T("submitAuthInput serviceName=%s username=%s action=%s"),
+	           serviceName.data(), username.data(), act);
+
+	if (strcmp(act, "cancel") == 0) {
+		LibpurpleAdapter::cancelQRLogin(serviceName.data(), username.data());
+	} else if (strcmp(act, "refresh") == 0) {
+		LibpurpleAdapter::cancelQRLogin(serviceName.data(), username.data());
+		LibpurpleAdapter::startQRLogin(serviceName.data(), username.data());
+	} else if (strcmp(act, "captcha") == 0) {
+		// The UI solved the hCaptcha; hand the response token back to the prpl, which
+		// re-POSTs remote-auth/login with it. value carries the hCaptcha response token.
+		MojString captchaKey;
+		bool haveKey = false;
+		payload.get(_T("value"), captchaKey, haveKey);
+		if (!haveKey)
+			payload.get(_T("captcha_key"), captchaKey, haveKey);
+		bool ok = LibpurpleAdapter::submitCaptcha(serviceName.data(), username.data(),
+		                                          haveKey ? captchaKey.data() : "");
+		if (!ok)
+			MojLogError(IMServiceApp::s_log, _T("submitAuthInput: captcha had no pending request"));
+	}
+
+	if (m_authChannel == NULL)
+		return serviceMsg->replyError(MojErrNotInitialized, _T("auth channel not ready"));
+	return m_authChannel->submitInput(serviceMsg, serviceName.data(), username.data(), act, NULL);
 }
 
 /**

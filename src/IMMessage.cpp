@@ -23,6 +23,7 @@
  * IMMessage class handles saving and retrieving an immessage object from the DB
  */
 
+#include <string.h>
 #include "IMMessage.h"
 #include "IMServiceHandler.h"
 #include "sanitize.h"
@@ -56,6 +57,8 @@ IMMessage::IMMessage()
 	folder = Inbox;
 	// webOS Servers/Rooms: default to a 1:1 IM; set true only when channelName is supplied.
 	isGroupChat = false;
+	// muted messages (chat muted on the server side) get flags.noNotification; default off.
+	muted = false;
 }
 
 IMMessage::~IMMessage() {
@@ -72,7 +75,11 @@ IMMessage::~IMMessage() {
  *
  */
 MojErr IMMessage::initFromCallback(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp,
-		const char* channelName, const char* serverId, const char* serverName) {
+		const char* channelName, const char* serverId, const char* serverName, bool muted) {
+
+	// Remember whether the source conversation is muted; createDBObject turns this into
+	// flags.noNotification so the Messaging app stores the message but skips the banner.
+	this->muted = muted;
 
 	MojErr err;
 
@@ -97,7 +104,14 @@ MojErr IMMessage::initFromCallback(const char* serviceName, const char* username
 	// can't keep this log...
 	//MojLogInfo(IMServiceApp::s_log, _T("original message: %s, unescaped message: %s, sanitized message: %s"), message, unescapedMessage, sanitizedMessage);
 
-	err = msgText.assign(sanitizedMessage);
+	// Encode astral (>U+FFFF) emoji as numeric HTML entities before storing. The device's JS
+	// runtimes corrupt raw 4-byte UTF-8 to U+FFFD on the way out of db8, so this is the only
+	// place (native, pre-db8) the emoji is still intact. The Messaging app decodes the
+	// entities back into inline emoji images. See sanitize.h.
+	char *emojiSafeMessage = encodeAstralEntities(sanitizedMessage);
+
+	err = msgText.assign(emojiSafeMessage);
+	free(emojiSafeMessage);
 	MojErrCheck(err);
 	// cleanup
 	free(unescapedMessage);
@@ -109,6 +123,18 @@ MojErr IMMessage::initFromCallback(const char* serviceName, const char* username
 	err = formattedUserName.assign(usernameFrom);
 	MojErrCheck(err);
 	err = unformatFromAddress(formattedUserName, fromAddress);
+	MojErrCheck(err);
+
+	// If the sender name carries astral emoji, keep an encoded copy for DISPLAY only (written
+	// as the "name" on the from address in createDBObject). fromAddress stays raw so the
+	// conversation match key is unchanged -> emoji-named chats never split. See sanitize.h.
+	char *encFrom = encodeAstralEntities(usernameFrom);
+	if (encFrom && strcmp(encFrom, usernameFrom) != 0) {
+		err = fromDisplayName.assign(encFrom);
+	} else {
+		err = MojErrNone;
+	}
+	if (encFrom) free(encFrom);
 	MojErrCheck(err);
 
 	err = toAddress.assign(username);
@@ -137,7 +163,11 @@ MojErr IMMessage::initFromCallback(const char* serviceName, const char* username
 		err = this->channelName.assign(channelName);
 		MojErrCheck(err);
 		if (serverName != NULL && *serverName != '\0') {
-			err = this->serverName.assign(serverName);
+			// serverName is the guild/network DISPLAY name (serverId is the match key), so encoding
+			// its emoji is display-only and safe. See sanitize.h.
+			char *safeServer = encodeAstralEntities(serverName);
+			err = this->serverName.assign(safeServer);
+			free(safeServer);
 			MojErrCheck(err);
 		}
 		if (serverId != NULL && *serverId != '\0') {
@@ -165,6 +195,13 @@ MojErr IMMessage::createDBObject(MojObject& returnObj) {
 	MojObject addressObj;
 	MojErr err = addressObj.putString(MOJDB_ADDRESS, fromAddress);
 	MojErrCheck(err);
+	// Display-only encoded sender name (set only when it contained astral emoji). The
+	// chatthreader inherits conversation.displayName from this "name" while still matching on
+	// the raw addr above, so emoji render in thread/buddy names without splitting chats.
+	if (!fromDisplayName.empty()) {
+		err = addressObj.putString(_T("name"), fromDisplayName);
+		MojErrCheck(err);
+	}
 	err = returnObj.put(MOJDB_FROM, addressObj);
 	MojErrCheck(err);
 
@@ -201,6 +238,18 @@ MojErr IMMessage::createDBObject(MojObject& returnObj) {
 	// incoming server
 	err = returnObj.putInt(MOJDB_SERVER_TIMESTAMP, serverTimestamp);
 	MojErrCheck(err);
+
+	// Muted conversation (e.g. a Telegram chat the user muted server-side): store the message but
+	// mark it "no notification" so the Messaging app's DashboardManager (isNewMessage checks
+	// flags.noNotification) skips the banner. The message still lands in the inbox and counts as
+	// unread - matching native Telegram, which shows muted chats without alerting.
+	if (muted) {
+		MojObject flags;
+		err = flags.putBool(_T("noNotification"), true);
+		MojErrCheck(err);
+		err = returnObj.put(_T("flags"), flags);
+		MojErrCheck(err);
+	}
 
 	// webOS Servers/Rooms (Milestone 0): tag multi-user-chat messages with their room + parent
 	// server so ChatThreader/the Messaging app can group channels under a server. Only written for

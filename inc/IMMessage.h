@@ -105,13 +105,14 @@ public:
 	// webOS Servers/Rooms: channelName/serverId/serverName describe a multi-user-chat (MUC)
 	// message's room + parent server; NULL for ordinary 1:1 IMs.
 	MojErr initFromCallback(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp = 0,
-			const char* channelName = NULL, const char* serverId = NULL, const char* serverName = NULL);
+			const char* channelName = NULL, const char* serverId = NULL, const char* serverName = NULL, bool muted = false);
 	MojErr createDBObject(MojObject& returnObject);
 	MojErr unformatFromAddress(const MojString formattedScreenName, MojString& unformattedName);
 
 private:
 	MojString msgText;
 	MojString fromAddress;
+	MojString fromDisplayName;  // encoded sender name for display when it contains astral emoji (see sanitize.h); empty otherwise. Never used as a match key.
 	MojString toAddress;
 
 	// only meaningful for incoming messages - this is the time the message was received on the device.
@@ -134,6 +135,11 @@ private:
 	MojString channelName;   // room name (e.g. Discord channel id/name)
 	MojString serverId;      // parent server id (Discord guild id) - mirrors serverName until M1
 	MojString serverName;    // parent server display name (Discord guild / IRC network)
+
+	// muted: the conversation is muted on the server side (e.g. a muted Telegram chat). When true
+	// the message is stored with flags.noNotification so the Messaging app suppresses the banner
+	// (the message still appears/counts as unread, matching native Telegram behaviour).
+	bool muted;
 
 };
 

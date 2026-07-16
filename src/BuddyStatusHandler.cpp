@@ -29,6 +29,7 @@
 #include "IMServiceHandler.h"
 #include "IMDefines.h"
 #include "IMMessage.h"
+#include "sanitize.h"
 
 /*
  * Note the order of the globals inited below, it matters
@@ -65,8 +66,14 @@ MojErr BuddyStatusHandler::updateBuddyStatus(const char* accountId, const char* 
 {
 	// remember the status fields to update
 	m_availability = availability;
-	m_customMessage.assign(customMessage);
-	m_groupName.assign(groupName);
+	// Encode astral emoji in the status message / group name so they survive the device's JS
+	// runtimes (see sanitize.h). These are display-only fields (not address/match keys).
+	char *safeCustom = customMessage ? encodeAstralEntities(customMessage) : NULL;
+	m_customMessage.assign(safeCustom ? safeCustom : customMessage);
+	if (safeCustom) free(safeCustom);
+	char *safeGroup = groupName ? encodeAstralEntities(groupName) : NULL;
+	m_groupName.assign(safeGroup ? safeGroup : groupName);
+	if (safeGroup) free(safeGroup);
 
 
 	//construct our where clause - find by username and accountId

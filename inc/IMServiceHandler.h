@@ -35,6 +35,7 @@
 #include "ConnectionStateHandler.h"
 #include "IMServiceApp.h"
 #include "DisplayController.h"
+#include "AuthChannel.h"
 
 class IMServiceHandler : public MojService::CategoryHandler, public IMServiceCallbackInterface, public IMServiceApp::Listener
 {
@@ -50,7 +51,7 @@ public:
 	// webOS Servers/Rooms: channelName/serverId/serverName are set for multi-user-chat (MUC)
 	// messages (Discord channels etc.), NULL for 1:1 IMs.
 	virtual bool incomingIM(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp = 0,
-			const char* channelName = NULL, const char* serverId = NULL, const char* serverName = NULL);
+			const char* channelName = NULL, const char* serverId = NULL, const char* serverName = NULL, bool muted = false);
 	virtual bool updateBuddyStatus(const char* accountId, const char* serviceName, const char* username, int availability,
 			const char* customMessage, const char* groupName, const char* buddyAvatarLoc);
 	virtual bool receivedBuddyInvite(const char* serviceName, const char* username, const char* usernameFrom, const char* message);
@@ -102,6 +103,8 @@ private:
 	IMLoginState* m_loginState;
 	ConnectionState m_connectionState;
 	DisplayController* m_displayController;
+	// Interactive-login (Discord QR) challenge channel surfaced to the accounts UI.
+	AuthChannel* m_authChannel;
 
 	// count of active processes (signal handlers)
 	MojInt64 m_activeProcesses;
@@ -115,6 +118,14 @@ private:
 
 	MojErr handleLoginStateChange(MojServiceMessage* msg, const MojObject payload);
 	MojErr loginForTesting(MojServiceMessage* msg, const MojObject payload);
+
+	// Discord QR / interactive-login channel (see AuthChannel):
+	//  startQRLogin     {serviceName, username}         - spin up the pending remote-auth login
+	//  getAuthChallenge {serviceName, username}         - (subscribe) push the QR/state snapshot
+	//  submitAuthInput  {serviceName, username, action} - action: refresh | cancel
+	MojErr startQRLogin(MojServiceMessage* msg, const MojObject payload);
+	MojErr getAuthChallenge(MojServiceMessage* msg, const MojObject payload);
+	MojErr submitAuthInput(MojServiceMessage* msg, const MojObject payload);
 
 	// Kicks off the send process. Queries DB for outgoing messages and sends them.
 	MojErr IMSend(MojServiceMessage* msg, const MojObject payload);

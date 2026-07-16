@@ -59,10 +59,12 @@
 #include <stdlib.h>
 #include <unordered_map>
 #include <vector>
+#include <set>
 
 #include "Util.h"
 #include "LibpurpleAdapter.h"
 #include "PalmImCommon.h"
+#include "AuthChannel.h"
 
 //#include <cjson/json.h>
 //#include <lunaservice.h>
@@ -83,6 +85,23 @@ static const guint QR_CONNECT_TIMEOUT_SECONDS = 300;
 
 static LoginCallbackInterface* s_loginState = NULL;
 static IMServiceCallbackInterface* s_imServiceHandler = NULL;
+// Interactive-login (Discord QR) channel + the set of account keys whose current
+// login is a disposable QR-preview (create-after-confirm). Preview logins route
+// their connect callbacks to the AuthChannel, NOT to the webOS login-state machine.
+static AuthChannel* s_authChannel = NULL;
+static std::set<std::string> s_qrPreviewKeys;
+
+// Pending Discord remote-auth captcha requests. The prpl raised purple_request_fields
+// with read-only sitekey/rqdata/rqtoken + an editable "captcha_key" field and an OK
+// callback. We hold the request keyed by account so submitCaptcha() can fill captcha_key
+// with the UI-solved token and invoke the callback (which re-POSTs remote-auth/login).
+typedef void (*PurpleRequestFieldsCbT)(void*, PurpleRequestFields*);
+struct PendingCaptcha {
+	PurpleRequestFields*   fields;
+	PurpleRequestFieldsCbT okCb;
+	void*                  userData;
+};
+static std::unordered_map<std::string, PendingCaptcha> s_pendingCaptcha;
 
 std::hash<std::string> hash;
 
@@ -141,6 +160,7 @@ struct AccountMetaData
 };
 
 static void incoming_message_cb(PurpleConversation *conv, const char *who, const char *alias, const char *message,	PurpleMessageFlags flags, time_t mtime);
+static std::string const& getServiceNameFromPurpleAccount(PurpleAccount* account);
 static void adapterUIInit(void);
 static GHashTable* getClientInfo(void);
 static gboolean adapterInvokeIO(GIOChannel *source, GIOCondition condition, gpointer data);
@@ -246,6 +266,125 @@ static PurpleConversationUiOps adapterConversationUIOps  =
 	NULL, NULL
 };
 
+/* webOS: Discord's remote-auth (QR) login raises the QR through purple_request_fields
+ * (an image field "qr_image" + a string "qr_string"). The stock transport installed no
+ * request ui-ops, so the prpl fell back to dumping the QR into a chat conversation.
+ * Install a request_fields op that forwards the QR image to the AuthChannel, which
+ * surfaces it to the accounts auth UI for inline QR sign-in. Only request_fields is set;
+ * request_input is deliberately left NULL so Telegram's login-code / 2FA capture keeps
+ * its existing sendMessage-routing path untouched. */
+static void* adapter_request_fields(const char *title, const char *primary, const char *secondary,
+        PurpleRequestFields *fields, const char *ok_text, GCallback ok_cb,
+        const char *cancel_text, GCallback cancel_cb, PurpleAccount *account,
+        const char *who, PurpleConversation *conv, void *user_data)
+{
+	// Resolve the account: Discord passes account=NULL, who=username. Fall back to a
+	// pending account whose username matches `who`.
+	PurpleAccount* acct = account;
+	if (acct == NULL && who != NULL)
+	{
+		for (std::unordered_map<std::string, PurpleAccount*>::iterator it = s_pendingAccountData.begin();
+		     it != s_pendingAccountData.end(); ++it)
+		{
+			PurpleAccount* a = it->second;
+			if (a && a->username && strcmp(a->username, who) == 0) { acct = a; break; }
+		}
+	}
+	if (acct == NULL || acct->ui_data == NULL)
+	{
+		MojLogError(IMServiceApp::s_log, _T("adapter_request_fields: could not resolve account (who=%s)"), who ? who : "");
+		return NULL;
+	}
+
+	const guchar* imgData = NULL;
+	gsize imgLen = 0;
+	const char* qrString = NULL;
+	// Captcha fields (Discord remote-auth hCaptcha). Presence of captcha_sitekey marks
+	// this request as a captcha challenge rather than the QR image.
+	const char* capService = NULL;
+	const char* capSitekey = NULL;
+	const char* capRqData = NULL;
+	const char* capRqToken = NULL;
+
+	GList* groups = purple_request_fields_get_groups(fields);
+	for (; groups != NULL; groups = groups->next)
+	{
+		PurpleRequestFieldGroup* group = (PurpleRequestFieldGroup*)groups->data;
+		GList* flds = purple_request_field_group_get_fields(group);
+		for (; flds != NULL; flds = flds->next)
+		{
+			PurpleRequestField* f = (PurpleRequestField*)flds->data;
+			const char* id = purple_request_field_get_id(f);
+			PurpleRequestFieldType t = purple_request_field_get_type(f);
+			if (t == PURPLE_REQUEST_FIELD_IMAGE && id && strcmp(id, "qr_image") == 0)
+			{
+				imgData = (const guchar*)purple_request_field_image_get_buffer(f);
+				imgLen = purple_request_field_image_get_size(f);
+			}
+			else if (t == PURPLE_REQUEST_FIELD_STRING && id && strcmp(id, "qr_string") == 0)
+			{
+				qrString = purple_request_field_string_get_value(f);
+			}
+			else if (t == PURPLE_REQUEST_FIELD_STRING && id && strcmp(id, "captcha_sitekey") == 0)
+				capSitekey = purple_request_field_string_get_value(f);
+			else if (t == PURPLE_REQUEST_FIELD_STRING && id && strcmp(id, "captcha_service") == 0)
+				capService = purple_request_field_string_get_value(f);
+			else if (t == PURPLE_REQUEST_FIELD_STRING && id && strcmp(id, "captcha_rqdata") == 0)
+				capRqData = purple_request_field_string_get_value(f);
+			else if (t == PURPLE_REQUEST_FIELD_STRING && id && strcmp(id, "captcha_rqtoken") == 0)
+				capRqToken = purple_request_field_string_get_value(f);
+		}
+	}
+
+	std::string const& serviceName = getServiceNameFromPurpleAccount(acct);
+	// acct->ui_data (checked non-NULL above) is our AccountMetaData carrying the account key.
+	std::string const  accountKey  = ((AccountMetaData*)acct->ui_data)->account_key;
+
+	// Captcha challenge: hold the request (fields + ok_cb + user_data) so submitCaptcha
+	// can complete it once the UI solves the hCaptcha, then surface it to the UI.
+	if (capSitekey != NULL)
+	{
+		PendingCaptcha pc;
+		pc.fields   = fields;
+		pc.okCb     = (PurpleRequestFieldsCbT)ok_cb;
+		pc.userData = user_data;
+		s_pendingCaptcha[accountKey] = pc;
+
+		MojLogInfo(IMServiceApp::s_log, _T("adapter_request_fields: CAPTCHA for service=%s user=%s (sitekey=%s)"),
+		           serviceName.c_str(), acct->username ? acct->username : "", capSitekey);
+
+		if (s_authChannel)
+			s_authChannel->publishCaptchaChallenge(serviceName.c_str(), acct->username,
+			                                       capService, capSitekey, capRqData, capRqToken);
+
+		// Return a non-NULL handle so the prpl treats the request as accepted. We keep
+		// ownership of `fields` and free it in submitCaptcha after invoking the callback.
+		return (void*)fields;
+	}
+
+	MojLogInfo(IMServiceApp::s_log, _T("adapter_request_fields: QR for service=%s user=%s (%u img bytes)"),
+	           serviceName.c_str(), acct->username ? acct->username : "", (unsigned)imgLen);
+
+	if (s_authChannel)
+		s_authChannel->publishQRChallenge(serviceName.c_str(), acct->username, imgData, imgLen, "image/png", qrString);
+
+	return NULL;   // no ui handle to track
+}
+
+static PurpleRequestUiOps adapterRequestUIOps =
+{
+	NULL,                    // request_input  (left NULL: Telegram keeps its sendMessage path)
+	NULL,                    // request_choice
+	NULL,                    // request_action
+	adapter_request_fields,  // request_fields (Discord QR)
+	NULL,                    // request_file
+	NULL,                    // close_request
+	NULL,                    // request_folder
+	NULL,                    // request_action_with_icon
+	NULL,                    // _purple_reserved1
+	NULL                     // _purple_reserved2
+};
+
 // useful for debugging
 static void authRequest_log_func(gpointer key, gpointer value, gpointer ud)
 {
@@ -263,6 +402,8 @@ void adapterUIInit(void)
 {
 	purple_conversations_set_ui_ops(&adapterConversationUIOps);
 	purple_accounts_set_ui_ops(&adapterAccountUIOps);
+	// Surface interactive-login challenges (Discord QR) to the accounts UI instead of chat.
+	purple_request_set_ui_ops(&adapterRequestUIOps);
 }
 
 void destroyNotify(gpointer dataToFree)
@@ -850,6 +991,38 @@ static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 	std::string const& serviceName = getServiceNameFromPurpleAccount(loggedInAccount);
 	std::string const& accountKey = getAccountKeyFromPurpleAccount(loggedInAccount);
 
+	/* webOS create-after-confirm: this was a disposable QR-preview login. Remote-auth
+	 * succeeded, so the prpl has persisted the Discord token on the account. Hand the
+	 * token to the AuthChannel as the confirmed credential (the UI creates the real
+	 * account with it) and tear the preview down. Do NOT run the normal login-state
+	 * path -- there is no webOS account for this yet. */
+	if (s_qrPreviewKeys.count(accountKey))
+	{
+		const char* token = purple_account_get_string(loggedInAccount, "token", NULL);
+		MojLogInfo(IMServiceApp::s_log, _T("account_logged_in_cb: QR-preview confirmed for %s (token %s)"),
+		           accountKey.c_str(), (token && *token) ? "present" : "MISSING");
+		if (s_authChannel)
+			s_authChannel->setConfirmed(serviceName.c_str(), loggedInAccount->username, token ? token : "");
+
+		if (s_accountLoginTimers.count(accountKey))
+		{
+			purple_timeout_remove(s_accountLoginTimers[accountKey]);
+			s_accountLoginTimers.erase(accountKey);
+		}
+		s_qrPreviewKeys.erase(accountKey);
+		s_pendingAccountData.erase(accountKey);
+		s_onlineAccountData.erase(accountKey);
+		// Delete the disposable preview account entirely (see qrTokenPollCallback): keeping it
+		// persisted would leave an untagged orphan (no webosAccountId) that auto-logs-in +
+		// floods and that onDelete can never remove. The token is already handed to the UI;
+		// the real account is created by the UI and logs in directly with that token.
+		if (purple_account_is_connected(loggedInAccount) || purple_account_is_connecting(loggedInAccount))
+			purple_account_disconnect(loggedInAccount);
+		purple_account_set_enabled(loggedInAccount, UI_ID, FALSE);
+		purple_accounts_delete(loggedInAccount);
+		return;
+	}
+
 	if (s_onlineAccountData.count(accountKey))
 	{
 		// we were online. why are we getting notified that we're connected again? we were never disconnected.
@@ -972,6 +1145,28 @@ static void account_login_failed_cb(PurpleConnection* gc, PurpleConnectionError 
 	gboolean loggedOut = FALSE;
 	bool noRetry = true;
 	std::string const& accountKey = getAccountKeyFromPurpleAccount(account);
+
+	/* webOS create-after-confirm: a disposable QR-preview login failed (bad network,
+	 * QR expired before approval, etc.). Report it on the AuthChannel so the UI can
+	 * offer a refresh, and tear the preview down -- do NOT touch the login-state machine. */
+	if (s_qrPreviewKeys.count(accountKey))
+	{
+		std::string const& svc = getServiceNameFromPurpleAccount(account);
+		MojLogInfo(IMServiceApp::s_log, _T("account_login_failed_cb: QR-preview failed for %s: %s"), accountKey.c_str(), description ? description : "");
+		if (s_authChannel)
+			s_authChannel->setChallengeState(svc.c_str(), account->username,
+			    (type == PURPLE_CONNECTION_ERROR_NETWORK_ERROR) ? AuthChannel::StateExpired : AuthChannel::StateFailed,
+			    description);
+		if (s_accountLoginTimers.count(accountKey))
+		{
+			purple_timeout_remove(s_accountLoginTimers[accountKey]);
+			s_accountLoginTimers.erase(accountKey);
+		}
+		s_qrPreviewKeys.erase(accountKey);
+		s_pendingAccountData.erase(accountKey);
+		s_onlineAccountData.erase(accountKey);
+		return;
+	}
 
 	if (s_onlineAccountData.count(accountKey))
 	{
@@ -1132,6 +1327,11 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 	// unaffected: both pointers stay NULL and the stored record is identical to before.
 	const char* channelName = NULL;
 	std::string serverNameStr;   // guild / network - the room's blist group
+	// Muted-conversation support: the prpl (e.g. tdlib-purple) records a chat's server-side mute
+	// state as a "muted" bool on the buddy (1:1) / chat (group) blist node. Read it here and forward
+	// it so the message is stored with flags.noNotification (banner suppressed, still unread). This
+	// is protocol-agnostic - any prpl that sets the "muted" node bool participates.
+	bool muted = false;
 	if (purple_conversation_get_type(conv) == PURPLE_CONV_TYPE_CHAT)
 	{
 		channelName = purple_conversation_get_name(conv);
@@ -1150,11 +1350,19 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 					if (groupName != NULL)
 						serverNameStr = groupName;
 				}
+				muted = purple_blist_node_get_bool((PurpleBlistNode*)chat, "muted");
 			}
 		}
 		MojLogInfo(IMServiceApp::s_log,
-			_T("incoming_message_cb: group-chat message. channel: %s server(guild): %s sender: %s"),
-			channelName ? channelName : "", serverNameStr.c_str(), usernameFromStripped.c_str());
+			_T("incoming_message_cb: group-chat message. channel: %s server(guild): %s sender: %s muted: %d"),
+			channelName ? channelName : "", serverNameStr.c_str(), usernameFromStripped.c_str(), muted);
+	}
+	else
+	{
+		// 1:1 IM: the buddy node carries the per-chat mute flag.
+		PurpleBuddy* buddy = purple_find_buddy(account, usernameFrom);
+		if (buddy != NULL)
+			muted = purple_blist_node_get_bool((PurpleBlistNode*)buddy, "muted");
 	}
 
 	// call the transport service incoming message handler
@@ -1165,7 +1373,7 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 	// pull the real guild id from the chat's components.
 	const char* serverName = serverNameStr.empty() ? NULL : serverNameStr.c_str();
 	s_imServiceHandler->incomingIM(serviceName.c_str(), account->username, usernameFromStripped.c_str(),
-			message, mtime, channelName, serverName, serverName);
+			message, mtime, channelName, serverName, serverName, muted);
 }
 
 /*
@@ -1247,6 +1455,20 @@ gboolean connectTimeoutCallback(gpointer data)
 	s_pendingAccountData.erase(accountKey);
 	s_ipAddressesBoundTo.erase(accountKey);
 
+	// webOS create-after-confirm: a disposable QR-preview login timed out (the user
+	// never scanned / approved). Report expiry on the AuthChannel so the UI offers a
+	// refresh; do NOT route through the login-state machine (no webOS account exists).
+	if (s_qrPreviewKeys.count(accountKey))
+	{
+		s_qrPreviewKeys.erase(accountKey);
+		if (account && s_authChannel)
+		{
+			std::string const& svc = getServiceNameFromPurpleAccount(account);
+			s_authChannel->setChallengeState(svc.c_str(), account->username, AuthChannel::StateExpired, "QR code expired");
+		}
+		return FALSE;
+	}
+
 	if (s_loginState)
 	{
 		std::string const& serviceName = getServiceNameFromPurpleAccount(account);
@@ -1307,6 +1529,14 @@ static void initializeLibpurple()
 		MojLogInfo(IMServiceApp::s_log, _T("libpurple initialization failed."));
 		abort();
 	}
+
+	/* webOS: /var is a small partition (~62MB). libpurple's per-conversation logging duplicates
+	 * what db8 already stores and grows unbounded under /var/preferences/com.palm.purple/transport/logs.
+	 * Disable it (and system logging) so nothing accumulates there. Must be set after purple_core_init
+	 * so the logging subsystem's prefs exist. */
+	purple_prefs_set_bool("/purple/logging/log_ims", FALSE);
+	purple_prefs_set_bool("/purple/logging/log_chats", FALSE);
+	purple_prefs_set_bool("/purple/logging/log_system", FALSE);
 
 	/* Create and load the buddylist. */
 	purple_set_blist(purple_blist_new());
@@ -2356,6 +2586,246 @@ void LibpurpleAdapter::assignIMServiceHandler(IMServiceCallbackInterface* imServ
 	MojLogInfo(IMServiceApp::s_log, _T("%s called."), __FUNCTION__);
 
 	s_imServiceHandler = imServiceHandler;
+}
+
+void LibpurpleAdapter::assignAuthChannel(AuthChannel* authChannel)
+{
+	MojLogInfo(IMServiceApp::s_log, _T("%s called."), __FUNCTION__);
+	s_authChannel = authChannel;
+}
+
+/* QR-preview token poll. prpl-discord persists the obtained token on the account
+ * (purple_account_set_string "token") the instant remote-auth completes -- BEFORE it
+ * opens the main gateway and starts syncing. We poll for that token rather than wait on
+ * the "signed-on" signal (which did not fire reliably for the disposable preview account,
+ * and which only fires AFTER a full gateway sync -> a flood of messages into a webOS
+ * account that doesn't exist yet). On finding it: hand it to the UI as the confirmed
+ * credential and tear the preview down (disconnect) so nothing syncs. */
+struct QRPollCtx {
+	std::string accountKey;
+	std::string serviceName;
+	std::string username;
+	PurpleAccount* account;
+	int elapsed;
+};
+
+static gboolean qrTokenPollCallback(gpointer data)
+{
+	QRPollCtx* ctx = (QRPollCtx*)data;
+
+	// Preview cancelled/torn down elsewhere -> stop polling.
+	if (s_qrPreviewKeys.count(ctx->accountKey) == 0)
+	{
+		delete ctx;
+		return FALSE;
+	}
+
+	const char* token = purple_account_get_string(ctx->account, "token", NULL);
+	if (token && *token)
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("qrTokenPoll: token obtained for %s -> confirm + tear down preview"), ctx->accountKey.c_str());
+		if (s_authChannel)
+			s_authChannel->setConfirmed(ctx->serviceName.c_str(), ctx->username.c_str(), token);
+
+		s_qrPreviewKeys.erase(ctx->accountKey);
+		s_pendingAccountData.erase(ctx->accountKey);
+		s_onlineAccountData.erase(ctx->accountKey);
+		if (s_accountLoginTimers.count(ctx->accountKey))
+		{
+			purple_timeout_remove(s_accountLoginTimers[ctx->accountKey]);
+			s_accountLoginTimers.erase(ctx->accountKey);
+		}
+		// Delete the disposable preview account entirely -- disconnect it (so it never syncs)
+		// AND remove it from accounts.xml. Keeping it persisted leaves an UNTAGGED orphan (no
+		// webosAccountId), which auto-logs-in on every transport restart and floods, and which
+		// onDelete (deleteAccountByWebosId, matched on webosAccountId) can NEVER clean up --
+		// exactly why deleting the account from the UI did not clear it. The token was already
+		// handed to the UI above; the real account is created by the UI and logs in directly
+		// with that token (passed as its credential -> discord_login uses it, no second QR).
+		if (purple_account_is_connected(ctx->account) || purple_account_is_connecting(ctx->account))
+			purple_account_disconnect(ctx->account);
+		purple_account_set_enabled(ctx->account, UI_ID, FALSE);
+		purple_accounts_delete(ctx->account);
+
+		delete ctx;
+		return FALSE;
+	}
+
+	ctx->elapsed += 1;
+	if (ctx->elapsed > (int)QR_CONNECT_TIMEOUT_SECONDS)
+	{
+		// overall timeout; connectTimeoutCallback (if still armed) reports expiry.
+		delete ctx;
+		return FALSE;
+	}
+	return TRUE;   // keep polling (~1s)
+}
+
+/*
+ * Start a disposable "QR-preview" login (create-after-confirm). This spins up a prpl
+ * account with the QRLOGIN sentinel purely so prpl-discord runs its remote-auth flow and
+ * emits the QR (surfaced via the request_fields ui-op -> AuthChannel). On sign-on the prpl
+ * has persisted the obtained Discord token on the account; account_logged_in_cb detects the
+ * QR-preview key, hands the token to the AuthChannel as the confirmed credential, and tears
+ * the preview down. The real account is then created by the UI with that token and logs in
+ * directly (no second QR). This does NOT touch the webOS login-state machine.
+ */
+LibpurpleAdapter::LoginResult LibpurpleAdapter::startQRLogin(const char* serviceName, const char* username)
+{
+	if (!serviceName || !*serviceName || !username || !*username)
+	{
+		MojLogError(IMServiceApp::s_log, _T("startQRLogin: empty serviceName/username"));
+		return FAILED;
+	}
+
+	std::string const accountKey = getAccountKey(username, serviceName);
+
+	std::string prplProtocolId = getPrplProtocolIdFromServiceName(serviceName);
+
+	/* A previously-saved Discord account auto-logs-in on transport start with its stored
+	 * "token", so by the time the user opens Add-Account it is already CONNECTED (and
+	 * quietly flooding messages). prpl-discord's discord_login does a DIRECT login whenever
+	 * the "token" string is non-empty -- and re-enabling an already-connected account never
+	 * re-runs discord_login at all -- so merely clearing the token + enabling emits no QR.
+	 * The only robust way to force remote-auth is to tear any such account down completely
+	 * and start from a brand-new, tokenless account. purple_accounts_delete disconnects it
+	 * (if connected) and removes it from accounts.xml, which also kills the auto-login flood
+	 * source. The real account is (re)created by the UI after confirm with the fresh token. */
+	PurpleAccount* account = purple_accounts_find(username, prplProtocolId.c_str());
+	if (account)
+	{
+		if (purple_account_is_connected(account) || purple_account_is_connecting(account))
+			purple_account_disconnect(account);
+		purple_account_set_enabled(account, UI_ID, FALSE);
+		purple_accounts_delete(account);
+		account = NULL;
+	}
+	// Drop any stale in-memory session tracking so the fresh login is not mistaken for active.
+	s_onlineAccountData.erase(accountKey);
+	s_pendingAccountData.erase(accountKey);
+	s_offlineAccountData.erase(accountKey);
+
+	MojObject emptyConfig;
+	account = Util::createPurpleAccount(username, prplProtocolId.c_str(), emptyConfig);
+	if (!account)
+	{
+		MojLogError(IMServiceApp::s_log, _T("startQRLogin: failed to create Purple account"));
+		return FAILED;
+	}
+	purple_accounts_add(account);
+
+	AccountMetaData* amd = new AccountMetaData;
+	amd->account_key = accountKey;
+	amd->servicename = serviceName;
+	account->ui_data = (void*)amd;
+
+	/* Fresh account: no "token" string + the QRLOGIN sentinel password -> discord_login
+	 * takes the remote-auth (QR) path (see discord_login: token empty AND password=="QRLOGIN"). */
+	purple_account_set_password(account, "QRLOGIN");
+
+	s_pendingAccountData[accountKey] = account;
+	s_qrPreviewKeys.insert(accountKey);
+
+	purple_account_set_enabled(account, UI_ID, TRUE);
+
+	// Poll for the token the moment remote-auth completes (robust; independent of the
+	// signed-on signal) and tear the preview down before it syncs. See qrTokenPollCallback.
+	QRPollCtx* pollCtx = new QRPollCtx;
+	pollCtx->accountKey  = accountKey;
+	pollCtx->serviceName = serviceName;
+	pollCtx->username    = username;
+	pollCtx->account     = account;
+	pollCtx->elapsed     = 0;
+	purple_timeout_add_seconds(1, qrTokenPollCallback, pollCtx);
+
+	// QR grace-period timeout; connectTimeoutCallback special-cases QR-preview keys.
+	guint timerHandle = purple_timeout_add_seconds(QR_CONNECT_TIMEOUT_SECONDS, connectTimeoutCallback, new std::string(accountKey));
+	s_accountLoginTimers[accountKey] = timerHandle;
+
+	PurpleSavedStatus* savedStatus = purple_savedstatus_new(NULL, PURPLE_STATUS_AVAILABLE);
+	purple_savedstatus_activate_for_account(savedStatus, account);
+
+	MojLogInfo(IMServiceApp::s_log, _T("startQRLogin: pending QR login started for %s"), accountKey.c_str());
+	return OK;
+}
+
+void LibpurpleAdapter::cancelQRLogin(const char* serviceName, const char* username)
+{
+	if (!serviceName || !username)
+		return;
+	std::string const accountKey = getAccountKey(username, serviceName);
+	MojLogInfo(IMServiceApp::s_log, _T("cancelQRLogin: %s"), accountKey.c_str());
+
+	s_qrPreviewKeys.erase(accountKey);
+
+	// Discard any pending captcha request for this account (destroy the held fields).
+	if (s_pendingCaptcha.count(accountKey))
+	{
+		if (s_pendingCaptcha[accountKey].fields)
+			purple_request_fields_destroy(s_pendingCaptcha[accountKey].fields);
+		s_pendingCaptcha.erase(accountKey);
+	}
+
+	if (s_accountLoginTimers.count(accountKey))
+	{
+		purple_timeout_remove(s_accountLoginTimers[accountKey]);
+		s_accountLoginTimers.erase(accountKey);
+	}
+
+	PurpleAccount* account = NULL;
+	if (s_pendingAccountData.count(accountKey))
+		account = s_pendingAccountData[accountKey];
+	else if (s_onlineAccountData.count(accountKey))
+		account = s_onlineAccountData[accountKey];
+
+	s_pendingAccountData.erase(accountKey);
+	s_onlineAccountData.erase(accountKey);
+
+	if (account)
+		purple_account_set_enabled(account, UI_ID, FALSE);
+
+	if (s_authChannel)
+		s_authChannel->clearChallenge(serviceName, username);
+}
+
+/*
+ * Feed a UI-solved captcha response token back into the prpl's pending request_fields
+ * callback. adapter_request_fields stored the PurpleRequestFields + ok callback keyed by
+ * account when Discord raised the hCaptcha; here we set the editable "captcha_key" field
+ * to the solved token and invoke that callback, which re-POSTs remote-auth/login. The
+ * held fields are then destroyed (we own them; the prpl uses no close_request ui-op).
+ */
+bool LibpurpleAdapter::submitCaptcha(const char* serviceName, const char* username, const char* captchaKey)
+{
+	if (!serviceName || !username)
+		return false;
+	std::string const accountKey = getAccountKey(username, serviceName);
+
+	std::unordered_map<std::string, PendingCaptcha>::iterator it = s_pendingCaptcha.find(accountKey);
+	if (it == s_pendingCaptcha.end())
+	{
+		MojLogError(IMServiceApp::s_log, _T("submitCaptcha: no pending captcha request for %s"), accountKey.c_str());
+		return false;
+	}
+
+	PendingCaptcha pc = it->second;
+	s_pendingCaptcha.erase(it);   // erase before invoking (callback may raise a new captcha)
+
+	MojLogInfo(IMServiceApp::s_log, _T("submitCaptcha: completing captcha for %s (key %s)"),
+	           accountKey.c_str(), (captchaKey && *captchaKey) ? "present" : "EMPTY");
+
+	if (pc.fields)
+	{
+		PurpleRequestField* keyField = purple_request_fields_get_field(pc.fields, "captcha_key");
+		if (keyField)
+			purple_request_field_string_set_value(keyField, captchaKey ? captchaKey : "");
+
+		if (pc.okCb)
+			pc.okCb(pc.userData, pc.fields);
+
+		purple_request_fields_destroy(pc.fields);
+	}
+	return true;
 }
 
 /*
