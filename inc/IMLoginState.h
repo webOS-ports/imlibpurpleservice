@@ -113,6 +113,10 @@ public:
 
 	virtual void loginResult(const char* serviceName, const char* username, LoginCallbackInterface::LoginResult type, bool loggedOut, const char* errCode, bool noRetry);
 	virtual void buddyListResult(const char* serviceName, const char* username, MojObject& buddyList, bool fullList);
+	// webOS Telegram port: re-run the full buddy-list sync for an account whose buddies arrived
+	// after the login-time snapshot (tdlib async chat load). Bumps the imloginstate record back to
+	// GETTING_BUDDIES so the existing login-state db-watch re-drives getBuddyLists().
+	virtual void buddyListChanged(const char* serviceName, const char* username);
 
 	void handlerDone(IMLoginStateHandlerInterface* handler);
 
@@ -175,6 +179,10 @@ public:
 	 */
 	virtual void fullBuddyListResult(const char* serviceName, const char* username, MojObject& buddyList);
 
+	// webOS Telegram port: bump this account's imloginstate record back to GETTING_BUDDIES so the
+	// login-state db-watch re-drives getBuddyLists() (re-sync buddies that arrived after login).
+	MojErr requestBuddyResync(const MojString& serviceName, const MojString& username);
+
 private:
 	MojErr adoptActivity();
 	MojErr completeAndResetWatch();
@@ -206,6 +214,10 @@ private:
 
 	MojDbClient::Signal::Slot<IMLoginStateHandler> m_updateLoginStateSlot;
 	MojErr updateLoginStateResult(MojObject& result, MojErr err);
+
+	// webOS Telegram port: response slot for the buddy-resync imloginstate bump (requestBuddyResync)
+	MojDbClient::Signal::Slot<IMLoginStateHandler> m_resyncBumpSlot;
+	MojErr resyncBumpResult(MojObject& result, MojErr err);
 
 	MojDbClient::Signal::Slot<IMLoginStateHandler> m_ignoreUpdateLoginStateSlot;
 	MojErr ignoreUpdateLoginStateResult(MojObject& result, MojErr err);

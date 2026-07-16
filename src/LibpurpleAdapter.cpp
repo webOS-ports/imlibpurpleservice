@@ -953,10 +953,75 @@ static void buddy_blocked_cb(PurpleBuddy* buddy)
  * Called both after we add a buddy to our list and when we accept a remote users' invitation to add us to their list
  * buddy is the new buddy
  */
+/*
+ * webOS Telegram port: coalesce a burst of buddy-added signals into a single buddy-list re-sync.
+ * The login-time buddy snapshot (getFullBuddyList) runs once, right after login. Protocols like
+ * tdlib-purple load their chat/contact list asynchronously AFTER login, so those buddies arrive
+ * via buddy-added past the snapshot and used to be dropped (buddy_added_cb was a no-op, and the
+ * incremental buddyListResult(fullList=false) path does nothing). We debounce the burst and ask
+ * the login-state layer to re-run the full sync so these become db8 contacts.
+ */
+#define BUDDY_RESYNC_DEBOUNCE_SECONDS 8
+
+struct BuddyResyncCtx
+{
+	std::string serviceName;
+	std::string username;
+	std::string accountKey;
+	guint timerId;
+};
+static std::unordered_map<std::string, BuddyResyncCtx*> s_buddyResyncCtx;
+
+static gboolean buddyResyncTimeoutCallback(gpointer data)
+{
+	BuddyResyncCtx* ctx = (BuddyResyncCtx*)data;
+	s_buddyResyncCtx.erase(ctx->accountKey);
+	if (s_loginState != NULL)
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("buddyResyncTimeoutCallback: requesting buddy re-sync for %s"), ctx->accountKey.c_str());
+		s_loginState->buddyListChanged(ctx->serviceName.c_str(), ctx->username.c_str());
+	}
+	delete ctx;
+	return FALSE; // one-shot
+}
+
 static void buddy_added_cb(PurpleBuddy* buddy)
 {
-	// nothing to do...
 	MojLogInfo(IMServiceApp::s_log, _T("buddy added %s"), buddy->name);
+
+	PurpleAccount* account = purple_buddy_get_account(buddy);
+	if (account == NULL)
+		return;
+
+	// Only re-sync for a live, logged-in account. Buddies added while the account is still
+	// connecting (or loaded from blist at startup) are covered by the normal login-time snapshot.
+	if (!purple_account_is_connected(account))
+		return;
+
+	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
+	std::string const& accountKey = getAccountKeyFromPurpleAccount(account);
+	const char* username = account->username;
+	if (serviceName.empty() || username == NULL || *username == '\0')
+		return;
+
+	// Reset any pending debounce timer for this account so the re-sync fires once, ~8s after the
+	// LAST buddy in the burst is added (covers both the post-login load and later single additions).
+	BuddyResyncCtx* ctx = NULL;
+	std::unordered_map<std::string, BuddyResyncCtx*>::iterator it = s_buddyResyncCtx.find(accountKey);
+	if (it != s_buddyResyncCtx.end())
+	{
+		ctx = it->second;
+		purple_timeout_remove(ctx->timerId);
+	}
+	else
+	{
+		ctx = new BuddyResyncCtx;
+		ctx->accountKey = accountKey;
+		s_buddyResyncCtx[accountKey] = ctx;
+	}
+	ctx->serviceName = serviceName;
+	ctx->username = username;
+	ctx->timerId = purple_timeout_add_seconds(BUDDY_RESYNC_DEBOUNCE_SECONDS, buddyResyncTimeoutCallback, ctx);
 }
 
 static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)

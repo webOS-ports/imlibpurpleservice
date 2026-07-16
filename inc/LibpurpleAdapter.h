@@ -58,6 +58,11 @@ public:
 
 	virtual void loginResult(const char* serviceName, const char* username, LoginResult type, bool loggedOut, const char* errCode, bool noRetry) = 0;
 	virtual void buddyListResult(const char* serviceName, const char* username, MojObject& buddyList, bool fullList) = 0;
+	// webOS Telegram port: the buddy list changed AFTER the login-time getFullBuddyList() one-shot
+	// snapshot (e.g. tdlib-purple loads its chats/contacts asynchronously post-login, so those
+	// buddies never made it into a db8 contact). Ask the login-state layer to re-run the full
+	// buddy-list sync (getBuddyLists) for this account. The adapter debounces the post-login burst.
+	virtual void buddyListChanged(const char* serviceName, const char* username) = 0;
 };
 
 /*

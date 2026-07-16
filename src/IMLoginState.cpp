@@ -172,6 +172,30 @@ void IMLoginState::buddyListResult(const char* serviceName, const char* username
 }
 
 
+/*
+ * webOS Telegram port: the transport (LibpurpleAdapter::buddy_added_cb, debounced) tells us the
+ * buddy list changed after the login-time snapshot. Re-run the full buddy sync by bumping the
+ * account's imloginstate record back to GETTING_BUDDIES; the existing db-watch then re-drives
+ * getBuddyLists() -> getFullBuddyList() + consolidate, which now sees the async-loaded buddies.
+ * A short-lived handler carries the db8 merge (kept alive by its outstanding request slot).
+ */
+void IMLoginState::buddyListChanged(const char* serviceName, const char* username)
+{
+	if (serviceName == NULL || username == NULL)
+		return;
+
+	MojLogInfo(IMServiceApp::s_log, _T("buddyListChanged: scheduling buddy re-sync for %s/%s"), serviceName, username);
+
+	MojString svc;
+	svc.assign(serviceName);
+	MojString user;
+	user.assign(username);
+
+	MojRefCountedPtr<IMLoginStateHandler> handler = new IMLoginStateHandler(m_service, m_loginStateRevision, this);
+	handler->requestBuddyResync(svc, user);
+}
+
+
 bool IMLoginState::getLoginStateData(const MojString& key, LoginStateData& state)
 {
 	bool found = (m_loginState.find(key) != m_loginState.end());
@@ -214,6 +238,7 @@ IMLoginStateHandler::IMLoginStateHandler(MojService* service, MojInt64 loginStat
   m_loginStateQuerySlot(this, &IMLoginStateHandler::loginStateQueryResult),
   m_getCredentialsSlot(this, &IMLoginStateHandler::getCredentialsResult),
   m_updateLoginStateSlot(this, &IMLoginStateHandler::updateLoginStateResult),
+  m_resyncBumpSlot(this, &IMLoginStateHandler::resyncBumpResult),
   m_ignoreUpdateLoginStateSlot(this, &IMLoginStateHandler::ignoreUpdateLoginStateResult),
   m_queryForContactsSlot(this, &IMLoginStateHandler::queryForContactsResult),
   m_queryForBuddyStatusSlot(this, &IMLoginStateHandler::queryForBuddyStatusResult),
@@ -879,6 +904,43 @@ MojErr IMLoginStateHandler::processLoginStates(MojObject& loginStateArray)
 }
 
 
+// webOS Telegram port: bump the account's imloginstate record back to GETTING_BUDDIES. This is a
+// no-op state-wise for an already-online account, but it makes the login-state db-watch re-fire
+// (LoginStateData::needsToGetBuddies now also accepts an ONLINE predecessor) so getBuddyLists()
+// runs again and picks up buddies that tdlib loaded asynchronously after the login snapshot.
+MojErr IMLoginStateHandler::requestBuddyResync(const MojString& serviceName, const MojString& username)
+{
+	MojLogInfo(IMServiceApp::s_log, _T("requestBuddyResync: bumping imloginstate to GETTING_BUDDIES for %s/%s"),
+			serviceName.data(), username.data());
+
+	MojDbQuery query;
+	MojErr err = query.where("serviceName", MojDbQuery::OpEq, serviceName);
+	MojErrCheck(err);
+	err = query.where("username", MojDbQuery::OpEq, username);
+	MojErrCheck(err);
+	err = query.from(IM_LOGINSTATE_KIND);
+	MojErrCheck(err);
+
+	MojObject mergeProps;
+	err = mergeProps.putString("state", LOGIN_STATE_GETTING_BUDDIES);
+	MojErrCheck(err);
+
+	err = m_dbClient.merge(m_resyncBumpSlot, query, mergeProps);
+	MojErrCheck(err);
+
+	return MojErrNone;
+}
+
+MojErr IMLoginStateHandler::resyncBumpResult(MojObject& result, MojErr err)
+{
+	if (err)
+		MojLogError(IMServiceApp::s_log, _T("resyncBumpResult: imloginstate bump failed err=%d"), err);
+	else
+		MojLogInfo(IMServiceApp::s_log, _T("resyncBumpResult: imloginstate bumped; db-watch will re-sync buddies"));
+	return MojErrNone;
+}
+
+
 // This fires off 3 asynchronous requests with the responses being stored in m_buddyListConsolidator
 // So whichever of the 3 returns last will continue the buddy list processing
 MojErr IMLoginStateHandler::getBuddyLists(const MojString& serviceName, const MojString& username, const MojString& accountId)
@@ -1265,7 +1327,10 @@ bool LoginStateData::needsToLogin(LoginStateData& oldState)
 
 bool LoginStateData::needsToGetBuddies(LoginStateData& oldState)
 {
-	return (m_state == LOGIN_STATE_GETTING_BUDDIES && m_availability != PalmAvailability::OFFLINE && m_availability != PalmAvailability::NO_PRESENCE && (oldState.m_state == LOGIN_STATE_OFFLINE || oldState.m_state == LOGIN_STATE_LOGGING_ON));
+	// webOS Telegram port: also allow an already-ONLINE account to re-enter GETTING_BUDDIES. This
+	// lets a post-login buddy re-sync (see IMLoginState::buddyListChanged / requestBuddyResync) drive
+	// getBuddyLists() again for buddies that tdlib loaded asynchronously after the login snapshot.
+	return (m_state == LOGIN_STATE_GETTING_BUDDIES && m_availability != PalmAvailability::OFFLINE && m_availability != PalmAvailability::NO_PRESENCE && (oldState.m_state == LOGIN_STATE_OFFLINE || oldState.m_state == LOGIN_STATE_LOGGING_ON || oldState.m_state == LOGIN_STATE_ONLINE));
 }
 
 bool LoginStateData::needsToLogoff(LoginStateData& oldState)
