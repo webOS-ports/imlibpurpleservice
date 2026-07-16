@@ -2359,6 +2359,53 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::declineBuddy(const char* serviceN
 	return SENT;
 }
 
+// webOS Telegram port: reduce a display name to plain printable ASCII (0x20-0x7E), collapsing runs of
+// whitespace and trimming. Old webOS (enyo, no emoji/CJK/Thai fonts) renders anything else as tofu
+// boxes, and astral-plane chars (emoji) can break the messaging JS. May return empty if the input had
+// no ASCII content. Non-ASCII bytes are dropped without emitting a space, so "a<emoji>b" -> "ab" while
+// "a <emoji> b" -> "a b".
+static std::string reduceToAscii(const char* in)
+{
+	std::string out;
+	if (in == NULL)
+		return out;
+	bool prevSpace = false;
+	for (const unsigned char* p = (const unsigned char*)in; *p; ++p)
+	{
+		unsigned char c = *p;
+		if (c < 0x20 || c > 0x7E)
+			continue; // drop non-printable / non-ASCII
+		bool isSpace = (c == ' ' || c == '\t');
+		if (isSpace)
+		{
+			if (!out.empty() && !prevSpace)
+				out.push_back(' ');
+			prevSpace = true;
+		}
+		else
+		{
+			out.push_back((char)c);
+			prevSpace = false;
+		}
+	}
+	while (!out.empty() && out[out.size() - 1] == ' ')
+		out.erase(out.size() - 1);
+	return out;
+}
+
+// webOS Telegram port: true if a buddy display name (alias) is effectively empty (NULL/""/whitespace).
+// tdlib gives deleted Telegram accounts no name, so they arrive as nameless buddies whose contact then
+// shows the raw "id<number>" - skip those entirely.
+static bool isBlankName(const char* s)
+{
+	if (s == NULL)
+		return true;
+	for (const char* p = s; *p; ++p)
+		if (*p != ' ' && *p != '\t')
+			return false;
+	return true;
+}
+
 bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* username)
 {
 	MojLogInfo(IMServiceApp::s_log, "%s called.", __FUNCTION__);
@@ -2410,6 +2457,15 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 			buddyObj.clear(MojObject::TypeArray);
 			buddyToBeAdded = (PurpleBuddy*)buddyIterator->data;
 
+			// webOS Telegram port: skip deleted/nameless users. tdlib gives them no name, so the
+			// contact would otherwise show a raw "id<number>". Not reporting them here also makes the
+			// BuddyListConsolidator delete any such contacts left from a previous (pre-filter) sync.
+			if (isBlankName(buddyToBeAdded->alias))
+			{
+				MojLogInfo(IMServiceApp::s_log, _T("getFullBuddyList: skipping nameless buddy %s (deleted user?)"), buddyToBeAdded->name);
+				continue;
+			}
+
 			buddyObj.putString("username", buddyToBeAdded->name);
 			buddyObj.putString("serviceName", serviceName);
 
@@ -2427,7 +2483,11 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 
 			if (buddyToBeAdded->alias != NULL)
 			{
-				buddyObj.putString("displayName", buddyToBeAdded->alias);
+				// webOS Telegram port: reduce the name to plain ASCII so emoji/CJK/Thai don't render as
+				// tofu. If a name is entirely non-ASCII it reduces to empty - keep the original then, since
+				// a tofu name is still more useful than falling back to a raw "id<number>".
+				std::string asciiName = reduceToAscii(buddyToBeAdded->alias);
+				buddyObj.putString("displayName", asciiName.empty() ? buddyToBeAdded->alias : asciiName.c_str());
 			}
 
 			PurpleBuddyIcon* icon = purple_buddy_get_icon(buddyToBeAdded);
