@@ -51,7 +51,7 @@ public:
 	// webOS Servers/Rooms: channelName/serverId/serverName are set for multi-user-chat (MUC)
 	// messages (Discord channels etc.), NULL for 1:1 IMs.
 	virtual bool incomingIM(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp = 0,
-			const char* channelName = NULL, const char* serverId = NULL, const char* serverName = NULL, bool muted = false);
+			const char* channelName = NULL, const char* channelDisplayName = NULL, const char* serverId = NULL, const char* serverName = NULL, bool muted = false);
 	virtual bool updateBuddyStatus(const char* accountId, const char* serviceName, const char* username, int availability,
 			const char* customMessage, const char* groupName, const char* buddyAvatarLoc);
 	virtual bool receivedBuddyInvite(const char* serviceName, const char* username, const char* usernameFrom, const char* message);

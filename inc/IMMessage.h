@@ -75,7 +75,8 @@ typedef enum {
 // (Discord channels, IRC channels, ...); absent on 1:1 IMs. db8 is schemaless so these need no
 // kind change; query indexes are added in Milestone 1.
 #define MOJDB_CHAT_TYPE             _T("chatType")     // "groupchat" for MUC messages
-#define MOJDB_CHANNEL_NAME          _T("channelName")  // room name within the server
+#define MOJDB_CHANNEL_NAME          _T("channelName")  // stable room key (e.g. Discord channel id, Telegram chat-<id>)
+#define MOJDB_CHANNEL_DISPLAY_NAME  _T("channelDisplayName")  // human room title (e.g. Telegram group title)
 #define MOJDB_SERVER_ID             _T("serverId")     // parent server id (e.g. Discord guild id)
 #define MOJDB_SERVER_NAME           _T("serverName")   // parent server display name (guild/network)
 
@@ -105,7 +106,7 @@ public:
 	// webOS Servers/Rooms: channelName/serverId/serverName describe a multi-user-chat (MUC)
 	// message's room + parent server; NULL for ordinary 1:1 IMs.
 	MojErr initFromCallback(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp = 0,
-			const char* channelName = NULL, const char* serverId = NULL, const char* serverName = NULL, bool muted = false);
+			const char* channelName = NULL, const char* channelDisplayName = NULL, const char* serverId = NULL, const char* serverName = NULL, bool muted = false);
 	MojErr createDBObject(MojObject& returnObject);
 	MojErr unformatFromAddress(const MojString formattedScreenName, MojString& unformattedName);
 
@@ -132,7 +133,8 @@ private:
 	// webOS Servers/Rooms: multi-user-chat (MUC) metadata. isGroupChat gates whether the fields
 	// below (and the MUC db8 properties) are written; all empty/false for ordinary 1:1 IMs.
 	bool isGroupChat;
-	MojString channelName;   // room name (e.g. Discord channel id/name)
+	MojString channelName;   // stable room key (e.g. Discord channel id/name, Telegram chat-<id>)
+	MojString channelDisplayName;   // human room title (Telegram group name); channelName stays the match key
 	MojString serverId;      // parent server id (Discord guild id) - mirrors serverName until M1
 	MojString serverName;    // parent server display name (Discord guild / IRC network)
 

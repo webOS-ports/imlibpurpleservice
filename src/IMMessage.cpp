@@ -75,7 +75,7 @@ IMMessage::~IMMessage() {
  *
  */
 MojErr IMMessage::initFromCallback(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp,
-		const char* channelName, const char* serverId, const char* serverName, bool muted) {
+		const char* channelName, const char* channelDisplayName, const char* serverId, const char* serverName, bool muted) {
 
 	// Remember whether the source conversation is muted; createDBObject turns this into
 	// flags.noNotification so the Messaging app stores the message but skips the banner.
@@ -162,6 +162,14 @@ MojErr IMMessage::initFromCallback(const char* serviceName, const char* username
 	if (isGroupChat) {
 		err = this->channelName.assign(channelName);
 		MojErrCheck(err);
+		if (channelDisplayName != NULL && *channelDisplayName != '\0') {
+			// Human room title (Telegram group name etc.) - display only, so encode astral emoji
+			// like serverName. channelName remains the stable match key. See sanitize.h.
+			char *safeChannel = encodeAstralEntities(channelDisplayName);
+			err = this->channelDisplayName.assign(safeChannel);
+			free(safeChannel);
+			MojErrCheck(err);
+		}
 		if (serverName != NULL && *serverName != '\0') {
 			// serverName is the guild/network DISPLAY name (serverId is the match key), so encoding
 			// its emoji is display-only and safe. See sanitize.h.
@@ -260,6 +268,10 @@ MojErr IMMessage::createDBObject(MojObject& returnObj) {
 		MojErrCheck(err);
 		err = returnObj.putString(MOJDB_CHANNEL_NAME, channelName);
 		MojErrCheck(err);
+		if (!channelDisplayName.empty()) {
+			err = returnObj.putString(MOJDB_CHANNEL_DISPLAY_NAME, channelDisplayName);
+			MojErrCheck(err);
+		}
 		if (!serverName.empty()) {
 			err = returnObj.putString(MOJDB_SERVER_NAME, serverName);
 			MojErrCheck(err);

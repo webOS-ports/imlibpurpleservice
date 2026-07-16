@@ -468,7 +468,7 @@ MojErr IMServiceHandler::IMSendCmd(MojServiceMessage* serviceMsg, const MojObjec
  * New incoming IM message
  */
 bool IMServiceHandler::incomingIM(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp,
-		const char* channelName, const char* serverId, const char* serverName, bool muted)
+		const char* channelName, const char* channelDisplayName, const char* serverId, const char* serverName, bool muted)
 {
 
 	MojLogTrace(IMServiceApp::s_log);
@@ -485,7 +485,7 @@ bool IMServiceHandler::incomingIM(const char* serviceName, const char* username,
 	// set the message fields based on the incoming parameters. muted (chat muted on the server
 	// side, e.g. a muted Telegram chat) becomes flags.noNotification so the Messaging app stores
 	// the message but suppresses the notification banner.
-	MojErr err = imMessage->initFromCallback(serviceName, username, usernameFrom, message, timestamp, channelName, serverId, serverName, muted);
+	MojErr err = imMessage->initFromCallback(serviceName, username, usernameFrom, message, timestamp, channelName, channelDisplayName, serverId, serverName, muted);
 
 	if (!err) {
 		// handle the message

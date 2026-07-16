@@ -1326,6 +1326,7 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 	// immessage so the ChatThreader/UI can group channels under their server. 1:1 IMs are
 	// unaffected: both pointers stay NULL and the stored record is identical to before.
 	const char* channelName = NULL;
+	const char* channelDisplayName = NULL;   // human room title (Telegram group name); channelName stays the key
 	std::string serverNameStr;   // guild / network - the room's blist group
 	// Muted-conversation support: the prpl (e.g. tdlib-purple) records a chat's server-side mute
 	// state as a "muted" bool on the buddy (1:1) / chat (group) blist node. Read it here and forward
@@ -1335,6 +1336,11 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 	if (purple_conversation_get_type(conv) == PURPLE_CONV_TYPE_CHAT)
 	{
 		channelName = purple_conversation_get_name(conv);
+		// Human room title for display. tdlib-purple names the conversation "chat-<id>" (a stable
+		// key, kept as channelName) but exposes the real room title separately - forward it so the
+		// UI shows "Gubbins Calls" instead of "chat-1001609073900". purple-discord's name is already
+		// human, so title==name there and this is harmless.
+		channelDisplayName = purple_conversation_get_title(conv);
 		if (channelName && *channelName)
 		{
 			PurpleChat* chat = purple_blist_find_chat(account, channelName);
@@ -1353,9 +1359,20 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 				muted = purple_blist_node_get_bool((PurpleBlistNode*)chat, "muted");
 			}
 		}
+		// Flat-hierarchy protocols (Telegram: groups/supergroups/channels have no parent "server" -
+		// they land under tdlib-purple's generic "Chats" blist group, or none at all when the chat
+		// isn't in the blist, giving an inconsistent/meaningless server). Route them under one
+		// stable synthetic server = the network name, so every one of the account's Telegram rooms
+		// groups under a single "Telegram" server in the Servers tab. Discord/IRC keep their real guild.
+		const char* protoId = purple_account_get_protocol_id(account);
+		if (protoId != NULL && strstr(protoId, "telegram") != NULL)
+		{
+			const char* net = purple_account_get_protocol_name(account);
+			serverNameStr = (net != NULL && *net != '\0') ? net : "Telegram";
+		}
 		MojLogInfo(IMServiceApp::s_log,
-			_T("incoming_message_cb: group-chat message. channel: %s server(guild): %s sender: %s muted: %d"),
-			channelName ? channelName : "", serverNameStr.c_str(), usernameFromStripped.c_str(), muted);
+			_T("incoming_message_cb: group-chat message. channel: %s title: %s server(guild): %s sender: %s muted: %d"),
+			channelName ? channelName : "", channelDisplayName ? channelDisplayName : "", serverNameStr.c_str(), usernameFromStripped.c_str(), muted);
 	}
 	else
 	{
@@ -1373,7 +1390,7 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 	// pull the real guild id from the chat's components.
 	const char* serverName = serverNameStr.empty() ? NULL : serverNameStr.c_str();
 	s_imServiceHandler->incomingIM(serviceName.c_str(), account->username, usernameFromStripped.c_str(),
-			message, mtime, channelName, serverName, serverName, muted);
+			message, mtime, channelName, channelDisplayName, serverName, serverName, muted);
 }
 
 /*

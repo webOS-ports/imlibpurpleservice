@@ -78,7 +78,7 @@ public:
 	// muted: source conversation is muted server-side (e.g. a muted Telegram chat) -> the message
 	// is stored with flags.noNotification so the Messaging app suppresses the banner. Default false.
 	virtual bool incomingIM(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp = 0,
-				const char* channelName = NULL, const char* serverId = NULL, const char* serverName = NULL, bool muted = false) = 0;
+				const char* channelName = NULL, const char* channelDisplayName = NULL, const char* serverId = NULL, const char* serverName = NULL, bool muted = false) = 0;
 	virtual bool updateBuddyStatus(const char* accountId, const char* serviceName, const char* username, int availability,
 				const char* customMessage, const char* groupName, const char* buddyAvatarLoc) = 0;
 	virtual bool receivedBuddyInvite(const char* serviceName, const char* username, const char* usernameFrom, const char* message) = 0;
