@@ -1438,7 +1438,10 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 					if (groupName != NULL)
 						serverNameStr = groupName;
 				}
-				muted = purple_blist_node_get_bool((PurpleBlistNode*)chat, "muted");
+				// webOS: an archived chat is silenced like a muted one (no notification banner). The
+				// prpl (tdlib-purple) sets both bools on the chat blist node.
+				muted = purple_blist_node_get_bool((PurpleBlistNode*)chat, "muted")
+				        || purple_blist_node_get_bool((PurpleBlistNode*)chat, "archived");
 			}
 		}
 		// Flat-hierarchy protocols (Telegram: groups/supergroups/channels have no parent "server" -
@@ -1458,10 +1461,12 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 	}
 	else
 	{
-		// 1:1 IM: the buddy node carries the per-chat mute flag.
+		// 1:1 IM: the buddy node carries the per-chat mute/archived flags. (An archived 1:1 whose
+		// buddy was pruned from the list has no node here - that rarer case isn't silenced yet.)
 		PurpleBuddy* buddy = purple_find_buddy(account, usernameFrom);
 		if (buddy != NULL)
-			muted = purple_blist_node_get_bool((PurpleBlistNode*)buddy, "muted");
+			muted = purple_blist_node_get_bool((PurpleBlistNode*)buddy, "muted")
+			        || purple_blist_node_get_bool((PurpleBlistNode*)buddy, "archived");
 	}
 
 	// call the transport service incoming message handler
