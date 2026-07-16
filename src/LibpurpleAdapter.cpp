@@ -1586,10 +1586,15 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
          */
         /* Discord logs in via an interactive QR / remote-auth flow that waits on the
          * user's phone; use the longer grace period so we don't tear the account down
-         * mid-handshake. Other protocols keep the normal timeout. */
+         * mid-handshake. Telegram is likewise interactive: the user must type the login
+         * code AND (if enabled) a 2FA password into the "Telegram" auth chat, which
+         * easily exceeds the normal 45s. Give both the longer grace period. Other
+         * protocols keep the normal timeout. */
         const char* protoId = purple_account_get_protocol_id(account);
-        guint connectTimeout = (protoId != NULL && strcmp(protoId, "prpl-discord") == 0)
-                               ? QR_CONNECT_TIMEOUT_SECONDS : CONNECT_TIMEOUT_SECONDS;
+        bool interactiveAuth = (protoId != NULL &&
+                                (strcmp(protoId, "prpl-discord") == 0 ||
+                                 strcmp(protoId, "prpl-telegram") == 0));
+        guint connectTimeout = interactiveAuth ? QR_CONNECT_TIMEOUT_SECONDS : CONNECT_TIMEOUT_SECONDS;
         guint timerHandle = purple_timeout_add_seconds(connectTimeout, connectTimeoutCallback, new std::string(accountKey));
         s_accountLoginTimers[accountKey] = timerHandle;
 
@@ -2165,14 +2170,29 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceNa
 
 	std::string accountKey = getAccountKey(username, serviceName);
 
-	if (s_onlineAccountData.count(accountKey) == 0)
+	PurpleAccount* accountToSendFrom = NULL;
+	if (s_onlineAccountData.count(accountKey))
+	{
+		accountToSendFrom = s_onlineAccountData[accountKey];
+	}
+	else if (s_pendingAccountData.count(accountKey))
+	{
+		// webOS Telegram port: the account is still authenticating (e.g. tdlib is in
+		// authorizationStateWaitCode / WaitPassword). Route the outgoing message to the
+		// prpl anyway so the plugin can capture the user's reply as the login code / 2FA
+		// password (tdlib-purple's promptAuthInputViaChat -> tgprpl_send_im mechanism).
+		// Without this the code reply is rejected here and login never completes.
+		accountToSendFrom = s_pendingAccountData[accountKey];
+		MojLogInfo(IMServiceApp::s_log, _T("sendMessage: account %s still authenticating; routing message to prpl for auth-input capture"), serviceName);
+	}
+
+	if (accountToSendFrom == NULL)
 	{
 		retVal = LibpurpleAdapter::USER_NOT_LOGGED_IN;
 		MojLogError(IMServiceApp::s_log, _T("sendMessage: Trying to send from an account that is not logged in. service name %s"), serviceName);
 	}
 	else
 	{
-    	PurpleAccount* accountToSendFrom = s_onlineAccountData[accountKey];
 		PurpleConversation* purpleConversation = purple_conversation_new(PURPLE_CONV_TYPE_IM, accountToSendFrom, usernameTo);
 		char* messageTextUnescaped = g_strcompress(messageText);
 

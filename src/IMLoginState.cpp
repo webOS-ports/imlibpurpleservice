@@ -1119,6 +1119,15 @@ void IMLoginStateHandler::loginResult(const char* serviceName, const char* usern
 		case LoginCallbackInterface::LOGIN_SUCCESS:
 			mergeProps.putString("state", LOGIN_STATE_GETTING_BUDDIES);
 			mergeProps.put("errorCode", errorCodeMoj);
+			// webOS Telegram port: a successful login means the account IS online, so force
+			// availability back to ONLINE. Prior failed attempts stamp availability=OFFLINE
+			// (see line ~1097), and an onEnabled-triggered login (re-add / interactive auth)
+			// doesn't go through the availability-gated needsToLogin path, so the stale
+			// OFFLINE would otherwise make needsToLogoff() fire and tear down the just-online
+			// account (and block needsToGetBuddies()). Resetting it here keeps us online and
+			// lets buddy retrieval proceed. Intentional sign-out comes via LOGIN_SIGNED_OFF,
+			// and AWAY/BUSY are set post-login via setMyAvailability, so neither is affected.
+			mergeProps.putInt("availability", PalmAvailability::ONLINE);
 			// Since the login succeeded, move any waiting messages back to pending
 			moveWaitingMessagesToPending(serviceNameMoj, usernameMoj);
 			break;
