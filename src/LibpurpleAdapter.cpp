@@ -497,6 +497,12 @@ static std::string getPrplProtocolIdFromServiceName(std::string const& serviceNa
 	{
 		return "prpl-hehoe-signal";
 	}
+	// hoehermann/purple-gowhatsapp (whatsmeow branch) registers as "prpl-hehoe-whatsmeow";
+	// keep the db8/capability service name "type_whatsapp" decoupled from the plugin id.
+	if (serviceName == "type_whatsapp")
+	{
+		return "prpl-hehoe-whatsmeow";
+	}
 	std::string prplProtocolIdToReturn = "prpl-" + serviceName.substr(strlen("type_"), std::string::npos);
 	return prplProtocolIdToReturn;
 }
