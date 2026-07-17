@@ -432,6 +432,17 @@ bool ContactConsolidationHelper::formatForDB(const MojString& accountId, const M
 			newImObj.put("type", serviceName);
 			//newImObj.put("serviceName", serviceName);
 			newImsArray.push(newImObj);
+			// webOS Telegram port: add the @username as a second IM entry (informational + searchable)
+			// when the prpl supplied one; the id-based entry above stays the primary routing address.
+			MojString handle;
+			buddy.get("handle", handle, found);
+			if (found && !handle.empty())
+			{
+				MojObject handleImObj;
+				handleImObj.put("value", handle);
+				handleImObj.put("type", serviceName);
+				newImsArray.push(handleImObj);
+			}
 			contact.put("ims", newImsArray);
 
 			// need to add email address too for contacts linker
@@ -463,6 +474,33 @@ bool ContactConsolidationHelper::formatForDB(const MojString& accountId, const M
 				newPhotoObj.putString("type", "type_square"); // AIM and GTalk generally send small, square-ish images
 				newPhotosArray.push(newPhotoObj);
 				contact.put("photos", newPhotosArray);
+			}
+
+			// webOS Telegram port: phone number + structured name, when the prpl provided them (stashed
+			// on the buddy node). Telegram only exposes phone for mutual contacts, so it fills in for
+			// saved contacts but not most group members.
+			MojString phone;
+			buddy.get("phoneNumber", phone, found);
+			if (found && !phone.empty())
+			{
+				MojObject phonesArray, phoneObj;
+				phoneObj.put("value", phone);
+				phoneObj.putString("type", "type_mobile");
+				phonesArray.push(phoneObj);
+				contact.put("phoneNumbers", phonesArray);
+			}
+
+			MojString firstName, lastName;
+			buddy.get("firstName", firstName, found);
+			bool hasFirst = found && !firstName.empty();
+			buddy.get("lastName", lastName, found);
+			bool hasLast = found && !lastName.empty();
+			if (hasFirst || hasLast)
+			{
+				MojObject nameObj;
+				if (hasFirst) nameObj.put("givenName", firstName);
+				if (hasLast)  nameObj.put("familyName", lastName);
+				contact.put("name", nameObj);
 			}
 
 			valid = true;

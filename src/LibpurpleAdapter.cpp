@@ -2531,6 +2531,21 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 				buddyObj.putString("status", customMessage);
 			}
 
+			// webOS Telegram port: extra profile info the prpl (tdlib-purple) stashed on the buddy node
+			// (keys must match BuddyOptions in purple-info.h). Forwarded so BuddyListConsolidator can
+			// enrich the db8 contact with phone / @username / structured name instead of only an id.
+			{
+				PurpleBlistNode* bnode = (PurpleBlistNode*)buddyToBeAdded;
+				const char* bPhone = purple_blist_node_get_string(bnode, "tdlib-phone");
+				const char* bUser  = purple_blist_node_get_string(bnode, "tdlib-username");
+				const char* bFirst = purple_blist_node_get_string(bnode, "tdlib-first-name");
+				const char* bLast  = purple_blist_node_get_string(bnode, "tdlib-last-name");
+				if (bPhone && *bPhone) buddyObj.putString("phoneNumber", bPhone);
+				if (bUser  && *bUser)  buddyObj.putString("handle", bUser);   // @username
+				if (bFirst && *bFirst) buddyObj.putString("firstName", bFirst);
+				if (bLast  && *bLast)  buddyObj.putString("lastName", bLast);
+			}
+
 			g_message("%s says: %s's presence: availability: '%d', custom message: '%s', avatar location: '%s', display name: '%s', group name:'%s'",
 					__FUNCTION__, buddyToBeAdded->name, availability, customMessage, buddyAvatarLocation, buddyToBeAdded->alias, groupName);
 
