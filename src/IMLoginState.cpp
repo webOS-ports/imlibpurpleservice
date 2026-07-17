@@ -972,14 +972,28 @@ MojErr IMLoginStateHandler::getBuddyLists(const MojString& serviceName, const Mo
 	}
 	else
 	{
-		//TODO: set the state to offline?? Perhaps loginstate needs a retry count.
-		MojLogError(IMServiceApp::s_log, _T("getBuddyLists: getFullBuddyList return false. This is not good"));
+		// webOS resilience: getFullBuddyList returned false because the buddy list isn't ready yet -
+		// the protocol (tdlib) is still loading its contact/chat list, or couldn't (e.g. /var was full).
+		// Do NOT leave the account stuck in GETTING_BUDDIES: mark it ONLINE (it IS logged in; there are
+		// simply no buddies to reconcile right now) and leave the existing contacts untouched. The
+		// debounced buddy-added resync - which re-fires from an ONLINE predecessor - runs the real sync
+		// once buddies actually load. (Previously this left the state stuck and could not recover.)
+		MojLogWarning(IMServiceApp::s_log, _T("getBuddyLists: buddy list not ready for %s - marking online, keeping existing contacts"), serviceName.data());
 
 		delete m_buddyListConsolidator;
 		m_buddyListConsolidator = NULL;
 
+		MojDbQuery stateQuery;
+		stateQuery.where("serviceName", MojDbQuery::OpEq, serviceName);
+		stateQuery.where("username", MojDbQuery::OpEq, username);
+		stateQuery.from(IM_LOGINSTATE_KIND);
+		MojObject stateProps;
+		stateProps.putString("state", LOGIN_STATE_ONLINE);
+		MojErr mErr = m_dbClient.merge(m_updateLoginStateSlot, stateQuery, stateProps);
+		if (mErr)
+			MojLogError(IMServiceApp::s_log, _T("getBuddyLists: failed to mark online after empty buddy list: %d"), mErr);
 
-		// Since it failed, we need to reset the watch ourself.
+		// Reset the watch ourself since we short-circuited the normal consolidate path.
 		completeAndResetWatch();
 	}
 

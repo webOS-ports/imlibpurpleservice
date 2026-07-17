@@ -2463,8 +2463,14 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 		MojObject buddyListObj;
 		if (!buddyList)
 		{
-			MojLogError(IMServiceApp::s_log, _T("getFullBuddyList: WARNING: the buddy list was NULL, returning empty buddy list."));
-			s_loginState->buddyListResult(serviceName, username, buddyListObj, true);
+			// webOS resilience: an ONLINE account with ZERO buddies almost always means the protocol
+			// (tdlib) has not finished loading its contact/chat list yet - or couldn't (e.g. /var full).
+			// Reporting an empty full list here would make the BuddyListConsolidator DELETE every
+			// existing contact (this wiped all Telegram contacts when tdlib couldn't load). Treat it as
+			// "not ready": return false so getBuddyLists cleans up WITHOUT deleting anything. The
+			// debounced buddy-added resync runs the real sync once buddies actually load.
+			MojLogWarning(IMServiceApp::s_log, _T("getFullBuddyList: 0 buddies for online account %s - skipping sync to avoid wiping contacts"), serviceName);
+			return FALSE;
 		}
 
 		GSList* buddyIterator = NULL;
