@@ -502,15 +502,14 @@ static std::string getPrplProtocolIdFromServiceName(std::string const& serviceNa
 	{
 		return "prpl-teams-personal";
 	}
-	// hoehermann/purple-signal registers as "prpl-hehoe-signal" (the "hehoe" infix
-	// cannot be derived from the "type_signal" service name), so map it explicitly.
-	// NOTE: the Signal prpl is scaffolding only and not currently runnable on this
-	// device (needs an embedded JVM + an ARMv7 Rust libsignal); see
-	// messaging/signal/BUILD-LOG.md. The mapping is inert unless a type_signal
-	// account exists and the plugin is actually loaded.
+	// Signal maps to hoehermann/purple-presage (prpl-hehoe-presage) — the native Rust
+	// backend (no JVM). This replaces the old JVM-based purple-signal (prpl-hehoe-signal),
+	// which ran but was too slow (interpreter-only OpenJDK Zero) for Signal's provisioning
+	// handshake. libpresage.so is a single cross-built armv7 .so (presage + libsignal-rs +
+	// SQLCipher, rustls/ring TLS); see messaging/signal/build-presage.sh.
 	if (serviceName == "type_signal")
 	{
-		return "prpl-hehoe-signal";
+		return "prpl-hehoe-presage";
 	}
 	// hoehermann/purple-gowhatsapp (whatsmeow branch) registers as "prpl-hehoe-whatsmeow";
 	// keep the db8/capability service name "type_whatsapp" decoupled from the plugin id.
