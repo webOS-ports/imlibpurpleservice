@@ -1931,6 +1931,14 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 				purple_account_set_password(account, params.password.data());
 			}
 		}
+
+		/* webOS: let credential-caching prpls skip re-auth on reconnect. purple-facebook only takes
+		 * its saved-token path (fb_login: fb_data_load && remember_password) when this flag is set;
+		 * without it, every login re-runs email+password auth and re-triggers the 2FA challenge. The
+		 * token/cid/mid are already persisted in accounts.xml (fb_data_save after a successful login),
+		 * so honoring remember_password here makes subsequent reconnects silent. Benign for prpls that
+		 * ignore the flag. */
+		purple_account_set_remember_password(account, TRUE);
 	}
 
 	if (result == OK)
@@ -1960,12 +1968,18 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
          * user's phone; use the longer grace period so we don't tear the account down
          * mid-handshake. Telegram is likewise interactive: the user must type the login
          * code AND (if enabled) a 2FA password into the "Telegram" auth chat, which
-         * easily exceeds the normal 45s. Give both the longer grace period. Other
-         * protocols keep the normal timeout. */
+         * easily exceeds the normal 45s. Facebook is likewise interactive when the
+         * account has two-factor enabled: the prpl raises a login-code challenge and
+         * the user types the code into the "facebook" auth chat. Give all three the
+         * longer grace period; otherwise the 45s connect timeout fires mid-challenge
+         * and drives a retry loop that re-issues auth.login (a fresh machine_id each
+         * time) before the code can be entered. Other protocols keep the normal
+         * timeout. */
         const char* protoId = purple_account_get_protocol_id(account);
         bool interactiveAuth = (protoId != NULL &&
                                 (strcmp(protoId, "prpl-discord") == 0 ||
-                                 strcmp(protoId, "prpl-telegram") == 0));
+                                 strcmp(protoId, "prpl-telegram") == 0 ||
+                                 strcmp(protoId, "prpl-facebook") == 0));
         guint connectTimeout = interactiveAuth ? QR_CONNECT_TIMEOUT_SECONDS : CONNECT_TIMEOUT_SECONDS;
         guint timerHandle = purple_timeout_add_seconds(connectTimeout, connectTimeoutCallback, new std::string(accountKey));
         s_accountLoginTimers[accountKey] = timerHandle;
@@ -2570,10 +2584,18 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 			buddyObj.clear(MojObject::TypeArray);
 			buddyToBeAdded = (PurpleBuddy*)buddyIterator->data;
 
+			// webOS: resolve the buddy's display name as local alias, else SERVER alias. tdlib-purple
+			// (Telegram) writes the local ->alias, but purple-facebook only ever calls
+			// purple_buddy_set_server_alias(), so reading ->alias directly left every Facebook buddy
+			// nameless -> skipped here -> absent from Contacts. purple_buddy_get_alias_only() returns
+			// the local alias, else the server alias, or NULL if neither is set (it does NOT fall back
+			// to the numeric username), which is exactly the "is this buddy nameless?" test we want.
+			const char* resolvedAlias = purple_buddy_get_alias_only(buddyToBeAdded);
+
 			// webOS Telegram port: skip deleted/nameless users. tdlib gives them no name, so the
 			// contact would otherwise show a raw "id<number>". Not reporting them here also makes the
 			// BuddyListConsolidator delete any such contacts left from a previous (pre-filter) sync.
-			if (isBlankName(buddyToBeAdded->alias))
+			if (isBlankName(resolvedAlias))
 			{
 				MojLogInfo(IMServiceApp::s_log, _T("getFullBuddyList: skipping nameless buddy %s (deleted user?)"), buddyToBeAdded->name);
 				continue;
@@ -2594,14 +2616,14 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 			int availability = getPalmAvailabilityFromPurpleAvailability(newStatusPrimitive);
 			buddyObj.putInt("availability", availability);
 
-			if (buddyToBeAdded->alias != NULL)
+			if (resolvedAlias != NULL)
 			{
 				// webOS Telegram port: strip only astral emoji/flags (unrenderable on this WebKit), keep
 				// all BMP text (Thai/Cyrillic/CJK/Latin) which renders via the fallback-font slots. If the
 				// name was entirely astral it strips to empty - keep the original then, so we never fall
 				// back to a raw "id<number>".
-				std::string cleanName = stripAstral(buddyToBeAdded->alias);
-				buddyObj.putString("displayName", cleanName.empty() ? buddyToBeAdded->alias : cleanName.c_str());
+				std::string cleanName = stripAstral(resolvedAlias);
+				buddyObj.putString("displayName", cleanName.empty() ? resolvedAlias : cleanName.c_str());
 			}
 
 			PurpleBuddyIcon* icon = purple_buddy_get_icon(buddyToBeAdded);
