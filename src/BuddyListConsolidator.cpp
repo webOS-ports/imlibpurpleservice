@@ -422,7 +422,8 @@ bool ContactConsolidationHelper::formatForDB(const MojString& accountId, const M
 			contact.put("remoteId", username); // using username as remote ID since we don't have anything else and this should be unique
 
 			// If the buddy has a displayName, put it in the contact's nickname property
-			if (MojErrNone == buddy.getRequired("displayName", nickname))
+			bool hasDisplayName = (MojErrNone == buddy.getRequired("displayName", nickname));
+			if (hasDisplayName)
 	        {
 				contact.put("nickname", nickname);
 	        }
@@ -508,6 +509,30 @@ bool ContactConsolidationHelper::formatForDB(const MojString& accountId, const M
 				MojObject nameObj;
 				if (hasFirst) nameObj.put("givenName", firstName);
 				if (hasLast)  nameObj.put("familyName", lastName);
+				contact.put("name", nameObj);
+			}
+			else if (hasDisplayName && !nickname.empty())
+			{
+				// webOS: prpls like Facebook provide only a full display name (structured_name.text),
+				// not first/last. Without a "name" object the Contacts/Messaging app shows the raw IM
+				// id ("id<username>") instead of the name (nickname alone is not used for display).
+				// Split the display name on the last space so it renders properly:
+				// "Alan Morford" -> given "Alan", family "Morford"; a single token -> givenName.
+				MojObject nameObj;
+				const char* full = nickname.data();
+				const char* sp = strrchr(full, ' ');
+				if (sp != NULL && sp != full && *(sp + 1) != '\0')
+				{
+					MojString given, family;
+					given.assign(full, (MojSize)(sp - full));
+					family.assign(sp + 1);
+					nameObj.put("givenName", given);
+					nameObj.put("familyName", family);
+				}
+				else
+				{
+					nameObj.put("givenName", nickname);
+				}
 				contact.put("name", nameObj);
 			}
 
