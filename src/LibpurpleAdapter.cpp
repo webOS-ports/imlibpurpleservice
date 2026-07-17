@@ -2431,6 +2431,53 @@ static std::string reduceToAscii(const char* in)
 	return out;
 }
 
+// webOS Telegram port: drop astral-plane characters (Unicode > U+FFFF: emoji, flags, rare CJK-ext) from
+// a display name, keeping ALL Basic-Multilingual-Plane text - Latin, Cyrillic, Greek, Thai, CJK, BMP
+// symbols - which the webOS WebKit renders fine via the fallback-font slots. WebKit's font fallback is
+// UTF-16/BMP-oriented and shows astral codepoints as the replacement glyph (U+FFFD), no matter what
+// emoji font is installed, so we strip those rather than leave a row of "?" glyphs. Whitespace left
+// where an emoji was removed is collapsed, and the result is trimmed.
+static std::string stripAstral(const char* in)
+{
+	std::string out;
+	if (in == NULL)
+		return out;
+	bool prevSpace = false;
+	const unsigned char* p = (const unsigned char*)in;
+	while (*p)
+	{
+		unsigned char c = *p;
+		int len = 1;
+		if (c >= 0xF0)      len = 4;   // 4-byte UTF-8 == U+10000.. (astral) -> drop
+		else if (c >= 0xE0) len = 3;   // 3-byte BMP (Thai, CJK, symbols like U+26A1)
+		else if (c >= 0xC0) len = 2;   // 2-byte BMP (Latin-ext, Cyrillic, Greek, Arabic, Hebrew)
+		for (int i = 1; i < len; ++i)  // guard against a truncated trailing sequence
+			if ((p[i] & 0xC0) != 0x80) { len = 1; break; }
+
+		if (len == 4)
+		{
+			p += 4;
+			continue;
+		}
+		bool isSpace = (len == 1 && (c == ' ' || c == '\t'));
+		if (isSpace)
+		{
+			if (!out.empty() && !prevSpace)
+				out.push_back(' ');
+			prevSpace = true;
+		}
+		else
+		{
+			out.append((const char*)p, len);
+			prevSpace = false;
+		}
+		p += len;
+	}
+	while (!out.empty() && out[out.size() - 1] == ' ')
+		out.erase(out.size() - 1);
+	return out;
+}
+
 // webOS Telegram port: true if a buddy display name (alias) is effectively empty (NULL/""/whitespace).
 // tdlib gives deleted Telegram accounts no name, so they arrive as nameless buddies whose contact then
 // shows the raw "id<number>" - skip those entirely.
@@ -2527,11 +2574,12 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 
 			if (buddyToBeAdded->alias != NULL)
 			{
-				// webOS Telegram port: reduce the name to plain ASCII so emoji/CJK/Thai don't render as
-				// tofu. If a name is entirely non-ASCII it reduces to empty - keep the original then, since
-				// a tofu name is still more useful than falling back to a raw "id<number>".
-				std::string asciiName = reduceToAscii(buddyToBeAdded->alias);
-				buddyObj.putString("displayName", asciiName.empty() ? buddyToBeAdded->alias : asciiName.c_str());
+				// webOS Telegram port: strip only astral emoji/flags (unrenderable on this WebKit), keep
+				// all BMP text (Thai/Cyrillic/CJK/Latin) which renders via the fallback-font slots. If the
+				// name was entirely astral it strips to empty - keep the original then, so we never fall
+				// back to a raw "id<number>".
+				std::string cleanName = stripAstral(buddyToBeAdded->alias);
+				buddyObj.putString("displayName", cleanName.empty() ? buddyToBeAdded->alias : cleanName.c_str());
 			}
 
 			PurpleBuddyIcon* icon = purple_buddy_get_icon(buddyToBeAdded);
@@ -2564,8 +2612,9 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 				const char* bLast  = purple_blist_node_get_string(bnode, "tdlib-last-name");
 				if (bPhone && *bPhone) buddyObj.putString("phoneNumber", bPhone);
 				if (bUser  && *bUser)  buddyObj.putString("handle", bUser);   // @username
-				if (bFirst && *bFirst) buddyObj.putString("firstName", bFirst);
-				if (bLast  && *bLast)  buddyObj.putString("lastName", bLast);
+				// Strip astral emoji from the structured name (renders as the header) - keep BMP text.
+				if (bFirst && *bFirst) { std::string s = stripAstral(bFirst); if (!s.empty()) buddyObj.putString("firstName", s.c_str()); }
+				if (bLast  && *bLast)  { std::string s = stripAstral(bLast);  if (!s.empty()) buddyObj.putString("lastName", s.c_str()); }
 			}
 
 			g_message("%s says: %s's presence: availability: '%d', custom message: '%s', avatar location: '%s', display name: '%s', group name:'%s'",
