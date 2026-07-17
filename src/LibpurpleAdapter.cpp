@@ -1978,7 +1978,8 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
         bool interactiveAuth = (protoId != NULL &&
                                 (strcmp(protoId, "prpl-discord") == 0 ||
                                  strcmp(protoId, "prpl-telegram") == 0 ||
-                                 strcmp(protoId, "prpl-facebook") == 0));
+                                 strcmp(protoId, "prpl-facebook") == 0 ||
+                                 strcmp(protoId, "prpl-hehoe-presage") == 0));
         guint connectTimeout = interactiveAuth ? QR_CONNECT_TIMEOUT_SECONDS : CONNECT_TIMEOUT_SECONDS;
         guint timerHandle = purple_timeout_add_seconds(connectTimeout, connectTimeoutCallback, new std::string(accountKey));
         s_accountLoginTimers[accountKey] = timerHandle;
