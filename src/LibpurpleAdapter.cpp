@@ -299,6 +299,11 @@ static void* adapter_request_fields(const char *title, const char *primary, cons
 	const guchar* imgData = NULL;
 	gsize imgLen = 0;
 	const char* qrString = NULL;
+	// WhatsApp (purple-gowhatsapp) offers device-linking as a QR image AND an 8-char
+	// pairing code in the same request; it names the QR-payload string "qr_data" (Discord
+	// uses "qr_string") and the code "pairing_code". Surface the pairing code as urlString
+	// (it's the more reliable path on a small screen), falling back to the QR payload.
+	const char* pairingCode = NULL;
 	// Captcha fields (Discord remote-auth hCaptcha). Presence of captcha_sitekey marks
 	// this request as a captcha challenge rather than the QR image.
 	const char* capService = NULL;
@@ -321,9 +326,14 @@ static void* adapter_request_fields(const char *title, const char *primary, cons
 				imgData = (const guchar*)purple_request_field_image_get_buffer(f);
 				imgLen = purple_request_field_image_get_size(f);
 			}
-			else if (t == PURPLE_REQUEST_FIELD_STRING && id && strcmp(id, "qr_string") == 0)
+			else if (t == PURPLE_REQUEST_FIELD_STRING && id &&
+			         (strcmp(id, "qr_string") == 0 || strcmp(id, "qr_data") == 0))
 			{
 				qrString = purple_request_field_string_get_value(f);
+			}
+			else if (t == PURPLE_REQUEST_FIELD_STRING && id && strcmp(id, "pairing_code") == 0)
+			{
+				pairingCode = purple_request_field_string_get_value(f);
 			}
 			else if (t == PURPLE_REQUEST_FIELD_STRING && id && strcmp(id, "captcha_sitekey") == 0)
 				capSitekey = purple_request_field_string_get_value(f);
@@ -362,11 +372,16 @@ static void* adapter_request_fields(const char *title, const char *primary, cons
 		return (void*)fields;
 	}
 
-	MojLogInfo(IMServiceApp::s_log, _T("adapter_request_fields: QR for service=%s user=%s (%u img bytes)"),
-	           serviceName.c_str(), acct->username ? acct->username : "", (unsigned)imgLen);
+	// Prefer the pairing code as the surfaced urlString when the prpl provided one
+	// (WhatsApp); otherwise the raw QR payload (Discord's qr_string / gowhatsapp's qr_data).
+	const char* urlString = (pairingCode && *pairingCode) ? pairingCode : qrString;
+
+	MojLogInfo(IMServiceApp::s_log, _T("adapter_request_fields: QR for service=%s user=%s (%u img bytes, pairing=%s)"),
+	           serviceName.c_str(), acct->username ? acct->username : "", (unsigned)imgLen,
+	           (pairingCode && *pairingCode) ? "yes" : "no");
 
 	if (s_authChannel)
-		s_authChannel->publishQRChallenge(serviceName.c_str(), acct->username, imgData, imgLen, "image/png", qrString);
+		s_authChannel->publishQRChallenge(serviceName.c_str(), acct->username, imgData, imgLen, "image/png", urlString);
 
 	return NULL;   // no ui handle to track
 }
