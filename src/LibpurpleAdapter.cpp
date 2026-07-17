@@ -487,6 +487,16 @@ static std::string getPrplProtocolIdFromServiceName(std::string const& serviceNa
 	{
 		return "prpl-teams-personal";
 	}
+	// hoehermann/purple-signal registers as "prpl-hehoe-signal" (the "hehoe" infix
+	// cannot be derived from the "type_signal" service name), so map it explicitly.
+	// NOTE: the Signal prpl is scaffolding only and not currently runnable on this
+	// device (needs an embedded JVM + an ARMv7 Rust libsignal); see
+	// messaging/signal/BUILD-LOG.md. The mapping is inert unless a type_signal
+	// account exists and the plugin is actually loaded.
+	if (serviceName == "type_signal")
+	{
+		return "prpl-hehoe-signal";
+	}
 	std::string prplProtocolIdToReturn = "prpl-" + serviceName.substr(strlen("type_"), std::string::npos);
 	return prplProtocolIdToReturn;
 }
