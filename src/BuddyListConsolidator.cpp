@@ -483,8 +483,16 @@ bool ContactConsolidationHelper::formatForDB(const MojString& accountId, const M
 			buddy.get("phoneNumber", phone, found);
 			if (found && !phone.empty())
 			{
+				// webOS: Telegram phone numbers always carry the country code but arrive without the
+				// leading "+". Store canonical E.164 (with "+") so the Contacts/Phone apps recognise it.
+				MojString e164;
+				if (phone.data()[0] == '+')
+					e164.assign(phone);
+				else
+					e164.format(_T("+%s"), phone.data());
+
 				MojObject phonesArray, phoneObj;
-				phoneObj.put("value", phone);
+				phoneObj.put("value", e164);
 				phoneObj.putString("type", "type_mobile");
 				phonesArray.push(phoneObj);
 				contact.put("phoneNumbers", phonesArray);
