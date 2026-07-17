@@ -1094,8 +1094,15 @@ static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 	 * path -- there is no webOS account for this yet. */
 	if (s_qrPreviewKeys.count(accountKey))
 	{
+		/* The confirmed credential the UI must store on the real account. Discord's
+		 * remote-auth persists it as the "token" account string; session-based prpls
+		 * (gowhatsapp) instead set it as the account PASSWORD (deviceJID|registrationId
+		 * from purple_set_credentials). Prefer the token, fall back to the password, so
+		 * the created account carries whatever lets it reconnect without re-pairing. */
 		const char* token = purple_account_get_string(loggedInAccount, "token", NULL);
-		MojLogInfo(IMServiceApp::s_log, _T("account_logged_in_cb: QR-preview confirmed for %s (token %s)"),
+		if (token == NULL || *token == '\0')
+			token = purple_account_get_password(loggedInAccount);
+		MojLogInfo(IMServiceApp::s_log, _T("account_logged_in_cb: QR-preview confirmed for %s (credential %s)"),
 		           accountKey.c_str(), (token && *token) ? "present" : "MISSING");
 		if (s_authChannel)
 			s_authChannel->setConfirmed(serviceName.c_str(), loggedInAccount->username, token ? token : "");
