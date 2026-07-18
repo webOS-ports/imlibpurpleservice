@@ -120,6 +120,9 @@ static std::unordered_map<std::string, guint> s_accountLoginTimers;
 static std::unordered_map<std::string, std::string> s_connectionTypeData;
 
 static std::unordered_map<std::string, std::string> s_AccountIdsData;
+// Perf (#3): last-seen avatar path per "accountKey\x1fbuddyName", so a presence tick with an
+// unchanged avatar skips the per-buddy com.palm.contact find in updateBuddyStatus.
+static std::unordered_map<std::string, std::string> s_lastBuddyAvatar;
 
 /*
  * list of pending authorization requests
@@ -161,6 +164,8 @@ struct AccountMetaData
 
 static void incoming_message_cb(PurpleConversation *conv, const char *who, const char *alias, const char *message,	PurpleMessageFlags flags, time_t mtime);
 static std::string const& getServiceNameFromPurpleAccount(PurpleAccount* account);
+// human-friendly WhatsApp display name (push-name, else "+<phone>"); defined lower, used in incoming_message_cb
+static std::string whatsAppDisplayName(const char* alias, const char* username);
 static void adapterUIInit(void);
 static GHashTable* getClientInfo(void);
 static gboolean adapterInvokeIO(GIOChannel *source, GIOCondition condition, gpointer data);
@@ -519,6 +524,27 @@ static std::string getPrplProtocolIdFromServiceName(std::string const& serviceNa
 	}
 	std::string prplProtocolIdToReturn = "prpl-" + serviceName.substr(strlen("type_"), std::string::npos);
 	return prplProtocolIdToReturn;
+}
+
+// Inverse of getPrplProtocolIdFromServiceName(): map a loaded prpl's protocol_id back to the
+// webOS db8/capability service name ("type_..."). MUST mirror the special-cases above, or an
+// account whose plugin id does not follow the generic "prpl-<type>" pattern gets registered under
+// the wrong service key. That breaks the auto-login path (account_logged_in_cb repairs ui_data from
+// the account itself): the account comes online under e.g. "type_hehoe-whatsmeow" while the webOS
+// login() for "type_whatsapp" can't find/adopt it, so its connect timer never disarms and
+// connectTimeoutCallback force-disconnects the healthy session (WhatsApp/Signal never go online).
+static std::string getServiceNameFromPrplProtocolId(const char* prplProtocolId)
+{
+	std::string prpl = prplProtocolId ? prplProtocolId : "";
+	if (prpl == "prpl-teams-personal")
+		return "type_teams";
+	if (prpl == "prpl-hehoe-presage")
+		return "type_signal";
+	if (prpl == "prpl-hehoe-whatsmeow")
+		return "type_whatsapp";
+	if (prpl.compare(0, strlen("prpl-"), "prpl-") == 0)
+		return "type_" + prpl.substr(strlen("prpl-"));
+	return prpl;
 }
 
 static const char* getMojoFriendlyErrorCode(PurpleConnectionError type)
@@ -902,6 +928,65 @@ static void buddy_signed_on_off_cb(PurpleBuddy* buddy, gpointer data)
 	}
 }
 
+// ---- Perf (#2): coalesce per-buddy presence ticks and flush them as ONE batched db8 write. -------
+// libpurple emits buddy-status-changed one buddy at a time; during a login/contact-sync burst that
+// meant a find+merge round-trip PER buddy (measured ~467ms/op under load). We buffer presence-only
+// ticks per account and, after a short quiet window, hand the whole set to updateBuddyStatusBatch,
+// which does a single find + one batched merge/put (~14ms/op amortized).
+struct PendingPresence
+{
+	std::string serviceName;
+	int availability;
+	std::string customMessage;
+	std::string groupName;
+};
+static std::unordered_map<std::string, std::unordered_map<std::string, PendingPresence> > s_pendingPresence; // accountId -> username -> latest
+static guint s_presenceFlushTimer = 0;
+#define PRESENCE_FLUSH_DEBOUNCE_SECONDS 3
+
+static gboolean presenceFlushCallback(gpointer /*data*/)
+{
+	s_presenceFlushTimer = 0;
+	if (s_imServiceHandler == NULL)
+	{
+		s_pendingPresence.clear();
+		return FALSE;
+	}
+	for (std::unordered_map<std::string, std::unordered_map<std::string, PendingPresence> >::iterator ai = s_pendingPresence.begin(); ai != s_pendingPresence.end(); ++ai)
+	{
+		if (ai->second.empty())
+			continue;
+		std::string serviceName = ai->second.begin()->second.serviceName;
+		MojObject updates; // array of { username, availability, status, group }
+		for (std::unordered_map<std::string, PendingPresence>::iterator ui = ai->second.begin(); ui != ai->second.end(); ++ui)
+		{
+			MojObject o;
+			o.putString(_T("username"), ui->first.c_str());
+			o.putInt(_T("availability"), ui->second.availability);
+			o.putString(_T("status"), ui->second.customMessage.c_str());
+			o.putString(_T("group"), ui->second.groupName.c_str());
+			updates.push(o);
+		}
+		s_imServiceHandler->updateBuddyStatusBatch(ai->first.c_str(), serviceName.c_str(), updates);
+	}
+	s_pendingPresence.clear();
+	return FALSE; // one-shot
+}
+
+static void queuePresenceUpdate(const char* accountId, const char* serviceName, const char* username, int availability, const char* customMessage, const char* groupName)
+{
+	if (accountId == NULL || username == NULL)
+		return;
+	PendingPresence& p = s_pendingPresence[accountId][username]; // keep only the LATEST tick per buddy
+	p.serviceName = serviceName ? serviceName : "";
+	p.availability = availability;
+	p.customMessage = customMessage ? customMessage : "";
+	p.groupName = groupName ? groupName : "";
+	if (s_presenceFlushTimer != 0)
+		purple_timeout_remove(s_presenceFlushTimer);
+	s_presenceFlushTimer = purple_timeout_add_seconds(PRESENCE_FLUSH_DEBOUNCE_SECONDS, presenceFlushCallback, NULL);
+}
+
 static void buddy_status_changed_cb(PurpleBuddy* buddy, PurpleStatus* old_status, PurpleStatus* new_status,
 		gpointer unused)
 {
@@ -950,9 +1035,42 @@ static void buddy_status_changed_cb(PurpleBuddy* buddy, PurpleStatus* old_status
 		groupName = "";
 	}
 
+	// Perf (#3): this fires on every presence tick (online/idle/away), but a buddy's avatar almost
+	// never changes between ticks. Forwarding the (unchanged) avatar path made updateBuddyStatus do
+	// a wasted com.palm.contact find PER presence change for every avatar'd buddy - a big chunk of
+	// the db8 churn during a login/contact-sync burst. Track the last path per buddy and only forward
+	// the avatar when it actually changed (or is first seen); avatar-only updates still come through
+	// here via buddy_avatar_changed_cb, which will see a differing path and forward it.
+	const char* avatarToForward = buddyAvatarLocation;
+	{
+		std::string avatarKey = accountKey;
+		avatarKey.push_back('\x1f');
+		avatarKey.append(buddy->name ? buddy->name : "");
+		std::string currentAvatar = buddyAvatarLocation ? buddyAvatarLocation : "";
+		std::unordered_map<std::string, std::string>::iterator la = s_lastBuddyAvatar.find(avatarKey);
+		if (la != s_lastBuddyAvatar.end() && la->second == currentAvatar)
+		{
+			avatarToForward = NULL; // unchanged -> skip the contact find/update in updateBuddyStatus
+		}
+		else
+		{
+			s_lastBuddyAvatar[avatarKey] = currentAvatar;
+		}
+	}
+
 	// call into the imlibpurpletransport
 	// buddy->name is stored in the imbuddyStatus DB kind in the libpurple format - ie. for AIM without the "@aol.com" so that is how we need to search for it
-	s_imServiceHandler->updateBuddyStatus(accountId.c_str(), serviceName.c_str(), buddy->name, newAvailabilityValue, customMessage, groupName, buddyAvatarLocation);
+	// Perf (#2): presence-only ticks are coalesced + flushed as a batch. Only avatar-changed ticks
+	// (avatarToForward != NULL, gated by #3) take the immediate per-buddy path, which also does the
+	// contact avatar update - those are rare, so per-buddy is fine for them.
+	if (avatarToForward != NULL)
+	{
+		s_imServiceHandler->updateBuddyStatus(accountId.c_str(), serviceName.c_str(), buddy->name, newAvailabilityValue, customMessage, groupName, avatarToForward);
+	}
+	else
+	{
+		queuePresenceUpdate(accountId.c_str(), serviceName.c_str(), buddy->name, newAvailabilityValue, customMessage, groupName);
+	}
 
 	g_message(
 			"%s says: %s's presence: availability: '%i', custom message: '%s', avatar location: '%s', display name: '%s', group name: '%s'",
@@ -1002,6 +1120,15 @@ static void buddy_blocked_cb(PurpleBuddy* buddy)
  * the login-state layer to re-run the full sync so these become db8 contacts.
  */
 #define BUDDY_RESYNC_DEBOUNCE_SECONDS 8
+// webOS: hard cap on how often a single account's post-change buddy re-sync may ACTUALLY fire.
+// The async prpls (tdlib/whatsmeow/presage) load their contact+chat lists in waves spread over
+// minutes; the 8s debounce only coalesces a *continuous* burst, so each wave >8s apart used to
+// fire its own re-sync. Each re-sync bumps imloginstate -> handleLoginStateChange -> getBuddyLists
+// AND re-runs enumerateServersChannels (a delete+recreate of imchannel rows) -- a churn storm that
+// broke imchannel.chatThreadId links and regenerated duplicate chatthreads (e.g. multiple PinePhone
+// Telegram rooms). Coalesce the waves: at most one re-sync per account per this interval. The
+// debounce still delivers a prompt final sync once the list settles (nothing fired for a while).
+#define BUDDY_RESYNC_MIN_INTERVAL_SECONDS 45
 
 struct BuddyResyncCtx
 {
@@ -1011,10 +1138,26 @@ struct BuddyResyncCtx
 	guint timerId;
 };
 static std::unordered_map<std::string, BuddyResyncCtx*> s_buddyResyncCtx;
+// wall-clock time a re-sync last actually FIRED per account, for the min-interval rate limit above.
+static std::unordered_map<std::string, time_t> s_lastResyncFire;
 
 static gboolean buddyResyncTimeoutCallback(gpointer data)
 {
 	BuddyResyncCtx* ctx = (BuddyResyncCtx*)data;
+
+	// Rate limit: if a re-sync fired for this account within the last MIN_INTERVAL, defer this one
+	// to the end of that window instead of firing now (coalesces later buddy-load waves into it).
+	// Keep ctx in s_buddyResyncCtx so a further buddy change just resets the debounce as usual.
+	time_t now = time(NULL);
+	std::unordered_map<std::string, time_t>::iterator lt = s_lastResyncFire.find(ctx->accountKey);
+	if (lt != s_lastResyncFire.end() && now >= lt->second && (now - lt->second) < BUDDY_RESYNC_MIN_INTERVAL_SECONDS)
+	{
+		guint wait = (guint)(BUDDY_RESYNC_MIN_INTERVAL_SECONDS - (now - lt->second));
+		ctx->timerId = purple_timeout_add_seconds(wait, buddyResyncTimeoutCallback, ctx);
+		return FALSE; // this occurrence ends; ctx lives on with the new (deferred) timer
+	}
+
+	s_lastResyncFire[ctx->accountKey] = now;
 	s_buddyResyncCtx.erase(ctx->accountKey);
 	if (s_loginState != NULL)
 	{
@@ -1166,9 +1309,10 @@ static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 	if (loggedInAccount->ui_data == NULL)
 	{
 		const char* prpl = loggedInAccount->protocol_id ? loggedInAccount->protocol_id : "";
-		std::string svc;
-		if (strncmp(prpl, "prpl-", 5) == 0)
-			svc = std::string("type_") + (prpl + 5);
+		// Use the special-case-aware inverse map, NOT a bare "prpl-"->"type_" strip: whatsmeow
+		// (prpl-hehoe-whatsmeow -> type_whatsapp) and presage (prpl-hehoe-presage -> type_signal)
+		// would otherwise register under a bogus service key and never adopt into the webOS login.
+		std::string svc = getServiceNameFromPrplProtocolId(prpl);
 		std::string uname = loggedInAccount->username ? loggedInAccount->username : "";
 
 		AccountMetaData* amd = new AccountMetaData;
@@ -1547,6 +1691,81 @@ static PurpleChat* findChatByIdComponent(PurpleAccount* account, const char* id)
 	return NULL;
 }
 
+/*
+ * webOS Servers/Rooms: derive the server (guild / team / network) identity for a group chat, used
+ * IDENTICALLY by incoming_message_cb (message-driven) and enumerateServersChannels (proactive) so the
+ * two paths resolve to the SAME imserver (dedup key = serviceName+serverName) instead of duplicating.
+ *  - Telegram (flat): every room lands under one synthetic server = the network name; the blist group
+ *    (tdlib's generic "Chats"/default) is meaningless as a server, so it's ignored.
+ *  - Discord / Teams (hierarchical): the blist group is "Guild: Category" (Discord) or the team name;
+ *    the server is the part before the first ": " (the guild/team). The remainder (Discord category)
+ *    is returned via outCategory for imchannel.parentId.
+ */
+static std::string deriveServerName(PurpleAccount* account, const char* groupName, std::string* outCategory)
+{
+	if (outCategory)
+		outCategory->clear();
+	const char* protoId = account ? purple_account_get_protocol_id(account) : NULL;
+	if (protoId != NULL && strstr(protoId, "telegram") != NULL)
+	{
+		const char* net = purple_account_get_protocol_name(account);
+		return (net != NULL && *net != '\0') ? std::string(net) : std::string("Telegram");
+	}
+	if (groupName == NULL || *groupName == '\0')
+		return std::string();
+	std::string g = groupName;
+	std::string::size_type sep = g.find(": ");
+	if (sep != std::string::npos)
+	{
+		if (outCategory)
+			*outCategory = g.substr(sep + 2);
+		return g.substr(0, sep);
+	}
+	return g;
+}
+
+/*
+ * webOS Servers/Rooms M3: join a group channel so the prpl fetches + delivers its recent history and
+ * accepts sends into it (purple-discord fetches ~100 messages on join). Robust to an unstable buddy
+ * list: if the channel's chat isn't in the blist, build the join components straight from the channel
+ * key (Discord/Telegram store it under "id", Teams under "chatname"). Returns the (existing or newly
+ * joined) chat conversation, or NULL. Joining is idempotent - an already-open chat is returned as-is.
+ */
+static PurpleConversation* joinChannelChat(PurpleAccount* account, const char* channel)
+{
+	if (account == NULL || channel == NULL || *channel == '\0')
+		return NULL;
+	PurpleConnection* gc = purple_account_get_connection(account);
+	if (gc == NULL)
+		return NULL;
+
+	PurpleConversation* conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, channel, account);
+	if (conv != NULL)
+		return conv;   // already joined
+
+	// Prefer the blist chat's own components; fall back to constructing them from the key.
+	PurpleChat* chat = findChatByIdComponent(account, channel);
+	if (chat == NULL)
+		chat = purple_blist_find_chat(account, channel);
+
+	GHashTable* built = NULL;
+	GHashTable* components = (chat != NULL) ? purple_chat_get_components(chat) : NULL;
+	if (components == NULL)
+	{
+		const char* protoId = purple_account_get_protocol_id(account);
+		const char* key = (protoId != NULL && strstr(protoId, "teams") != NULL) ? "chatname" : "id";
+		built = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+		g_hash_table_insert(built, g_strdup(key), g_strdup(channel));
+		components = built;
+	}
+
+	serv_join_chat(gc, components);
+	if (built != NULL)
+		g_hash_table_destroy(built);
+
+	return purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, channel, account);
+}
+
 
 void incoming_message_cb(PurpleConversation* conv, const char* who, const char* alias, const char* message,
 		PurpleMessageFlags flags, time_t mtime)
@@ -1607,7 +1826,8 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 	// unaffected: both pointers stay NULL and the stored record is identical to before.
 	const char* channelName = NULL;
 	const char* channelDisplayName = NULL;   // human room title (Telegram group name); channelName stays the key
-	std::string serverNameStr;   // guild / network - the room's blist group
+	std::string serverNameStr;   // resolved guild/team/network server (via deriveServerName)
+	std::string parentGroupName; // raw blist group of the chat, fed to deriveServerName
 	// Muted-conversation support: the prpl (e.g. tdlib-purple) records a chat's server-side mute
 	// state as a "muted" bool on the buddy (1:1) / chat (group) blist node. Read it here and forward
 	// it so the message is stored with flags.noNotification (banner suppressed, still unread). This
@@ -1646,7 +1866,7 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 				{
 					const char* groupName = purple_group_get_name((PurpleGroup*)parent);
 					if (groupName != NULL)
-						serverNameStr = groupName;
+						parentGroupName = groupName;
 				}
 				// webOS: an archived chat is silenced like a muted one (no notification banner). The
 				// prpl (tdlib-purple) sets both bools on the chat blist node.
@@ -1654,17 +1874,11 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 				        || purple_blist_node_get_bool((PurpleBlistNode*)chat, "archived");
 			}
 		}
-		// Flat-hierarchy protocols (Telegram: groups/supergroups/channels have no parent "server" -
-		// they land under tdlib-purple's generic "Chats" blist group, or none at all when the chat
-		// isn't in the blist, giving an inconsistent/meaningless server). Route them under one
-		// stable synthetic server = the network name, so every one of the account's Telegram rooms
-		// groups under a single "Telegram" server in the Servers tab. Discord/IRC keep their real guild.
-		const char* protoId = purple_account_get_protocol_id(account);
-		if (protoId != NULL && strstr(protoId, "telegram") != NULL)
-		{
-			const char* net = purple_account_get_protocol_name(account);
-			serverNameStr = (net != NULL && *net != '\0') ? net : "Telegram";
-		}
+		// Resolve the server identity consistently with enumerateServersChannels: the guild/team (the
+		// part before ": " in the blist group) for Discord/Teams, or the synthetic network server for
+		// flat Telegram (whose blist group is meaningless). Sharing deriveServerName makes a channel's
+		// message-driven and enumerated records dedup to the same imserver instead of duplicating.
+		serverNameStr = deriveServerName(account, parentGroupName.empty() ? NULL : parentGroupName.c_str(), NULL);
 		MojLogInfo(IMServiceApp::s_log,
 			_T("incoming_message_cb: group-chat message. channel: %s title: %s server(guild): %s sender: %s muted: %d"),
 			channelName ? channelName : "", channelDisplayName ? channelDisplayName : "", serverNameStr.c_str(), usernameFromStripped.c_str(), muted);
@@ -1677,6 +1891,23 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 		if (buddy != NULL)
 			muted = purple_blist_node_get_bool((PurpleBlistNode*)buddy, "muted")
 			        || purple_blist_node_get_bool((PurpleBlistNode*)buddy, "archived");
+	}
+
+	// webOS WhatsApp: the sender id is the raw JID "<digits>@s.whatsapp.net" (or opaque "<id>@lid"),
+	// so a message would otherwise show "31611745571@s.whatsapp.net" as the sender. Give from.name a
+	// human value -- the push-name if the sender is a known buddy, else the formatted "+<phone>" --
+	// mirroring getFullBuddyList's whatsAppDisplayName. from.addr keeps the routable JID. Only set
+	// when the prpl didn't already smuggle a display name (usernameFromDisplay via the \x1f split).
+	if (usernameFromDisplay == NULL && serviceName == "type_whatsapp")
+	{
+		PurpleBuddy* senderBuddy = purple_find_buddy(account, usernameFromStripped.c_str());
+		const char* senderAlias = senderBuddy ? purple_buddy_get_alias_only(senderBuddy) : NULL;
+		std::string waDisp = whatsAppDisplayName(senderAlias, usernameFromStripped.c_str());
+		if (!waDisp.empty() && waDisp != usernameFromStripped)
+		{
+			usernameFromDisplayBuf = waDisp;
+			usernameFromDisplay = usernameFromDisplayBuf.c_str();
+		}
 	}
 
 	// call the transport service incoming message handler
@@ -1910,9 +2141,10 @@ bool LibpurpleAdapter::deleteAccountByWebosId(const char* accountId, std::string
 				outUsername->assign(account->username);
 			if (outServiceName != NULL)
 			{
-				const char* prpl = account->protocol_id ? account->protocol_id : "";
-				if (strncmp(prpl, "prpl-", 5) == 0)
-					outServiceName->assign(std::string("type_") + (prpl + 5));
+				// special-case-aware inverse map so the db8 purge (keyed by serviceName)
+				// finds WhatsApp/Signal chat records too (type_whatsapp / type_signal),
+				// not the bogus type_hehoe-* a bare "prpl-"->"type_" strip would produce.
+				outServiceName->assign(getServiceNameFromPrplProtocolId(account->protocol_id));
 			}
 			MojLogInfo(IMServiceApp::s_log, _T("LibpurpleAdapter::deleteAccountByWebosId removing persisted account for %s"), accountId);
 			purple_accounts_delete(account);
@@ -2852,10 +3084,21 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 			// WhatsApp buddies always get a readable name (push-name, else a formatted "+<phone>")
 			// -- never skipped and never shown as the raw "<id>@s.whatsapp.net" / "<id>@lid".
 			bool isWhatsApp = (serviceName != NULL && strcmp(serviceName, "type_whatsapp") == 0);
+			bool isSignal = (serviceName != NULL && strcmp(serviceName, "type_signal") == 0);
 			std::string waName;
 			if (isWhatsApp)
 			{
 				waName = whatsAppDisplayName(resolvedAlias, buddyToBeAdded->name);
+			}
+			// webOS Signal: never DROP a Signal contact for being nameless. On a linked (secondary)
+			// device purple-presage often has no synced address-book name, so the buddy arrives with
+			// an empty alias; skipping it here (like the tdlib path below) hid real contacts that were
+			// actively messaging (e.g. +31611745571 / Alan). Keep it and fall back to the username
+			// (a "+<phone>" or UUID) in the displayName block below. presage's profile-name sync
+			// upgrades this to a real name when one becomes available.
+			else if (isSignal)
+			{
+				// intentionally not skipped; displayName falls back to the username below
 			}
 			// webOS Telegram port: skip deleted/nameless users. tdlib gives them no name, so the
 			// contact would otherwise show a raw "id<number>". Not reporting them here also makes the
@@ -2894,6 +3137,14 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 				// back to a raw "id<number>".
 				std::string cleanName = stripAstral(resolvedAlias);
 				buddyObj.putString("displayName", cleanName.empty() ? resolvedAlias : cleanName.c_str());
+			}
+			else if (isSignal)
+			{
+				// nameless Signal buddy (kept above): show its username -- a "+<phone>" or UUID -- so
+				// the contact still appears (by number) instead of vanishing from Contacts.
+				const char* u = buddyToBeAdded->name ? buddyToBeAdded->name : "";
+				std::string cleanName = stripAstral(u);
+				buddyObj.putString("displayName", cleanName.empty() ? u : cleanName.c_str());
 			}
 
 			PurpleBuddyIcon* icon = purple_buddy_get_icon(buddyToBeAdded);
@@ -2952,14 +3203,16 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 }
 
 /*
- * webOS Servers/Rooms M3: enumerate a hierarchical account's full server->channel roster from the
- * in-memory buddy list and hand it to the service handler to upsert into db8. This makes every guild
- * and all its visible channels appear in the Servers tab immediately after login, independent of any
- * incoming message. Discord only for now: purple-discord builds blist group names as
- * "<Guild>: <Category>" (discord_grab_group) and adds every visible channel as a chat under it with
- * components "id" (snowflake) + "name" (human). We group channels by guild, output servers keyed by
- * guild name.
+ * webOS Servers/Rooms M3: enumerate a room account's full server->channel roster from the in-memory
+ * buddy list and hand it to the service handler to upsert into db8, so every guild/team/network and
+ * its visible channels appear in the Servers tab immediately, independent of any incoming message.
+ * Works for Discord (guild->channel), Teams (team->channel) and Telegram (flat, one synthetic server);
+ * see deriveServerName. The roster is signature-compared to the previous run per account: an unchanged
+ * roster is skipped, so the frequent blist-changed triggers don't churn the (delete+recreate) db8 sync.
  */
+// last-enumerated roster signature per account, to skip a no-op delete+recreate (churn guard).
+static std::unordered_map<std::string, std::string> s_lastServerChannelSig;
+
 bool LibpurpleAdapter::enumerateServersChannels(const char* serviceName, const char* username)
 {
 	if (!serviceName || !username || s_imServiceHandler == NULL)
@@ -2975,15 +3228,14 @@ bool LibpurpleAdapter::enumerateServersChannels(const char* serviceName, const c
 	if (account == NULL)
 		return false;
 
-	// Only guild->channel protocols have a server hierarchy worth enumerating; the "Guild: Category"
-	// group parsing below is Discord-specific.
-	const char* protoId = purple_account_get_protocol_id(account);
-	if (protoId == NULL || strstr(protoId, "discord") == NULL)
-		return false;
-
-	// guild name -> server MojObject (carrying its "channels" array). std::map keeps a stable
+	// Enumerate for any room protocol (Discord, Teams, Telegram). deriveServerName maps each chat to
+	// its server - guild/team for Discord/Teams, one synthetic network server for flat Telegram - the
+	// same mapping incoming_message_cb uses. Non-room protocols simply have no group chats in the
+	// blist, so this yields nothing and (with the empty-roster guard) is a harmless no-op.
+	// server name -> server MojObject (carrying its "channels" array). std::map keeps a stable
 	// (alphabetical) server order in the output.
 	std::map<std::string, MojObject> serverByGuild;
+	std::set<std::string> sigSet;   // order-independent roster signature ("server\x1f channelId")
 
 	for (PurpleBlistNode* node = purple_blist_get_root(); node != NULL; node = node->next)
 	{
@@ -2993,16 +3245,13 @@ bool LibpurpleAdapter::enumerateServersChannels(const char* serviceName, const c
 		if (groupName == NULL || *groupName == '\0')
 			continue;
 
-		// "Guild: Category" -> guild = before the first ": ", category = the remainder (may be empty).
-		std::string groupStr = groupName;
-		std::string guildName = groupStr;
+		// Server + category via the shared deriveServerName (identical to incoming_message_cb):
+		// Discord/Teams -> guild/team (before ": "), category -> the remainder; Telegram -> synthetic
+		// network server (the group is ignored). Empty -> unrelated group, skip its chats.
 		std::string categoryName;
-		std::string::size_type sep = groupStr.find(": ");
-		if (sep != std::string::npos)
-		{
-			guildName = groupStr.substr(0, sep);
-			categoryName = groupStr.substr(sep + 2);
-		}
+		std::string guildName = deriveServerName(account, groupName, &categoryName);
+		if (guildName.empty())
+			continue;
 
 		int position = 0;
 		for (PurpleBlistNode* child = node->child; child != NULL; child = child->next)
@@ -3015,12 +3264,21 @@ bool LibpurpleAdapter::enumerateServersChannels(const char* serviceName, const c
 			GHashTable* comps = purple_chat_get_components(chat);
 			if (comps == NULL)
 				continue;
+			// Channel key (must equal purple_conversation_get_name so this dedups with the
+			// message-driven record): Discord/Telegram store it as "id", Teams as "chatname".
 			const char* chanId = (const char*)g_hash_table_lookup(comps, "id");
+			if (chanId == NULL || *chanId == '\0')
+				chanId = (const char*)g_hash_table_lookup(comps, "chatname");
+			// Human name: Discord exposes it as the "name" component; Teams/Telegram set it as the
+			// chat alias (returned by purple_chat_get_name).
 			const char* chanName = (const char*)g_hash_table_lookup(comps, "name");
 			if (chanName == NULL || *chanName == '\0')
 				chanName = purple_chat_get_name(chat);
 			if (chanId == NULL || *chanId == '\0')
 				continue;   // no stable key -> skip
+
+			// churn-guard signature: server + channel key (the set makes it order-independent).
+			sigSet.insert(guildName + std::string("\x1f") + chanId);
 
 			if (serverByGuild.find(guildName) == serverByGuild.end())
 			{
@@ -3066,11 +3324,66 @@ bool LibpurpleAdapter::enumerateServersChannels(const char* serviceName, const c
 		return false;
 	}
 
+	// Churn guard: if the roster is identical to the last one synced for this account, skip the
+	// (destructive delete+recreate) db8 sync. The blist-changed trigger fires often (tdlib re-adds
+	// Telegram chats etc.); without this the same roster would be deleted and rebuilt every few
+	// seconds, flickering the Servers tab.
+	std::string sig;
+	for (std::set<std::string>::iterator sit = sigSet.begin(); sit != sigSet.end(); ++sit)
+		sig += *sit + "\n";
+	if (s_lastServerChannelSig[accountKey] == sig)
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("enumerateServersChannels: %s roster unchanged (%d channels); skipping sync"), serviceName, totalChannels);
+		return true;
+	}
+	s_lastServerChannelSig[accountKey] = sig;
+
 	MojLogInfo(IMServiceApp::s_log, _T("enumerateServersChannels: %s -> %d servers, %d channels"),
 		serviceName, (int)serverByGuild.size(), totalChannels);
 
 	s_imServiceHandler->syncServersChannels(serviceName, username, serversObj);
 	return true;
+}
+
+/*
+ * webOS Servers/Rooms M3: join a channel on demand (called when the user opens it in the Servers tab)
+ * so the prpl fetches + delivers its history. username may be NULL - the account is then resolved by
+ * serviceName (first online account of that service). Joining also lands the channel in the buddy
+ * list, so a subsequent send finds it instead of falling back to a 1:1 IM ("<snowflake> is offline").
+ */
+bool LibpurpleAdapter::openChannel(const char* serviceName, const char* username, const char* channel)
+{
+	if (!serviceName || !channel || !*channel)
+		return false;
+
+	PurpleAccount* account = NULL;
+	if (username && *username)
+	{
+		std::string accountKey = getAccountKey(username, serviceName);
+		if (s_onlineAccountData.count(accountKey))
+			account = s_onlineAccountData[accountKey];
+	}
+	if (account == NULL)
+	{
+		// resolve by serviceName: first online account of this service
+		for (std::unordered_map<std::string, PurpleAccount*>::iterator it = s_onlineAccountData.begin();
+		     it != s_onlineAccountData.end(); ++it)
+		{
+			if (getServiceNameFromPurpleAccount(it->second) == serviceName)
+			{
+				account = it->second;
+				break;
+			}
+		}
+	}
+	if (account == NULL)
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("openChannel: no online account for %s"), serviceName);
+		return false;
+	}
+
+	MojLogInfo(IMServiceApp::s_log, _T("openChannel: joining %s on %s"), channel, serviceName);
+	return joinChannelChat(account, channel) != NULL;
 }
 
 LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceName, const char* username, const char* usernameTo, const char* messageText)

@@ -24,6 +24,7 @@
  */
 
 
+#include <set>
 #include "IMServiceHandler.h"
 #include "LibpurpleAdapter.h"
 #include "IncomingIMHandler.h"
@@ -47,6 +48,7 @@ const IMServiceHandler::Method IMServiceHandler::s_methods[] = {
 	{_T("startQRLogin"), (Callback) &IMServiceHandler::startQRLogin},
 	{_T("getAuthChallenge"), (Callback) &IMServiceHandler::getAuthChallenge},
 	{_T("submitAuthInput"), (Callback) &IMServiceHandler::submitAuthInput},
+	{_T("openChannel"), (Callback) &IMServiceHandler::openChannel},
 	{NULL, NULL} };
 
 IMServiceHandler::IMServiceHandler(MojService* service)
@@ -60,10 +62,14 @@ IMServiceHandler::IMServiceHandler(MojService* service)
   m_deleteImCommandsSlot(this, &IMServiceHandler::deleteImCommandsResult),
   m_deleteContactsSlot(this, &IMServiceHandler::deleteContactsResult),
   m_deleteImBuddyStatusSlot(this, &IMServiceHandler::deleteImBuddyStatusResult),
-  m_syncDelChannelsSlot(this, &IMServiceHandler::syncDelChannelsResult),
-  m_syncDelServersSlot(this, &IMServiceHandler::syncDelServersResult),
+  m_syncFindServersSlot(this, &IMServiceHandler::syncFindServersResult),
   m_syncPutServersSlot(this, &IMServiceHandler::syncPutServersResult),
+  m_syncFindChannelsSlot(this, &IMServiceHandler::syncFindChannelsResult),
   m_syncPutChannelsSlot(this, &IMServiceHandler::syncPutChannelsResult),
+  m_syncMergeServersSlot(this, &IMServiceHandler::syncMergeServersResult),
+  m_syncMergeChannelsSlot(this, &IMServiceHandler::syncMergeChannelsResult),
+  m_syncDelGoneServersSlot(this, &IMServiceHandler::syncDelGoneServersResult),
+  m_syncDelGoneChannelsSlot(this, &IMServiceHandler::syncDelGoneChannelsResult),
   m_connectionState(service)
 {
 	MojLogTrace(IMServiceApp::s_log);
@@ -72,6 +78,7 @@ IMServiceHandler::IMServiceHandler(MojService* service)
 	m_shutdownCallbackId = 0;
 	m_displayController = NULL;
 	m_authChannel = NULL;
+	m_syncInFlight = false;
 }
 
 IMServiceHandler::~IMServiceHandler()
@@ -317,166 +324,290 @@ bool IMServiceHandler::syncServersChannels(const char* serviceName, const char* 
 		return true;
 	}
 
+	// SERIALIZE: the delete->recreate chain below runs across async db8 callbacks on shared member
+	// state (m_syncServiceName / m_syncServers). Concurrent enumerations (Discord + Telegram both
+	// firing on their post-sync debounce) would clobber that state mid-chain and delete the wrong
+	// account's records in a never-converging churn. If a sync is already in flight, skip this one -
+	// the blist-changed trigger / next login re-enumerates, and the roster-signature guard means an
+	// unchanged roster won't re-sync anyway.
+	if (m_syncInFlight)
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("syncServersChannels: a sync is already in flight; skipping %s"), serviceName);
+		return true;
+	}
+	m_syncInFlight = true;
+
 	MojErr err = m_syncServiceName.assign(serviceName);
-	MojErrCheck(err);
+	if (err != MojErrNone)
+	{
+		m_syncInFlight = false;
+		return false;
+	}
 	m_syncServers = serversObj;
 
 	err = syncServersChannelsStart();
 	if (err != MojErrNone)
 	{
+		m_syncInFlight = false;
 		MojLogError(IMServiceApp::s_log, _T("syncServersChannels: start failed: %d"), err);
 		return false;
 	}
 	return true;
 }
 
-// Stage 1: delete this account's existing imchannel rows (byRemoteId index leads with serviceName).
+// Stage 1: find this account's existing imserver rows so we can diff (not wipe) against the roster.
 MojErr IMServiceHandler::syncServersChannelsStart()
+{
+	m_syncServerIdByRemote.clear();
+	m_syncNewServerRemotes.clear();
+
+	MojDbQuery query;
+	MojErr err = query.from(_T("com.palm.imserver:1"));
+	MojErrCheck(err);
+	err = query.where(_T("serviceName"), MojDbQuery::OpEq, m_syncServiceName);
+	MojErrCheck(err);
+	err = m_dbClient.find(m_syncFindServersSlot, query);
+	MojErrCheck(err);
+	return MojErrNone;
+}
+
+// Stage 2: diff servers by remoteId. MERGE existing (keep _id), PUT new (need their assigned _ids to
+// stamp onto channels), DEL those that vanished from the roster.
+MojErr IMServiceHandler::syncFindServersResult(MojObject& payload, MojErr err)
+{
+	if (err != MojErrNone)
+	{
+		MojLogError(IMServiceApp::s_log, _T("syncServersChannels: find(imserver) failed: %d"), err);
+		m_syncInFlight = false;
+		return MojErrNone;
+	}
+
+	// existing remoteId -> _id
+	std::map<std::string, MojString> existing;
+	MojObject results;
+	payload.get(_T("results"), results);
+	for (MojObject::ConstArrayIterator it = results.arrayBegin(); it != results.arrayEnd(); ++it)
+	{
+		MojString rid, id;
+		bool f = false;
+		it->get(_T("remoteId"), rid, f);
+		it->get(_T("_id"), id, f);
+		if (!rid.empty())
+			existing[std::string(rid.data())] = id;
+	}
+
+	MojObject::ObjectVec mergeServers, putServers;
+	MojObject delGoneServers;   // array of _id values
+	std::set<std::string> incoming;
+
+	for (MojObject::ConstArrayIterator sIt = m_syncServers.arrayBegin(); sIt != m_syncServers.arrayEnd(); ++sIt)
+	{
+		MojString remoteId, name;
+		bool f = false;
+		sIt->get(_T("remoteId"), remoteId, f);
+		sIt->get(_T("name"), name, f);
+		if (remoteId.empty())
+			continue;
+		incoming.insert(std::string(remoteId.data()));
+
+		std::map<std::string, MojString>::iterator e = existing.find(std::string(remoteId.data()));
+		if (e != existing.end())
+		{
+			// existing -> merge in place (keep _id); update the display fields only
+			MojObject m;
+			MojErrCheck(m.putString(_T("_kind"), _T("com.palm.imserver:1")));
+			MojErrCheck(m.put(_T("_id"), e->second));
+			MojErrCheck(m.putString(_T("displayName"), name));
+			MojErrCheck(m.putString(_T("name"), name));
+			MojErrCheck(mergeServers.push(m));
+			m_syncServerIdByRemote[std::string(remoteId.data())] = e->second; // _id known now
+		}
+		else
+		{
+			// new -> put (assigned _id comes back in syncPutServersResult, matched by this order)
+			MojObject s;
+			MojErrCheck(s.putString(_T("_kind"), _T("com.palm.imserver:1")));
+			MojErrCheck(s.putString(_T("serviceName"), m_syncServiceName));
+			MojErrCheck(s.putString(_T("remoteId"), remoteId));
+			MojErrCheck(s.putString(_T("displayName"), name));
+			MojErrCheck(s.putString(_T("name"), name));
+			MojErrCheck(putServers.push(s));
+			m_syncNewServerRemotes.push_back(std::string(remoteId.data()));
+		}
+	}
+
+	// servers that disappeared from the roster -> delete by _id
+	for (std::map<std::string, MojString>::iterator e = existing.begin(); e != existing.end(); ++e)
+		if (incoming.find(e->first) == incoming.end())
+			MojErrCheck(delGoneServers.push(e->second));
+
+	// fire cleanup (does not gate m_syncInFlight - the put-chain does)
+	if (!mergeServers.empty())
+		m_dbClient.merge(m_syncMergeServersSlot, mergeServers.begin(), mergeServers.end());
+	if (!delGoneServers.empty())
+		m_dbClient.del(m_syncDelGoneServersSlot, delGoneServers.arrayBegin(), delGoneServers.arrayEnd());
+
+	// put new servers if any (need their _ids for channels); otherwise the server map is complete now.
+	if (!putServers.empty())
+	{
+		MojErr merr = m_dbClient.put(m_syncPutServersSlot, putServers.begin(), putServers.end());
+		MojErrCheck(merr);
+	}
+	else
+	{
+		return syncFindChannels();
+	}
+	return MojErrNone;
+}
+
+// Stage 3: new servers created -> record their _ids (in the order they were put), then find channels.
+MojErr IMServiceHandler::syncPutServersResult(MojObject& payload, MojErr err)
+{
+	if (err != MojErrNone)
+	{
+		MojLogError(IMServiceApp::s_log, _T("syncServersChannels: put(imserver) failed: %d"), err);
+		m_syncInFlight = false;
+		return MojErrNone;
+	}
+
+	MojObject results;
+	payload.get(_T("results"), results);
+	size_t i = 0;
+	for (MojObject::ConstArrayIterator rIt = results.arrayBegin();
+	     rIt != results.arrayEnd() && i < m_syncNewServerRemotes.size(); ++rIt, ++i)
+	{
+		MojString id;
+		bool f = false;
+		rIt->get(_T("id"), id, f);
+		if (f)
+			m_syncServerIdByRemote[m_syncNewServerRemotes[i]] = id;
+	}
+	return syncFindChannels();
+}
+
+// Stage 4: find existing imchannel rows so we can diff (not wipe) the channels too.
+MojErr IMServiceHandler::syncFindChannels()
 {
 	MojDbQuery query;
 	MojErr err = query.from(_T("com.palm.imchannel:1"));
 	MojErrCheck(err);
 	err = query.where(_T("serviceName"), MojDbQuery::OpEq, m_syncServiceName);
 	MojErrCheck(err);
-	err = m_dbClient.del(m_syncDelChannelsSlot, query);
+	err = m_dbClient.find(m_syncFindChannelsSlot, query);
 	MojErrCheck(err);
 	return MojErrNone;
 }
 
-// Stage 2: channels gone -> delete the servers (byservice index).
-MojErr IMServiceHandler::syncDelChannelsResult(MojObject& payload, MojErr err)
+// Stage 5: diff channels by remoteId. MERGE existing (keep _id AND chatThreadId - chatThreadId is
+// deliberately NOT included so db8 leaves it untouched, which is what stops the duplicate-thread
+// orphaning), PUT new (serverId from the server _id map), DEL those that vanished.
+MojErr IMServiceHandler::syncFindChannelsResult(MojObject& payload, MojErr err)
 {
 	if (err != MojErrNone)
-		MojLogError(IMServiceApp::s_log, _T("syncServersChannels: del(imchannel) failed: %d"), err);
-
-	MojDbQuery query;
-	MojErr qerr = query.from(_T("com.palm.imserver:1"));
-	MojErrCheck(qerr);
-	qerr = query.where(_T("serviceName"), MojDbQuery::OpEq, m_syncServiceName);
-	MojErrCheck(qerr);
-	qerr = m_dbClient.del(m_syncDelServersSlot, query);
-	MojErrCheck(qerr);
-	return MojErrNone;
-}
-
-// Stage 3: servers gone -> create the fresh imserver rows. Their assigned _ids come back in order.
-MojErr IMServiceHandler::syncDelServersResult(MojObject& payload, MojErr err)
-{
-	if (err != MojErrNone)
-		MojLogError(IMServiceApp::s_log, _T("syncServersChannels: del(imserver) failed: %d"), err);
-
-	if (m_syncServers.size() == 0)
 	{
-		MojLogInfo(IMServiceApp::s_log, _T("syncServersChannels: no servers to create; done"));
+		MojLogError(IMServiceApp::s_log, _T("syncServersChannels: find(imchannel) failed: %d"), err);
+		m_syncInFlight = false;
 		return MojErrNone;
 	}
 
-	MojObject::ObjectVec servers;
-	MojObject::ConstArrayIterator it = m_syncServers.arrayBegin();
-	for (; it != m_syncServers.arrayEnd(); ++it)
-	{
-		MojString remoteId, name;
-		bool found = false;
-		it->get(_T("remoteId"), remoteId, found);
-		it->get(_T("name"), name, found);
-
-		MojObject server;
-		MojErr merr = server.putString(_T("_kind"), _T("com.palm.imserver:1"));
-		MojErrCheck(merr);
-		merr = server.putString(_T("serviceName"), m_syncServiceName);
-		MojErrCheck(merr);
-		merr = server.putString(_T("remoteId"), remoteId);
-		MojErrCheck(merr);
-		merr = server.putString(_T("displayName"), name);
-		MojErrCheck(merr);
-		merr = server.putString(_T("name"), name);
-		MojErrCheck(merr);
-		merr = servers.push(server);
-		MojErrCheck(merr);
-	}
-
-	MojErr merr = m_dbClient.put(m_syncPutServersSlot, servers.begin(), servers.end());
-	MojErrCheck(merr);
-	return MojErrNone;
-}
-
-// Stage 4: imservers created -> put the channels, each pointing at its server's new _id (put results
-// come back in the same order the servers were sent).
-MojErr IMServiceHandler::syncPutServersResult(MojObject& payload, MojErr err)
-{
-	if (err != MojErrNone)
-	{
-		MojLogError(IMServiceApp::s_log, _T("syncServersChannels: put(imserver) failed: %d"), err);
-		return MojErrNone;
-	}
-
+	std::map<std::string, MojString> existing; // channel remoteId -> _id
 	MojObject results;
-	if (!payload.get(_T("results"), results))
+	payload.get(_T("results"), results);
+	for (MojObject::ConstArrayIterator it = results.arrayBegin(); it != results.arrayEnd(); ++it)
 	{
-		MojLogError(IMServiceApp::s_log, _T("syncServersChannels: put(imserver) response had no results"));
-		return MojErrNone;
+		MojString rid, id;
+		bool f = false;
+		it->get(_T("remoteId"), rid, f);
+		it->get(_T("_id"), id, f);
+		if (!rid.empty())
+			existing[std::string(rid.data())] = id;
 	}
 
-	MojObject::ObjectVec channels;
-	MojObject::ConstArrayIterator sIt = m_syncServers.arrayBegin();
-	MojObject::ConstArrayIterator rIt = results.arrayBegin();
-	for (; sIt != m_syncServers.arrayEnd() && rIt != results.arrayEnd(); ++sIt, ++rIt)
+	MojObject::ObjectVec mergeChannels, putChannels;
+	MojObject delGoneChannels;
+	std::set<std::string> incoming;
+
+	for (MojObject::ConstArrayIterator sIt = m_syncServers.arrayBegin(); sIt != m_syncServers.arrayEnd(); ++sIt)
 	{
-		MojString serverId;
-		bool found = false;
-		rIt->get(_T("id"), serverId, found);
-		if (!found)
-			continue;
+		MojString serverRemote;
+		bool f = false;
+		sIt->get(_T("remoteId"), serverRemote, f);
+		std::map<std::string, MojString>::iterator sm = m_syncServerIdByRemote.find(std::string(serverRemote.data()));
+		if (sm == m_syncServerIdByRemote.end())
+			continue; // server _id unresolved (shouldn't happen); skip its channels
+		MojString serverId = sm->second;
 
 		MojObject channelArr;
 		if (!sIt->get(_T("channels"), channelArr))
 			continue;
 
-		MojObject::ConstArrayIterator cIt = channelArr.arrayBegin();
-		for (; cIt != channelArr.arrayEnd(); ++cIt)
+		for (MojObject::ConstArrayIterator cIt = channelArr.arrayBegin(); cIt != channelArr.arrayEnd(); ++cIt)
 		{
 			MojString remoteId, name, parentId;
-			bool f = false;
-			cIt->get(_T("remoteId"), remoteId, f);
-			cIt->get(_T("name"), name, f);
+			bool cf = false;
+			cIt->get(_T("remoteId"), remoteId, cf);
+			cIt->get(_T("name"), name, cf);
 			bool hasParent = false;
 			cIt->get(_T("parentId"), parentId, hasParent);
 			MojInt64 position = 0;
 			cIt->get(_T("position"), position);
+			if (remoteId.empty())
+				continue;
+			incoming.insert(std::string(remoteId.data()));
 
-			MojObject channel;
-			MojErr merr = channel.putString(_T("_kind"), _T("com.palm.imchannel:1"));
-			MojErrCheck(merr);
-			merr = channel.putString(_T("serviceName"), m_syncServiceName);
-			MojErrCheck(merr);
-			merr = channel.putString(_T("remoteId"), remoteId);
-			MojErrCheck(merr);
-			merr = channel.putString(_T("serverId"), serverId);
-			MojErrCheck(merr);
-			merr = channel.putString(_T("displayName"), name);
-			MojErrCheck(merr);
-			merr = channel.putString(_T("name"), name);
-			MojErrCheck(merr);
-			if (hasParent)
+			std::map<std::string, MojString>::iterator e = existing.find(std::string(remoteId.data()));
+			if (e != existing.end())
 			{
-				merr = channel.putString(_T("parentId"), parentId);
-				MojErrCheck(merr);
+				// existing -> merge in place. NOTE: chatThreadId intentionally omitted so the existing
+				// channel->chatthread link survives (this is what prevents the duplicate threads).
+				MojObject m;
+				MojErrCheck(m.putString(_T("_kind"), _T("com.palm.imchannel:1")));
+				MojErrCheck(m.put(_T("_id"), e->second));
+				MojErrCheck(m.putString(_T("serverId"), serverId));
+				MojErrCheck(m.putString(_T("displayName"), name));
+				MojErrCheck(m.putString(_T("name"), name));
+				if (hasParent)
+					MojErrCheck(m.putString(_T("parentId"), parentId));
+				MojErrCheck(m.putInt(_T("position"), position));
+				MojErrCheck(mergeChannels.push(m));
 			}
-			merr = channel.putInt(_T("position"), position);
-			MojErrCheck(merr);
-			merr = channels.push(channel);
-			MojErrCheck(merr);
+			else
+			{
+				// new -> put
+				MojObject channel;
+				MojErrCheck(channel.putString(_T("_kind"), _T("com.palm.imchannel:1")));
+				MojErrCheck(channel.putString(_T("serviceName"), m_syncServiceName));
+				MojErrCheck(channel.putString(_T("remoteId"), remoteId));
+				MojErrCheck(channel.putString(_T("serverId"), serverId));
+				MojErrCheck(channel.putString(_T("displayName"), name));
+				MojErrCheck(channel.putString(_T("name"), name));
+				if (hasParent)
+					MojErrCheck(channel.putString(_T("parentId"), parentId));
+				MojErrCheck(channel.putInt(_T("position"), position));
+				MojErrCheck(putChannels.push(channel));
+			}
 		}
 	}
 
-	if (channels.size() == 0)
-	{
-		MojLogInfo(IMServiceApp::s_log, _T("syncServersChannels: no channels to create; done"));
-		return MojErrNone;
-	}
+	for (std::map<std::string, MojString>::iterator e = existing.begin(); e != existing.end(); ++e)
+		if (incoming.find(e->first) == incoming.end())
+			MojErrCheck(delGoneChannels.push(e->second));
 
-	MojErr merr = m_dbClient.put(m_syncPutChannelsSlot, channels.begin(), channels.end());
-	MojErrCheck(merr);
+	if (!mergeChannels.empty())
+		m_dbClient.merge(m_syncMergeChannelsSlot, mergeChannels.begin(), mergeChannels.end());
+	if (!delGoneChannels.empty())
+		m_dbClient.del(m_syncDelGoneChannelsSlot, delGoneChannels.arrayBegin(), delGoneChannels.arrayEnd());
+
+	if (!putChannels.empty())
+	{
+		MojErr merr = m_dbClient.put(m_syncPutChannelsSlot, putChannels.begin(), putChannels.end());
+		MojErrCheck(merr);
+	}
+	else
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("syncServersChannels: incremental roster reconcile complete (no new channels)"));
+		m_syncInFlight = false;
+	}
 	return MojErrNone;
 }
 
@@ -485,7 +616,64 @@ MojErr IMServiceHandler::syncPutChannelsResult(MojObject& payload, MojErr err)
 	if (err != MojErrNone)
 		MojLogError(IMServiceApp::s_log, _T("syncServersChannels: put(imchannel) failed: %d"), err);
 	else
-		MojLogInfo(IMServiceApp::s_log, _T("syncServersChannels: roster upsert complete"));
+		MojLogInfo(IMServiceApp::s_log, _T("syncServersChannels: incremental roster reconcile complete"));
+	m_syncInFlight = false;   // put-chain complete: allow the next enumeration to sync
+	return MojErrNone;
+}
+
+// fire-and-forget cleanup result slots: log only (they don't gate the put-chain / m_syncInFlight).
+MojErr IMServiceHandler::syncMergeServersResult(MojObject& payload, MojErr err)
+{
+	if (err != MojErrNone)
+		MojLogError(IMServiceApp::s_log, _T("syncServersChannels: merge(imserver) failed: %d"), err);
+	return MojErrNone;
+}
+MojErr IMServiceHandler::syncMergeChannelsResult(MojObject& payload, MojErr err)
+{
+	if (err != MojErrNone)
+		MojLogError(IMServiceApp::s_log, _T("syncServersChannels: merge(imchannel) failed: %d"), err);
+	return MojErrNone;
+}
+MojErr IMServiceHandler::syncDelGoneServersResult(MojObject& payload, MojErr err)
+{
+	if (err != MojErrNone)
+		MojLogError(IMServiceApp::s_log, _T("syncServersChannels: del(gone imserver) failed: %d"), err);
+	return MojErrNone;
+}
+MojErr IMServiceHandler::syncDelGoneChannelsResult(MojObject& payload, MojErr err)
+{
+	if (err != MojErrNone)
+		MojLogError(IMServiceApp::s_log, _T("syncServersChannels: del(gone imchannel) failed: %d"), err);
+	return MojErrNone;
+}
+
+/*
+ * webOS Servers/Rooms M3: openChannel - the Messaging app calls this when the user opens a channel in
+ * the Servers tab, so the transport joins the channel (prpl fetches its history + accepts sends).
+ *   { "serviceName": "type_discord", "channel": "<channel key/snowflake>", "username": "<optional>" }
+ */
+MojErr IMServiceHandler::openChannel(MojServiceMessage* serviceMsg, const MojObject payload)
+{
+	MojLogTrace(IMServiceApp::s_log);
+
+	MojString serviceName, channel, username;
+	bool found = false;
+	payload.get(_T("serviceName"), serviceName, found);
+	bool haveChannel = false;
+	payload.get(_T("channel"), channel, haveChannel);
+	payload.get(_T("username"), username, found);   // optional
+
+	if (serviceName.empty() || !haveChannel || channel.empty())
+	{
+		MojLogError(IMServiceApp::s_log, _T("openChannel: serviceName and channel are required"));
+		serviceMsg->replyError(MojErrInvalidArg);
+		return MojErrNone;
+	}
+
+	MojLogInfo(IMServiceApp::s_log, _T("openChannel: serviceName=%s channel=%s"), serviceName.data(), channel.data());
+	LibpurpleAdapter::openChannel(serviceName.data(), username.empty() ? NULL : username.data(), channel.data());
+
+	serviceMsg->replySuccess();
 	return MojErrNone;
 }
 
@@ -728,6 +916,25 @@ bool IMServiceHandler::updateBuddyStatus(const char* accountId, const char* serv
 		return false;
 	}
 
+	return true;
+}
+
+// Perf (#2): batched presence for one account - the adapter flushes a coalesced window of per-buddy
+// presence ticks here as one array, and BuddyStatusHandler turns it into a single find + batched
+// merge/put (vs a find+merge per buddy). Short-lived handler like updateBuddyStatus above.
+bool IMServiceHandler::updateBuddyStatusBatch(const char* accountId, const char* serviceName, MojObject& updates)
+{
+	MojLogInfo(IMServiceApp::s_log, _T("updateBuddyStatusBatch - accountId: %s, serviceName: %s, count: %d"),
+			accountId, serviceName, (int)updates.size());
+
+	MojRefCountedPtr<BuddyStatusHandler> buddyStatusHandler(new BuddyStatusHandler(m_service, this));
+	MojErr err = buddyStatusHandler->updateBuddyStatusBatch(accountId, serviceName, updates);
+	if (err) {
+		MojString error;
+		MojErrToString(err, error);
+		MojLogError(IMServiceApp::s_log, _T("updateBuddyStatusBatch failed: %d - %s"), err, error.data());
+		return false;
+	}
 	return true;
 }
 

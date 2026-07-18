@@ -58,6 +58,11 @@ public:
 	virtual ~BuddyStatusHandler();
 	MojErr updateBuddyStatus(const char* accountId, const char* serviceName, const char* username, int availability,
 			const char* customMessage, const char* groupName, const char* buddyAvatarLoc);
+	// Perf (#2): batched presence update for ONE account. `updates` is an array of
+	// { username, availability, status, group }. Does a single find(byAccountId) then ONE batched
+	// merge (existing rows, by _id) + ONE batched put (new rows) instead of a find+merge PER buddy -
+	// the ~32x-faster path measured on-device. Avatars are handled by the per-buddy path (rare).
+	MojErr updateBuddyStatusBatch(const char* accountId, const char* serviceName, MojObject& updates);
 	MojErr receivedBuddyInvite(const char* serviceName, const char* username, const char* usernameFrom, const char* customMessage);
 
 
@@ -65,6 +70,17 @@ private:
 
 	MojDbClient::Signal::Slot<BuddyStatusHandler> m_saveStatusSlot;
 	MojErr saveStatusResult(MojObject& result, MojErr err);
+
+	// Perf (#2) batched-presence slots + carried state (see updateBuddyStatusBatch).
+	MojString m_batchAccountId;
+	MojString m_batchServiceName;
+	MojObject m_batchUpdates;   // array of { username, availability, status, group }
+	MojDbClient::Signal::Slot<BuddyStatusHandler> m_batchFindSlot;
+	MojErr batchFindResult(MojObject& result, MojErr err);
+	MojDbClient::Signal::Slot<BuddyStatusHandler> m_batchMergeSlot;
+	MojErr batchMergeResult(MojObject& result, MojErr err);
+	MojDbClient::Signal::Slot<BuddyStatusHandler> m_batchPutSlot;
+	MojErr batchPutResult(MojObject& result, MojErr err);
 
 	MojDbClient::Signal::Slot<BuddyStatusHandler> m_saveContactSlot;
 	MojErr saveContactResult(MojObject& result, MojErr err);

@@ -90,6 +90,11 @@ public:
 				const char* usernameFromDisplay = NULL) = 0;
 	virtual bool updateBuddyStatus(const char* accountId, const char* serviceName, const char* username, int availability,
 				const char* customMessage, const char* groupName, const char* buddyAvatarLoc) = 0;
+	// Perf (#2): batched presence for one account - `updates` is an array of { username, availability,
+	// status, group }. The adapter coalesces per-buddy presence ticks over a short window and flushes
+	// them here as ONE batch, which the db8 impl turns into a single find + batched merge/put instead
+	// of a find+merge per buddy. Default no-op so non-db8 implementors need not override.
+	virtual bool updateBuddyStatusBatch(const char* accountId, const char* serviceName, MojObject& updates) { return true; }
 	virtual bool receivedBuddyInvite(const char* serviceName, const char* username, const char* usernameFrom, const char* message) = 0;
 	virtual bool buddyInviteDeclined(const char* serviceName, const char* username, const char* usernameFrom) = 0;
 	// webOS Servers/Rooms M3: full server->channel roster enumerated from the buddy list at login,
@@ -146,6 +151,9 @@ public:
 	// build the guild->channel roster and hand it to the service handler (syncServersChannels) to
 	// upsert into db8. Called post-login once the blist is populated.
 	static bool enumerateServersChannels(const char* serviceName, const char* username);
+	// webOS Servers/Rooms M3: join a channel on demand (Servers-tab open) so the prpl fetches its
+	// history and a later send routes to the chat. username may be NULL (resolve by serviceName).
+	static bool openChannel(const char* serviceName, const char* username, const char* channel);
 	static bool setMyAvailability(const char* serviceName, const char* username, int availability);
 	static bool setMyCustomMessage(const char* serviceName, const char* username, const char* customMessage);
 	static SendResult blockBuddy(const char* serviceName, const char* username, const char* buddyUsername, bool block);

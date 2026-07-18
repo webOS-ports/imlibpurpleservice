@@ -1212,6 +1212,19 @@ void IMLoginStateHandler::loginResult(const char* serviceName, const char* usern
 		{
 			MojLogInfo(IMServiceApp::s_log, _T("loginResult: ignoring noRetry==true because type==login_success"));
 		}
+		else if (type == LoginCallbackInterface::LOGIN_SIGNED_OFF)
+		{
+			// webOS: a SIGNED_OFF is a CONNECTION event, not the user's intent to go offline. On this
+			// device WiFi roams between two similar-strength APs on different subnets, so the IP keeps
+			// changing and libpurple signs the account off to re-bind. Parking availability=OFFLINE
+			// here made the account manager treat the user as intentionally offline, so it never
+			// re-logged-in and the user had to manually toggle their status. The user's DESIRED
+			// presence is owned by the status UI / setMyAvailability - leave it untouched. We only set
+			// the current state=OFFLINE below, so needsToLogin() re-drives the login on the new IP.
+			// (A genuinely unreachable network still parks eventually via the LOGIN_FAILED/TIMEOUT
+			// retry path, so this does not loop forever.)
+			MojLogInfo(IMServiceApp::s_log, _T("loginResult: SIGNED_OFF - preserving desired availability so the account auto-reconnects (e.g. WiFi roam / IP change)"));
+		}
 		else
 		{
 			MojLogInfo(IMServiceApp::s_log, _T("loginResult: noRetry is true - setting availability offline"));

@@ -27,6 +27,9 @@
 #ifndef IMSERVICEHANDLER_H_
 #define IMSERVICEHANDLER_H_
 
+#include <map>
+#include <vector>
+#include <string>
 #include "core/MojService.h"
 #include "core/MojServiceMessage.h"
 #include "db/MojDbServiceClient.h"
@@ -55,6 +58,8 @@ public:
 			const char* usernameFromDisplay = NULL);
 	virtual bool updateBuddyStatus(const char* accountId, const char* serviceName, const char* username, int availability,
 			const char* customMessage, const char* groupName, const char* buddyAvatarLoc);
+	// Perf (#2): batched presence for one account (see IMServiceCallbackInterface / BuddyStatusHandler).
+	virtual bool updateBuddyStatusBatch(const char* accountId, const char* serviceName, MojObject& updates);
 	virtual bool receivedBuddyInvite(const char* serviceName, const char* username, const char* usernameFrom, const char* message);
 	virtual bool buddyInviteDeclined(const char* serviceName, const char* username, const char* usernameFrom);
 	// webOS Servers/Rooms M3: upsert the enumerated guild->channel roster into db8 (see .cpp).
@@ -103,22 +108,42 @@ private:
     MojDbClient::Signal::Slot<IMServiceHandler> m_deleteImBuddyStatusSlot;
     MojErr deleteImBuddyStatusResult(MojObject& payload, MojErr err);
 
-    /* webOS Servers/Rooms M3: enumerated server->channel roster upsert. A login-time sync that
-     * clears this account's imserver/imchannel then recreates them, so the Servers tab reflects the
-     * live guild/channel list. Done as a chained async sequence (db8 has no upsert): del imchannel ->
-     * del imserver -> put imserver (capture assigned _ids) -> put imchannel (serverId = those _ids).
-     * m_syncServers holds the pending {remoteId,name,channels:[...]} array across the async hops. */
+    /* webOS Servers/Rooms M3: enumerated server->channel roster upsert. A login-time (and debounced
+     * post-buddy-change) sync that reconciles this account's imserver/imchannel rows against the live
+     * roster INCREMENTALLY - NOT a wipe+recreate. The old delete+recreate gave every recreated
+     * imchannel a new _id and dropped its chatThreadId, which orphaned the channel's chatthread and
+     * spawned a duplicate on the next message. Instead we diff by the byRemoteId index, like
+     * BuddyListConsolidator does for contacts: MERGE existing rows in place (keeping _id AND
+     * chatThreadId - we simply don't include chatThreadId in the merge), PUT only genuinely new rows,
+     * and DEL only rows that disappeared from the roster. Chain: find imserver -> (merge existing /
+     * put new / del gone) -> find imchannel -> (merge existing / put new / del gone). serverId on a
+     * channel is resolved from the server _id map (existing _ids + the put results for new servers).
+     * m_syncServers holds the pending {remoteId,name,channels:[...]} roster across the async hops. */
     MojObject m_syncServers;
     MojString m_syncServiceName;
+    bool m_syncInFlight;   // a roster reconcile is running; serialize to protect the shared state below
+    std::map<std::string, MojString> m_syncServerIdByRemote; // server remoteId -> _id (existing + new)
+    std::vector<std::string> m_syncNewServerRemotes;         // remoteIds of NEW servers, in put order
     MojErr syncServersChannelsStart();
-    MojDbClient::Signal::Slot<IMServiceHandler> m_syncDelChannelsSlot;
-    MojErr syncDelChannelsResult(MojObject& payload, MojErr err);
-    MojDbClient::Signal::Slot<IMServiceHandler> m_syncDelServersSlot;
-    MojErr syncDelServersResult(MojObject& payload, MojErr err);
+    MojErr syncFindChannels();  // helper: kick off the imchannel find once server _ids are all resolved
+    // put-chain (drives m_syncInFlight): find servers -> put new servers -> find channels -> put new channels
+    MojDbClient::Signal::Slot<IMServiceHandler> m_syncFindServersSlot;
+    MojErr syncFindServersResult(MojObject& payload, MojErr err);
     MojDbClient::Signal::Slot<IMServiceHandler> m_syncPutServersSlot;
     MojErr syncPutServersResult(MojObject& payload, MojErr err);
+    MojDbClient::Signal::Slot<IMServiceHandler> m_syncFindChannelsSlot;
+    MojErr syncFindChannelsResult(MojObject& payload, MojErr err);
     MojDbClient::Signal::Slot<IMServiceHandler> m_syncPutChannelsSlot;
     MojErr syncPutChannelsResult(MojObject& payload, MojErr err);
+    // fire-and-forget cleanup (merge changed rows / delete removed rows); results only logged
+    MojDbClient::Signal::Slot<IMServiceHandler> m_syncMergeServersSlot;
+    MojErr syncMergeServersResult(MojObject& payload, MojErr err);
+    MojDbClient::Signal::Slot<IMServiceHandler> m_syncMergeChannelsSlot;
+    MojErr syncMergeChannelsResult(MojObject& payload, MojErr err);
+    MojDbClient::Signal::Slot<IMServiceHandler> m_syncDelGoneServersSlot;
+    MojErr syncDelGoneServersResult(MojObject& payload, MojErr err);
+    MojDbClient::Signal::Slot<IMServiceHandler> m_syncDelGoneChannelsSlot;
+    MojErr syncDelGoneChannelsResult(MojObject& payload, MojErr err);
 
 	IMLoginState* m_loginState;
 	ConnectionState m_connectionState;
@@ -146,6 +171,8 @@ private:
 	MojErr startQRLogin(MojServiceMessage* msg, const MojObject payload);
 	MojErr getAuthChallenge(MojServiceMessage* msg, const MojObject payload);
 	MojErr submitAuthInput(MojServiceMessage* msg, const MojObject payload);
+	// webOS Servers/Rooms M3: join a channel on open so its history is fetched (see .cpp).
+	MojErr openChannel(MojServiceMessage* msg, const MojObject payload);
 
 	// Kicks off the send process. Queries DB for outgoing messages and sends them.
 	MojErr IMSend(MojServiceMessage* msg, const MojObject payload);
