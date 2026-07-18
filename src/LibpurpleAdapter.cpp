@@ -550,6 +550,16 @@ static const char* getMojoFriendlyErrorCode(PurpleConnectionError type)
 
 static std::string getAccountKey(std::string const& username, std::string const& serviceName)
 {
+	// whatsmeow (WhatsApp) renames the account username to the full JID "<digits>@s.whatsapp.net"
+	// once pairing completes, while the webOS account layer + validator use the bare digits. Strip
+	// the JID suffix so a WhatsApp account maps to ONE stable transport key no matter which form we
+	// are handed -- otherwise sendMessage, preview adoption, and post-restart auto-login would key
+	// the same account differently and "lose" the logged-in session. No other service's username
+	// contains this suffix, so this is a no-op for them.
+	static const std::string waSuffix = "@s.whatsapp.net";
+	if (username.size() > waSuffix.size() &&
+	    username.compare(username.size() - waSuffix.size(), waSuffix.size(), waSuffix) == 0)
+		return username.substr(0, username.size() - waSuffix.size()) + "_" + serviceName;
 	return username + "_" + serviceName;
 }
 
@@ -1182,16 +1192,19 @@ static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 		}
 		s_qrPreviewKeys.erase(accountKey);
 		s_pendingAccountData.erase(accountKey);
-		s_onlineAccountData.erase(accountKey);
 		cancelBuddyResync(accountKey);
-		// Delete the disposable preview account entirely (see qrTokenPollCallback): keeping it
-		// persisted would leave an untagged orphan (no webosAccountId) that auto-logs-in +
-		// floods and that onDelete can never remove. The token is already handed to the UI;
-		// the real account is created by the UI and logs in directly with that token.
-		// DEFER the delete off this signal-callback stack: deleting the account here (with a large
-		// synced buddy list, e.g. WhatsApp) re-entrantly tears down the blist while libpurple is
-		// still using this connection -> crash. Disconnect+disable now; delete on the next tick.
-		schedulePreviewAccountDelete(loggedInAccount);
+		// ADOPTION (do NOT delete the paired preview). Earlier this disconnected + deleted the
+		// disposable account here; for session prpls (whatsmeow/WhatsApp) disconnecting a
+		// freshly-paired-and-synced client SIGSEGVs, and deleting orphans it in accounts.xml. So
+		// instead keep the live, paired connection and register it as an online account that has
+		// no webOS accountId yet. The UI creates the real webOS account from the confirmed token;
+		// when its onEnabled -> LibpurpleAdapter::login() arrives it finds THIS account already
+		// online without a webosAccountId and adopts it (stamps the id + marks the login state),
+		// reusing the paired session with no disconnect and no second login. If the user abandons
+		// the flow instead, the fail/timeout/cancel paths still tear the preview down.
+		s_onlineAccountData[accountKey] = loggedInAccount;
+		s_ipAddressesBoundTo[accountKey] = s_ipAddressesBoundTo.count(accountKey) ? s_ipAddressesBoundTo[accountKey] : "";
+		MojLogInfo(IMServiceApp::s_log, _T("account_logged_in_cb: keeping paired preview %s alive for adoption"), accountKey.c_str());
 		return;
 	}
 
@@ -1880,6 +1893,38 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 		 * We're either already logged in to this account or we're already in the process of logging in to this account
 		 * (i.e. it's pending; waiting for server response)
 		 */
+		/* ADOPTION (must run BEFORE the interface check below, which would otherwise
+		 * disconnect + rebind a mismatched-IP account -> crash whatsmeow): the account may
+		 * already be online because it was paired via a QR-preview login we kept alive (see
+		 * account_logged_in_cb). If it has no webOS accountId yet, THIS login() call is the
+		 * account's creation -- adopt the live paired session: stamp the webosAccountId (so
+		 * onDelete can find it + it is no longer an untagged orphan), bind it to the current
+		 * interface, and report login success. Reuses the paired connection with no disconnect
+		 * and no second login. */
+		if (accountIsAlreadyOnline)
+		{
+			const char* existingWebosId = purple_account_get_string(alreadyActiveAccount, "webosAccountId", NULL);
+			if ((existingWebosId == NULL || *existingWebosId == '\0') && !params.accountId.empty())
+			{
+				purple_account_set_string(alreadyActiveAccount, "webosAccountId", params.accountId.data());
+				if (alreadyActiveAccount->ui_data == NULL)
+				{
+					AccountMetaData* amd = new AccountMetaData;
+					amd->account_key = accountKey;
+					amd->servicename = params.serviceName.data();
+					alreadyActiveAccount->ui_data = (void*)amd;
+				}
+				s_ipAddressesBoundTo[accountKey] = params.localIpAddress.data();
+				MojLogInfo(IMServiceApp::s_log, _T("LibpurpleAdapter::login: adopted already-paired preview account %s"), accountKey.c_str());
+				/* Report success under the webOS-side username (params.username, e.g. the bare
+				 * WhatsApp digits) -- NOT alreadyActiveAccount->username, which whatsmeow has
+				 * rewritten to the JID form; the imloginstate record is keyed on the former. */
+				if (loginState)
+					((LoginCallbackInterface*)loginState)->loginResult(params.serviceName.data(), params.username.data(),
+					    LoginCallbackInterface::LOGIN_SUCCESS, false, ERROR_NO_ERROR, true);
+				return OK;
+			}
+		}
 		std::string const& accountBoundToIpAddress = s_ipAddressesBoundTo[accountKey];
 		if (params.localIpAddress.data() == accountBoundToIpAddress)
 		{
