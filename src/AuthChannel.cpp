@@ -132,11 +132,14 @@ void AuthChannel::setChallengeState(const char* serviceName, const char* usernam
 void AuthChannel::setConfirmed(const char* serviceName, const char* username, const char* token)
 {
 	std::string key = accountKey(serviceName, username);
-	std::map<std::string, Challenge>::iterator it = m_challenges.find(key);
-	if (it == m_challenges.end())
-		return;
-	it->second.state = StateConfirmed;
-	it->second.token = token ? token : "";
+	// Upsert (was find()+return): a session-reuse login — an already-linked Signal device or an
+	// already-paired WhatsApp — reaches "confirmed" WITHOUT ever publishing a QR, so no challenge
+	// entry was created by publishQRChallenge. If we bail here, the polling accounts validator never
+	// sees state="confirmed", never finalizes the account, and the preview login is left orphaned
+	// (connector connected but no account). Create the entry so confirmed + token still reach it.
+	Challenge& c = m_challenges[key];
+	c.state = StateConfirmed;
+	c.token = token ? token : "";
 	MojLogInfo(IMServiceApp::s_log, _T("AuthChannel::setConfirmed key=%s (token %s)"),
 	           key.c_str(), (token && *token) ? "present" : "absent");
 	notifySubscribers(key);
