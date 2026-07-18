@@ -517,7 +517,12 @@ MojErr IMLoginStateHandler::handleBadCredentials(const MojString& serviceName, c
 	mergeProps.putString("ipAddress", "");
 	mergeProps.putString("errorCode", err);
 
-	m_dbClient.merge(m_updateLoginStateSlot, query, mergeProps);
+	MojErr mErr = m_dbClient.merge(m_updateLoginStateSlot, query, mergeProps);
+	if (mErr) {
+		MojString error;
+		MojErrToString(mErr, error);
+		MojLogError(IMServiceApp::s_log, _T("handleBadCredentials: merge login-state to offline failed: %d - %s"), mErr, error.data());
+	}
 
 	// update the syncState record for this account so account dashboard can display errors
 	// first we need to find our account id
@@ -627,7 +632,12 @@ MojErr IMLoginStateHandler::getCredentialsResult(MojObject& payload, MojErr resu
 				MojObject mergeProps;
 				mergeProps.putString("state", LOGIN_STATE_ONLINE);
 				mergeProps.putString("ipAddress", localIpAddress);
-				m_dbClient.merge(m_updateLoginStateSlot, query, mergeProps);
+				MojErr mErr = m_dbClient.merge(m_updateLoginStateSlot, query, mergeProps);
+				if (mErr) {
+					MojString error;
+					MojErrToString(mErr, error);
+					MojLogError(IMServiceApp::s_log, _T("getCredentialsResult: merge login-state to online failed: %d - %s"), mErr, error.data());
+				}
 
 				// update any imcommands that are in the "waiting-for-connection" status
 				moveWaitingCommandsToPending();
@@ -1447,11 +1457,22 @@ MojErr IMLoginFailRetryHandler::startTimerActivity(const MojString& serviceName,
 
 		// activity.schedule
 		time_t targetDate;
-		time(&targetDate);
+		if (time(&targetDate) == (time_t)-1) {
+			MojLogError(IMServiceApp::s_log, _T("IMLoginFailRetryHandler: time() failed"));
+		}
 		targetDate += 2; // schedule for 2 seconds in the future
 		tm* ptm = gmtime(&targetDate);
 		char scheduleTime[50];
-		sprintf(scheduleTime, "%d-%02d-%02d %02d:%02d:%02dZ", ptm->tm_year+1900, ptm->tm_mon+1, ptm->tm_mday, ptm->tm_hour, ptm->tm_min, ptm->tm_sec);
+		if (ptm == NULL) {
+			MojLogError(IMServiceApp::s_log, _T("IMLoginFailRetryHandler: gmtime() returned NULL"));
+			scheduleTime[0] = '\0';
+		}
+		else {
+			int written = snprintf(scheduleTime, sizeof(scheduleTime), "%d-%02d-%02d %02d:%02d:%02dZ", ptm->tm_year+1900, ptm->tm_mon+1, ptm->tm_mday, ptm->tm_hour, ptm->tm_min, ptm->tm_sec);
+			if (written < 0 || (size_t)written >= sizeof(scheduleTime)) {
+				MojLogError(IMServiceApp::s_log, _T("IMLoginFailRetryHandler: scheduleTime truncated"));
+			}
+		}
 		MojLogDebug(IMServiceApp::s_log, _T("IMLoginFailRetryHandler: com.palm.activitymanager/create date=%s"), scheduleTime);
 		MojObject scheduleObj;
 		scheduleObj.putString("start", scheduleTime);

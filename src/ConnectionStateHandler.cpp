@@ -281,11 +281,22 @@ MojErr ConnectionState::ConnectionChangedScheduler::scheduleActivity()
 		activity.fromJson(activityJSON);
 		// activity.schedule
 		time_t targetDate;
-		time(&targetDate);
+		if (time(&targetDate) == (time_t)-1) {
+			MojLogError(IMServiceApp::s_log, _T("ConnectionChangedScheduler: time() failed"));
+		}
 		targetDate += 10; // 10 seconds in the future
 		tm* ptm = gmtime(&targetDate);
 		char scheduleTime[50];
-		sprintf(scheduleTime, "%d-%02d-%02d %02d:%02d:%02dZ", ptm->tm_year+1900, ptm->tm_mon+1, ptm->tm_mday, ptm->tm_hour, ptm->tm_min, ptm->tm_sec);
+		if (ptm == NULL) {
+			MojLogError(IMServiceApp::s_log, _T("ConnectionChangedScheduler: gmtime() returned NULL"));
+			scheduleTime[0] = '\0';
+		}
+		else {
+			int written = snprintf(scheduleTime, sizeof(scheduleTime), "%d-%02d-%02d %02d:%02d:%02dZ", ptm->tm_year+1900, ptm->tm_mon+1, ptm->tm_mday, ptm->tm_hour, ptm->tm_min, ptm->tm_sec);
+			if (written < 0 || (size_t)written >= sizeof(scheduleTime)) {
+				MojLogError(IMServiceApp::s_log, _T("ConnectionChangedScheduler: scheduleTime truncated"));
+			}
+		}
 		MojObject scheduleObj;
 		scheduleObj.putString("start", scheduleTime);
 		activity.put("schedule", scheduleObj);

@@ -1730,7 +1730,9 @@ static GHashTable* getClientInfo(void)
 
 static void initializeLibpurple()
 {
-	signal(SIGCHLD, SIG_IGN);
+	if (signal(SIGCHLD, SIG_IGN) == SIG_ERR) {
+		MojLogError(IMServiceApp::s_log, _T("initializeLibpurple: signal(SIGCHLD, SIG_IGN) failed"));
+	}
 
 	/* Set a custom user directory (optional) */
 	purple_util_set_user_dir(CUSTOM_USER_DIRECTORY);
