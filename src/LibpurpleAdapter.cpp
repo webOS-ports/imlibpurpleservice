@@ -1025,16 +1025,15 @@ static gboolean buddyResyncTimeoutCallback(gpointer data)
 	return FALSE; // one-shot
 }
 
-static void buddy_added_cb(PurpleBuddy* buddy)
+// Schedule (debounced) the post-change re-sync for a live account: buddy-list re-sync + the M3
+// server/channel enumeration. Fires once ~BUDDY_RESYNC_DEBOUNCE_SECONDS after the last change in a
+// burst. Shared by buddy_added_cb (buddies) and blist_node_added_cb (chats/channels).
+static void scheduleAccountResync(PurpleAccount* account)
 {
-	MojLogInfo(IMServiceApp::s_log, _T("buddy added %s"), buddy->name);
-
-	PurpleAccount* account = purple_buddy_get_account(buddy);
 	if (account == NULL)
 		return;
-
-	// Only re-sync for a live, logged-in account. Buddies added while the account is still
-	// connecting (or loaded from blist at startup) are covered by the normal login-time snapshot.
+	// Only re-sync for a live, logged-in account. Nodes added while still connecting (or loaded from
+	// the blist at startup) are covered by the normal login-time snapshot / the debounce that follows.
 	if (!purple_account_is_connected(account))
 		return;
 
@@ -1044,8 +1043,8 @@ static void buddy_added_cb(PurpleBuddy* buddy)
 	if (serviceName.empty() || username == NULL || *username == '\0')
 		return;
 
-	// Reset any pending debounce timer for this account so the re-sync fires once, ~8s after the
-	// LAST buddy in the burst is added (covers both the post-login load and later single additions).
+	// Reset any pending debounce timer for this account so the re-sync fires once, after the LAST
+	// change in the burst (covers the post-login buddy+channel load and later single additions).
 	BuddyResyncCtx* ctx = NULL;
 	std::unordered_map<std::string, BuddyResyncCtx*>::iterator it = s_buddyResyncCtx.find(accountKey);
 	if (it != s_buddyResyncCtx.end())
@@ -1062,6 +1061,23 @@ static void buddy_added_cb(PurpleBuddy* buddy)
 	ctx->serviceName = serviceName;
 	ctx->username = username;
 	ctx->timerId = purple_timeout_add_seconds(BUDDY_RESYNC_DEBOUNCE_SECONDS, buddyResyncTimeoutCallback, ctx);
+}
+
+static void buddy_added_cb(PurpleBuddy* buddy)
+{
+	MojLogInfo(IMServiceApp::s_log, _T("buddy added %s"), buddy->name);
+	scheduleAccountResync(purple_buddy_get_account(buddy));
+}
+
+// webOS Servers/Rooms M3: a CHAT (e.g. a Discord guild channel) added to the blist AFTER the
+// initial buddy burst must also (re)trigger the post-login re-sync, so enumerateServersChannels
+// picks up channels that populate late (channels are chats, not buddies, so buddy-added misses
+// them). Fires from the generic "blist-node-added" signal; ignores non-chat nodes.
+static void blist_node_added_cb(PurpleBlistNode* node)
+{
+	if (node == NULL || !PURPLE_BLIST_NODE_IS_CHAT(node))
+		return;
+	scheduleAccountResync(purple_chat_get_account((PurpleChat*)node));
 }
 
 // Delete a disposable QR-preview account OFF the signal-callback stack. Calling
@@ -1258,6 +1274,10 @@ static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 		purple_signal_connect(blist_handle, "buddy-removed", &handle, PURPLE_CALLBACK(buddy_removed_cb),
 				GINT_TO_POINTER(FALSE));
 		purple_signal_connect(blist_handle, "buddy-added", &handle, PURPLE_CALLBACK(buddy_added_cb),
+				GINT_TO_POINTER(FALSE));
+		// webOS Servers/Rooms M3: also catch chats (Discord guild channels) added to the blist, so a
+		// late-arriving channel re-triggers the server/channel enumeration (see blist_node_added_cb).
+		purple_signal_connect(blist_handle, "blist-node-added", &handle, PURPLE_CALLBACK(blist_node_added_cb),
 				GINT_TO_POINTER(FALSE));
 		purple_signal_connect(blist_handle, "buddy-privacy-changed", &handle, PURPLE_CALLBACK(buddy_blocked_cb),
 				GINT_TO_POINTER(FALSE));
@@ -2929,6 +2949,128 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 	}
 
 	return success;
+}
+
+/*
+ * webOS Servers/Rooms M3: enumerate a hierarchical account's full server->channel roster from the
+ * in-memory buddy list and hand it to the service handler to upsert into db8. This makes every guild
+ * and all its visible channels appear in the Servers tab immediately after login, independent of any
+ * incoming message. Discord only for now: purple-discord builds blist group names as
+ * "<Guild>: <Category>" (discord_grab_group) and adds every visible channel as a chat under it with
+ * components "id" (snowflake) + "name" (human). We group channels by guild, output servers keyed by
+ * guild name.
+ */
+bool LibpurpleAdapter::enumerateServersChannels(const char* serviceName, const char* username)
+{
+	if (!serviceName || !username || s_imServiceHandler == NULL)
+		return false;
+
+	std::string accountKey = getAccountKey(username, serviceName);
+	if (s_onlineAccountData.count(accountKey) == 0)
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("enumerateServersChannels: no online account for %s/%s"), serviceName, username);
+		return false;
+	}
+	PurpleAccount* account = s_onlineAccountData[accountKey];
+	if (account == NULL)
+		return false;
+
+	// Only guild->channel protocols have a server hierarchy worth enumerating; the "Guild: Category"
+	// group parsing below is Discord-specific.
+	const char* protoId = purple_account_get_protocol_id(account);
+	if (protoId == NULL || strstr(protoId, "discord") == NULL)
+		return false;
+
+	// guild name -> server MojObject (carrying its "channels" array). std::map keeps a stable
+	// (alphabetical) server order in the output.
+	std::map<std::string, MojObject> serverByGuild;
+
+	for (PurpleBlistNode* node = purple_blist_get_root(); node != NULL; node = node->next)
+	{
+		if (!PURPLE_BLIST_NODE_IS_GROUP(node))
+			continue;
+		const char* groupName = purple_group_get_name((PurpleGroup*)node);
+		if (groupName == NULL || *groupName == '\0')
+			continue;
+
+		// "Guild: Category" -> guild = before the first ": ", category = the remainder (may be empty).
+		std::string groupStr = groupName;
+		std::string guildName = groupStr;
+		std::string categoryName;
+		std::string::size_type sep = groupStr.find(": ");
+		if (sep != std::string::npos)
+		{
+			guildName = groupStr.substr(0, sep);
+			categoryName = groupStr.substr(sep + 2);
+		}
+
+		int position = 0;
+		for (PurpleBlistNode* child = node->child; child != NULL; child = child->next)
+		{
+			if (!PURPLE_BLIST_NODE_IS_CHAT(child))
+				continue;
+			PurpleChat* chat = (PurpleChat*)child;
+			if (purple_chat_get_account(chat) != account)
+				continue;
+			GHashTable* comps = purple_chat_get_components(chat);
+			if (comps == NULL)
+				continue;
+			const char* chanId = (const char*)g_hash_table_lookup(comps, "id");
+			const char* chanName = (const char*)g_hash_table_lookup(comps, "name");
+			if (chanName == NULL || *chanName == '\0')
+				chanName = purple_chat_get_name(chat);
+			if (chanId == NULL || *chanId == '\0')
+				continue;   // no stable key -> skip
+
+			if (serverByGuild.find(guildName) == serverByGuild.end())
+			{
+				MojObject server;
+				server.putString(_T("remoteId"), guildName.c_str());
+				server.putString(_T("name"), guildName.c_str());
+				MojObject emptyChannels(MojObject::TypeArray);
+				server.put(_T("channels"), emptyChannels);
+				serverByGuild[guildName] = server;
+			}
+
+			MojObject channel;
+			channel.putString(_T("remoteId"), chanId);
+			channel.putString(_T("name"), chanName ? chanName : chanId);
+			if (!categoryName.empty())
+				channel.putString(_T("parentId"), categoryName.c_str());
+			channel.putInt(_T("position"), position++);
+
+			MojObject& server = serverByGuild[guildName];
+			MojObject channels;
+			server.get(_T("channels"), channels);
+			channels.push(channel);
+			server.put(_T("channels"), channels);
+		}
+	}
+
+	MojObject serversObj(MojObject::TypeArray);
+	int totalChannels = 0;
+	for (std::map<std::string, MojObject>::iterator it = serverByGuild.begin(); it != serverByGuild.end(); ++it)
+	{
+		MojObject channels;
+		it->second.get(_T("channels"), channels);
+		totalChannels += (int)channels.size();
+		serversObj.push(it->second);
+	}
+
+	// SAFETY: if the blist yielded no channels (e.g. Discord guild trees not synced yet / out of sync),
+	// do NOT sync - syncServersChannels would DELETE this account's existing server/channel records and
+	// recreate nothing, wiping a working (message-driven) Servers tab. Only sync when we found a roster.
+	if (serverByGuild.empty())
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("enumerateServersChannels: %s has no channels in the blist; leaving existing records untouched"), serviceName);
+		return false;
+	}
+
+	MojLogInfo(IMServiceApp::s_log, _T("enumerateServersChannels: %s -> %d servers, %d channels"),
+		serviceName, (int)serverByGuild.size(), totalChannels);
+
+	s_imServiceHandler->syncServersChannels(serviceName, username, serversObj);
+	return true;
 }
 
 LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceName, const char* username, const char* usernameTo, const char* messageText)

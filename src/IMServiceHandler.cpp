@@ -60,6 +60,10 @@ IMServiceHandler::IMServiceHandler(MojService* service)
   m_deleteImCommandsSlot(this, &IMServiceHandler::deleteImCommandsResult),
   m_deleteContactsSlot(this, &IMServiceHandler::deleteContactsResult),
   m_deleteImBuddyStatusSlot(this, &IMServiceHandler::deleteImBuddyStatusResult),
+  m_syncDelChannelsSlot(this, &IMServiceHandler::syncDelChannelsResult),
+  m_syncDelServersSlot(this, &IMServiceHandler::syncDelServersResult),
+  m_syncPutServersSlot(this, &IMServiceHandler::syncPutServersResult),
+  m_syncPutChannelsSlot(this, &IMServiceHandler::syncPutChannelsResult),
   m_connectionState(service)
 {
 	MojLogTrace(IMServiceApp::s_log);
@@ -285,6 +289,203 @@ MojErr IMServiceHandler::deleteImBuddyStatusResult(MojObject& payload, MojErr er
 {
 	if (err != MojErrNone)
 		MojLogError(IMServiceApp::s_log, _T("purgeAccountData: del(imbuddystatus) failed: %d"), err);
+	return MojErrNone;
+}
+
+/*
+ * webOS Servers/Rooms M3: upsert the enumerated guild->channel roster (from
+ * LibpurpleAdapter::enumerateServersChannels) into db8. db8 has no native upsert, so we clear this
+ * account's imserver/imchannel and recreate them. imchannel.serverId must reference the imserver's
+ * db8-assigned _id, so the writes chain: del imchannel -> del imserver -> put imserver (capture the
+ * assigned ids) -> put imchannel. m_syncServers holds the pending roster across the async hops (one
+ * account at a time; a fresh sync overwrites any in flight - the more recent roster wins).
+ */
+bool IMServiceHandler::syncServersChannels(const char* serviceName, const char* username, MojObject& serversObj)
+{
+	MojLogInfo(IMServiceApp::s_log, _T("syncServersChannels: serviceName=%s servers=%d"),
+		serviceName ? serviceName : "", (int)serversObj.size());
+
+	if (serviceName == NULL || *serviceName == '\0')
+		return false;
+
+	// SAFETY: never wipe on an empty roster. An empty enumeration (out-of-sync guild trees) must NOT
+	// delete the account's existing (message-driven) server/channel records. Only a non-empty roster
+	// drives the delete+recreate. (enumerateServersChannels already guards this; belt and suspenders.)
+	if (serversObj.size() == 0)
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("syncServersChannels: empty roster; leaving existing records untouched"));
+		return true;
+	}
+
+	MojErr err = m_syncServiceName.assign(serviceName);
+	MojErrCheck(err);
+	m_syncServers = serversObj;
+
+	err = syncServersChannelsStart();
+	if (err != MojErrNone)
+	{
+		MojLogError(IMServiceApp::s_log, _T("syncServersChannels: start failed: %d"), err);
+		return false;
+	}
+	return true;
+}
+
+// Stage 1: delete this account's existing imchannel rows (byRemoteId index leads with serviceName).
+MojErr IMServiceHandler::syncServersChannelsStart()
+{
+	MojDbQuery query;
+	MojErr err = query.from(_T("com.palm.imchannel:1"));
+	MojErrCheck(err);
+	err = query.where(_T("serviceName"), MojDbQuery::OpEq, m_syncServiceName);
+	MojErrCheck(err);
+	err = m_dbClient.del(m_syncDelChannelsSlot, query);
+	MojErrCheck(err);
+	return MojErrNone;
+}
+
+// Stage 2: channels gone -> delete the servers (byservice index).
+MojErr IMServiceHandler::syncDelChannelsResult(MojObject& payload, MojErr err)
+{
+	if (err != MojErrNone)
+		MojLogError(IMServiceApp::s_log, _T("syncServersChannels: del(imchannel) failed: %d"), err);
+
+	MojDbQuery query;
+	MojErr qerr = query.from(_T("com.palm.imserver:1"));
+	MojErrCheck(qerr);
+	qerr = query.where(_T("serviceName"), MojDbQuery::OpEq, m_syncServiceName);
+	MojErrCheck(qerr);
+	qerr = m_dbClient.del(m_syncDelServersSlot, query);
+	MojErrCheck(qerr);
+	return MojErrNone;
+}
+
+// Stage 3: servers gone -> create the fresh imserver rows. Their assigned _ids come back in order.
+MojErr IMServiceHandler::syncDelServersResult(MojObject& payload, MojErr err)
+{
+	if (err != MojErrNone)
+		MojLogError(IMServiceApp::s_log, _T("syncServersChannels: del(imserver) failed: %d"), err);
+
+	if (m_syncServers.size() == 0)
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("syncServersChannels: no servers to create; done"));
+		return MojErrNone;
+	}
+
+	MojObject::ObjectVec servers;
+	MojObject::ConstArrayIterator it = m_syncServers.arrayBegin();
+	for (; it != m_syncServers.arrayEnd(); ++it)
+	{
+		MojString remoteId, name;
+		bool found = false;
+		it->get(_T("remoteId"), remoteId, found);
+		it->get(_T("name"), name, found);
+
+		MojObject server;
+		MojErr merr = server.putString(_T("_kind"), _T("com.palm.imserver:1"));
+		MojErrCheck(merr);
+		merr = server.putString(_T("serviceName"), m_syncServiceName);
+		MojErrCheck(merr);
+		merr = server.putString(_T("remoteId"), remoteId);
+		MojErrCheck(merr);
+		merr = server.putString(_T("displayName"), name);
+		MojErrCheck(merr);
+		merr = server.putString(_T("name"), name);
+		MojErrCheck(merr);
+		merr = servers.push(server);
+		MojErrCheck(merr);
+	}
+
+	MojErr merr = m_dbClient.put(m_syncPutServersSlot, servers.begin(), servers.end());
+	MojErrCheck(merr);
+	return MojErrNone;
+}
+
+// Stage 4: imservers created -> put the channels, each pointing at its server's new _id (put results
+// come back in the same order the servers were sent).
+MojErr IMServiceHandler::syncPutServersResult(MojObject& payload, MojErr err)
+{
+	if (err != MojErrNone)
+	{
+		MojLogError(IMServiceApp::s_log, _T("syncServersChannels: put(imserver) failed: %d"), err);
+		return MojErrNone;
+	}
+
+	MojObject results;
+	if (!payload.get(_T("results"), results))
+	{
+		MojLogError(IMServiceApp::s_log, _T("syncServersChannels: put(imserver) response had no results"));
+		return MojErrNone;
+	}
+
+	MojObject::ObjectVec channels;
+	MojObject::ConstArrayIterator sIt = m_syncServers.arrayBegin();
+	MojObject::ConstArrayIterator rIt = results.arrayBegin();
+	for (; sIt != m_syncServers.arrayEnd() && rIt != results.arrayEnd(); ++sIt, ++rIt)
+	{
+		MojString serverId;
+		bool found = false;
+		rIt->get(_T("id"), serverId, found);
+		if (!found)
+			continue;
+
+		MojObject channelArr;
+		if (!sIt->get(_T("channels"), channelArr))
+			continue;
+
+		MojObject::ConstArrayIterator cIt = channelArr.arrayBegin();
+		for (; cIt != channelArr.arrayEnd(); ++cIt)
+		{
+			MojString remoteId, name, parentId;
+			bool f = false;
+			cIt->get(_T("remoteId"), remoteId, f);
+			cIt->get(_T("name"), name, f);
+			bool hasParent = false;
+			cIt->get(_T("parentId"), parentId, hasParent);
+			MojInt64 position = 0;
+			cIt->get(_T("position"), position);
+
+			MojObject channel;
+			MojErr merr = channel.putString(_T("_kind"), _T("com.palm.imchannel:1"));
+			MojErrCheck(merr);
+			merr = channel.putString(_T("serviceName"), m_syncServiceName);
+			MojErrCheck(merr);
+			merr = channel.putString(_T("remoteId"), remoteId);
+			MojErrCheck(merr);
+			merr = channel.putString(_T("serverId"), serverId);
+			MojErrCheck(merr);
+			merr = channel.putString(_T("displayName"), name);
+			MojErrCheck(merr);
+			merr = channel.putString(_T("name"), name);
+			MojErrCheck(merr);
+			if (hasParent)
+			{
+				merr = channel.putString(_T("parentId"), parentId);
+				MojErrCheck(merr);
+			}
+			merr = channel.putInt(_T("position"), position);
+			MojErrCheck(merr);
+			merr = channels.push(channel);
+			MojErrCheck(merr);
+		}
+	}
+
+	if (channels.size() == 0)
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("syncServersChannels: no channels to create; done"));
+		return MojErrNone;
+	}
+
+	MojErr merr = m_dbClient.put(m_syncPutChannelsSlot, channels.begin(), channels.end());
+	MojErrCheck(merr);
+	return MojErrNone;
+}
+
+MojErr IMServiceHandler::syncPutChannelsResult(MojObject& payload, MojErr err)
+{
+	if (err != MojErrNone)
+		MojLogError(IMServiceApp::s_log, _T("syncServersChannels: put(imchannel) failed: %d"), err);
+	else
+		MojLogInfo(IMServiceApp::s_log, _T("syncServersChannels: roster upsert complete"));
 	return MojErrNone;
 }
 

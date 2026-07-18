@@ -193,6 +193,12 @@ void IMLoginState::buddyListChanged(const char* serviceName, const char* usernam
 
 	MojRefCountedPtr<IMLoginStateHandler> handler = new IMLoginStateHandler(m_service, m_loginStateRevision, this);
 	handler->requestBuddyResync(svc, user);
+
+	// webOS Servers/Rooms M3: the buddy list has settled (this fires on a debounce after login),
+	// so refresh the guild->channel roster in db8 from it. Makes every guild + all its visible
+	// channels appear in the Servers tab immediately, independent of any incoming message.
+	// No-op for non-hierarchical protocols (the adapter gates on Discord).
+	LibpurpleAdapter::enumerateServersChannels(serviceName, username);
 }
 
 

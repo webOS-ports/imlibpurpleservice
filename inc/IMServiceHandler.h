@@ -57,6 +57,8 @@ public:
 			const char* customMessage, const char* groupName, const char* buddyAvatarLoc);
 	virtual bool receivedBuddyInvite(const char* serviceName, const char* username, const char* usernameFrom, const char* message);
 	virtual bool buddyInviteDeclined(const char* serviceName, const char* username, const char* usernameFrom);
+	// webOS Servers/Rooms M3: upsert the enumerated guild->channel roster into db8 (see .cpp).
+	virtual bool syncServersChannels(const char* serviceName, const char* username, MojObject& serversObj);
 
 	static MojErr logMojObjectJsonString(const MojChar* format, const MojObject mojObject);
 	// strip message body to protect private data
@@ -100,6 +102,23 @@ private:
     MojErr deleteContactsResult(MojObject& payload, MojErr err);
     MojDbClient::Signal::Slot<IMServiceHandler> m_deleteImBuddyStatusSlot;
     MojErr deleteImBuddyStatusResult(MojObject& payload, MojErr err);
+
+    /* webOS Servers/Rooms M3: enumerated server->channel roster upsert. A login-time sync that
+     * clears this account's imserver/imchannel then recreates them, so the Servers tab reflects the
+     * live guild/channel list. Done as a chained async sequence (db8 has no upsert): del imchannel ->
+     * del imserver -> put imserver (capture assigned _ids) -> put imchannel (serverId = those _ids).
+     * m_syncServers holds the pending {remoteId,name,channels:[...]} array across the async hops. */
+    MojObject m_syncServers;
+    MojString m_syncServiceName;
+    MojErr syncServersChannelsStart();
+    MojDbClient::Signal::Slot<IMServiceHandler> m_syncDelChannelsSlot;
+    MojErr syncDelChannelsResult(MojObject& payload, MojErr err);
+    MojDbClient::Signal::Slot<IMServiceHandler> m_syncDelServersSlot;
+    MojErr syncDelServersResult(MojObject& payload, MojErr err);
+    MojDbClient::Signal::Slot<IMServiceHandler> m_syncPutServersSlot;
+    MojErr syncPutServersResult(MojObject& payload, MojErr err);
+    MojDbClient::Signal::Slot<IMServiceHandler> m_syncPutChannelsSlot;
+    MojErr syncPutChannelsResult(MojObject& payload, MojErr err);
 
 	IMLoginState* m_loginState;
 	ConnectionState m_connectionState;

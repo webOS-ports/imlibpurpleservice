@@ -92,6 +92,11 @@ public:
 				const char* customMessage, const char* groupName, const char* buddyAvatarLoc) = 0;
 	virtual bool receivedBuddyInvite(const char* serviceName, const char* username, const char* usernameFrom, const char* message) = 0;
 	virtual bool buddyInviteDeclined(const char* serviceName, const char* username, const char* usernameFrom) = 0;
+	// webOS Servers/Rooms M3: full server->channel roster enumerated from the buddy list at login,
+	// so every guild + all its (visible) channels appear in the Servers tab without waiting for a
+	// message. serversObj is an array of { remoteId, name, channels:[{ remoteId, name, parentId,
+	// position }] }. Default no-op so non-db8 implementors need not override.
+	virtual bool syncServersChannels(const char* serviceName, const char* username, MojObject& serversObj) { return true; }
 };
 
 class LibpurpleAdapter
@@ -137,6 +142,10 @@ public:
 	// account's db8 chat data (which is keyed by username/serviceName, not webOS accountId).
 	static bool deleteAccountByWebosId(const char* accountId, std::string* outUsername = NULL, std::string* outServiceName = NULL);
 	static bool getFullBuddyList(const char* serviceName, const char* username);
+	// webOS Servers/Rooms M3: walk the (in-memory) buddy list for a hierarchical account (Discord),
+	// build the guild->channel roster and hand it to the service handler (syncServersChannels) to
+	// upsert into db8. Called post-login once the blist is populated.
+	static bool enumerateServersChannels(const char* serviceName, const char* username);
 	static bool setMyAvailability(const char* serviceName, const char* username, int availability);
 	static bool setMyCustomMessage(const char* serviceName, const char* username, const char* customMessage);
 	static SendResult blockBuddy(const char* serviceName, const char* username, const char* buddyUsername, bool block);
