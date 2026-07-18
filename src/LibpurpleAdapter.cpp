@@ -3109,6 +3109,47 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceNa
 	}
 	else
 	{
+		// webOS Servers/Rooms M3 (outbound to channels): if the target resolves to a group channel -
+		// a blist chat, matched by its "id" component (Discord channel snowflake) or by name (IRC
+		// "#channel") - send into the CHAT conversation via serv_chat_send instead of opening a 1:1 IM.
+		// Join the chat first if it isn't already open (purple-discord's join creates the conversation
+		// synchronously via purple_serv_got_joined_chat, so the chat id is available immediately after).
+		PurpleChat* channelChat = findChatByIdComponent(accountToSendFrom, usernameTo);
+		if (channelChat == NULL)
+			channelChat = purple_blist_find_chat(accountToSendFrom, usernameTo);
+		if (channelChat != NULL)
+		{
+			PurpleConnection* gc = purple_account_get_connection(accountToSendFrom);
+			PurpleConversation* chatConv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, usernameTo, accountToSendFrom);
+			if (chatConv == NULL && gc != NULL)
+			{
+				GHashTable* components = purple_chat_get_components(channelChat);
+				if (components != NULL)
+					serv_join_chat(gc, components);
+				chatConv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, usernameTo, accountToSendFrom);
+			}
+			if (chatConv != NULL && gc != NULL)
+			{
+				char* chatMsg = g_strcompress(messageText);
+				int cerr = serv_chat_send(gc, purple_conv_chat_get_id(purple_conversation_get_chat_data(chatConv)),
+						chatMsg, (PurpleMessageFlags)0);
+				free(chatMsg);
+				if (cerr < 0)
+				{
+					retVal = LibpurpleAdapter::SEND_FAILED;
+					MojLogError(IMServiceApp::s_log, _T("sendMessage: serv_chat_send returned err %d for channel %s"), cerr, usernameTo);
+				}
+				else
+					MojLogInfo(IMServiceApp::s_log, _T("sendMessage: sent to channel %s"), usernameTo);
+			}
+			else
+			{
+				retVal = LibpurpleAdapter::SEND_FAILED;
+				MojLogError(IMServiceApp::s_log, _T("sendMessage: could not open chat conversation for channel %s"), usernameTo);
+			}
+			return retVal;
+		}
+
 		PurpleConversation* purpleConversation = purple_conversation_new(PURPLE_CONV_TYPE_IM, accountToSendFrom, usernameTo);
 		char* messageTextUnescaped = g_strcompress(messageText);
 
