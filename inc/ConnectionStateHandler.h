@@ -64,6 +64,11 @@ public:
 	};
 
 	ConnectionState(MojService* service);
+	// Owns m_handler via a raw `new`; never meant to be copied (single instance held
+	// through the static m_connState). Delete the copy ops so an accidental copy can't
+	// alias/leak the handler pointer (rule of three).
+	ConnectionState(const ConnectionState&) = delete;
+	ConnectionState& operator=(const ConnectionState&) = delete;
 
 	void initConnectionStatesFromActivity(const MojObject& activity);
 

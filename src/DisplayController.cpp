@@ -123,7 +123,7 @@ DisplayController::DisplayControllerSubscription::DisplayControllerSubscription(
 	else
 	{
 		MojObject params;
-		err = params.put("subscribe", true);
+		params.put("subscribe", true);
 		err = req->send(m_connMgrSubscriptionSlot, "com.palm.display","control/status", params, MojServiceRequest::Unlimited);
 		if (err)
 		{

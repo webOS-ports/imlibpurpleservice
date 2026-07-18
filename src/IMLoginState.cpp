@@ -346,7 +346,12 @@ MojErr IMLoginStateHandler::handleConnectionChanged(const MojObject payload)
 		MojObject mergeProps;
 		mergeProps.putString("state", LOGIN_STATE_OFFLINE);
 		mergeProps.putString("ipAddress", "");
-		err = m_dbClient.merge(m_ignoreUpdateLoginStateSlot, query, mergeProps);
+		MojErr err = m_dbClient.merge(m_ignoreUpdateLoginStateSlot, query, mergeProps);
+		if (err) {
+			MojString error;
+			MojErrToString(err, error);
+			MojLogError(IMServiceApp::s_log, _T("handleConnectionChanged: merge login-states to offline failed: %d - %s"), err, error.data());
+		}
 
 		// Mark all buddies so they look offline to us
 		MojString empty;
@@ -369,7 +374,12 @@ MojErr IMLoginStateHandler::handleConnectionChanged(const MojObject payload)
 		MojObject mergeProps;
 		mergeProps.putString("state", LOGIN_STATE_OFFLINE);
 		mergeProps.putString("ipAddress", "");
-		err = m_dbClient.merge(m_ignoreUpdateLoginStateSlot, query, mergeProps);
+		MojErr err = m_dbClient.merge(m_ignoreUpdateLoginStateSlot, query, mergeProps);
+		if (err) {
+			MojString error;
+			MojErrToString(err, error);
+			MojLogError(IMServiceApp::s_log, _T("handleConnectionChanged: merge login-states to offline failed: %d - %s"), err, error.data());
+		}
 
 		// Also tell libpurple to disconnect
 		LibpurpleAdapter::deviceConnectionClosed(false, ConnectionState::wanIpAddress());
@@ -385,7 +395,12 @@ MojErr IMLoginStateHandler::handleConnectionChanged(const MojObject payload)
 		MojObject mergeProps;
 		mergeProps.putString("state", LOGIN_STATE_OFFLINE);
 		mergeProps.putString("ipAddress", "");
-		err = m_dbClient.merge(m_ignoreUpdateLoginStateSlot, query, mergeProps);
+		MojErr err = m_dbClient.merge(m_ignoreUpdateLoginStateSlot, query, mergeProps);
+		if (err) {
+			MojString error;
+			MojErrToString(err, error);
+			MojLogError(IMServiceApp::s_log, _T("handleConnectionChanged: merge login-states to offline failed: %d - %s"), err, error.data());
+		}
 
 		// Also tell libpurple to disconnect
 		LibpurpleAdapter::deviceConnectionClosed(false, ConnectionState::wifiIpAddress());
@@ -561,11 +576,13 @@ MojErr IMLoginStateHandler::getCredentialsResult(MojObject& payload, MojErr resu
 
 		// Now get the login params and request login
 		MojObject credentials;
-    	MojErr err = payload.getRequired("credentials", credentials);
+    	payload.getRequired("credentials", credentials);
 
 		LoginParams loginParams;
 		MojString password;
-		err = credentials.getRequired("password", password);
+		// Note: a missing "password" key leaves password empty, which the check below
+		// handles the same as an explicit failure -- so the getRequired result is not stored.
+		credentials.getRequired("password", password);
 		if (password.empty())
 		{
 			MojLogError(IMServiceApp::s_log, _T("Password is empty. I think this is not ok."));
@@ -849,10 +866,22 @@ MojErr IMLoginStateHandler::processLoginStates(MojObject& loginStateArray)
 			{
 				MojRefCountedPtr<MojServiceRequest> req;
 				err = m_service->createRequest(req);
-				MojObject params;
-				err = params.put("accountId", accountId);
-				err = params.putString("name", "common");
-				err = req->send(m_getCredentialsSlot, "com.palm.service.accounts","readCredentials", params, 1);
+				if (err) {
+					MojString error;
+					MojErrToString(err, error);
+					MojLogError(IMServiceApp::s_log, _T("processLoginStates: createRequest for readCredentials failed: %d - %s"), err, error.data());
+				}
+				else {
+					MojObject params;
+					params.put("accountId", accountId);
+					params.putString("name", "common");
+					err = req->send(m_getCredentialsSlot, "com.palm.service.accounts","readCredentials", params, 1);
+					if (err) {
+						MojString error;
+						MojErrToString(err, error);
+						MojLogError(IMServiceApp::s_log, _T("processLoginStates: readCredentials send failed: %d - %s"), err, error.data());
+					}
+				}
 			}
 		}
 		else if (newState.needsToLogoff(cachedState))
@@ -1217,6 +1246,11 @@ void IMLoginStateHandler::loginResult(const char* serviceName, const char* usern
 			break;
 		}
 		err = m_dbClient.merge(m_updateLoginStateSlot, query, mergeProps);
+		if (err) {
+			MojString error;
+			MojErrToString(err, error);
+			MojLogError(IMServiceApp::s_log, _T("loginResult: merge login-state update failed: %d - %s"), err, error.data());
+		}
 	}
 
 	// update the syncState record for this account so account dashboard can display errors

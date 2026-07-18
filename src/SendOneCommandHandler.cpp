@@ -160,7 +160,7 @@ MojErr SendOneCommandHandler::doSend(const MojObject imCmd) {
 		// delete command so we don't keep processing it
 		// put id in an array
 		MojObject idsToDelete;  // array
-		err = idsToDelete.push(m_currentCmdDbId);
+		idsToDelete.push(m_currentCmdDbId);
 
 		// luna://com.palm.db/del '{"ids":[2]}'
 		IMServiceHandler::logMojObjectJsonString(_T("deleting imcommand: %s"), idsToDelete);
@@ -239,14 +239,12 @@ MojErr SendOneCommandHandler::imSaveCommandResult(MojObject& result, MojErr save
  */
 LibpurpleAdapter::SendResult SendOneCommandHandler::blockBuddy(const MojObject imCmd) {
 
-	bool found = false;
-
 	// params
 	MojObject params;
-	found = imCmd.get(MOJDB_PARAMS, params);
+	imCmd.get(MOJDB_PARAMS, params);
 	IMServiceHandler::logMojObjectJsonString(_T("command params: %s"),params);
 	bool block = true;
-	found = params.get(XPORT_BLOCK, block);
+	params.get(XPORT_BLOCK, block);
 
 	MojLogInfo (IMServiceApp::s_log, "sending blockBuddy command to transport. id: %s, serviceName: %s, username: %s, buddyUsername: %s, block: %d",
 			m_currentCmdDbId.data(), m_serviceName.data(), m_username.data(), m_buddyName.data(), block);
@@ -372,7 +370,7 @@ LibpurpleAdapter::SendResult SendOneCommandHandler::receivedBuddyInvite(const Mo
 	found = imCmd.get(MOJDB_PARAMS, params);
 	IMServiceHandler::logMojObjectJsonString(_T("command params: %s"),params);
 	if (found) {
-		found = params.get(XPORT_ACCEPT, accept);
+		params.get(XPORT_ACCEPT, accept);
 	}
 
 	MojLogInfo (IMServiceApp::s_log, "sending receiveBuddyInvite to transport. id: %s, serviceName: %s, username: %s, buddyName: %s",

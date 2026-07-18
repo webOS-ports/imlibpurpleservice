@@ -141,6 +141,12 @@ char *sanitizeHtml(const char *input, char **except, bool remove)
 		}
 		g_free(tag);
 		tag_end = strchr(tag_end, '>');
+		if (!tag_end) {
+			// malformed markup: '<' with no closing '>'. Copy the remainder verbatim and stop
+			// rather than doing pointer arithmetic on a NULL tag_end (crash / huge alloc).
+			g_strlcpy(result_end, tag_start, message_size - (tag_start-message_start));
+			break;
+		}
 		tag = g_strndup(tag_start, tag_end - tag_start);
 
 		if (is_allowed) {

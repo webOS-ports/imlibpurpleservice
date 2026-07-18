@@ -8,7 +8,7 @@ namespace Util
         bool found = false;
         MojString result;
 
-        MojErr err = obj.get(key, result, found);
+        obj.get(key, result, found);
 
         if (!found)
         {

@@ -71,12 +71,12 @@ public:
 private:
 	MojString m_recordId;
 	MojString m_accountId;
-	MojUInt64 m_revision;
+	MojUInt64 m_revision = 0;
 	MojString m_username;
 	MojString m_serviceName;
     MojString m_capabilityId;
     MojObject m_config;
-	MojUInt32 m_availability;
+	MojUInt32 m_availability = 0;
 	MojString m_state;
 	MojString m_customMessage;
 };

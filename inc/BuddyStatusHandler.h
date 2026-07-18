@@ -84,7 +84,7 @@ private:
 	MojErr createCommandObject(MojObject& returnObj);
 
 	// status fields we update
-	MojInt32 m_availability;
+	MojInt32 m_availability = 0;
 	MojString m_customMessage;
 	MojString m_groupName;
 	MojString m_buddyAvatarLoc;

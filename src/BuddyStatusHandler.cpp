@@ -437,8 +437,15 @@ MojErr BuddyStatusHandler::findCommandResult(MojObject& result, MojErr findErr)
 			// save it
 			MojObject dbObject;
 			MojErr err = createCommandObject(dbObject);
-			if (!err)
+			if (!err) {
 				err = m_dbClient.put(this->m_saveCommandSlot, dbObject);
+				if (err) {
+					MojString error;
+					MojErrToString(err, error);
+					MojLogError(IMServiceApp::s_log, _T("findCommandResult - db put failed: error %d - %s"), err, error.data());
+					return err;
+				}
+			}
 			else {
 				MojString error;
 				MojErrToString(err, error);

@@ -1360,7 +1360,7 @@ static void account_login_failed_cb(PurpleConnection* gc, PurpleConnectionError 
 			loggedOut = TRUE;
 			MojLogError(IMServiceApp::s_log, _T("We were logged out. Reason: %s, prpl error code: %i"), description, type);
 		}
-		MojLogInfo(IMServiceApp::s_log, _T("account_login_failed_cb: removing account from onlineAccountData hash table. accountKey %s"), accountKey);
+		MojLogInfo(IMServiceApp::s_log, _T("account_login_failed_cb: removing account from onlineAccountData hash table. accountKey %s"), accountKey.c_str());
 		s_onlineAccountData.erase(accountKey);
 	}
 	else

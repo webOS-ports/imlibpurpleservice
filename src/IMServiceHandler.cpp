@@ -497,7 +497,6 @@ bool IMServiceHandler::incomingIM(const char* serviceName, const char* username,
 		MojString error;
 		MojErrToString(err, error);
 		MojLogError(IMServiceApp::s_log, _T("incomingIM failed: %d - %s"), err, error.data());
-		MojErrCheck(err);
 		return false;
 	}
 

@@ -170,19 +170,20 @@ MojErr AuthChannel::buildSnapshot(const std::string& key, MojObject& out) const
 	}
 
 	const Challenge& c = it->second;
-	const char* stateStr = "waiting";
+	const char* stateStr;
 	switch (c.state) {
 		case StateWaiting:   stateStr = "waiting";   break;
 		case StateScanned:   stateStr = "scanned";   break;
 		case StateConfirmed: stateStr = "confirmed"; break;
 		case StateExpired:   stateStr = "expired";   break;
 		case StateFailed:    stateStr = "failed";    break;
+		default:             stateStr = "waiting";   break;
 	}
 	err = out.putString(_T("state"), stateStr);
 	MojErrCheck(err);
 
 	// "kind" lets the validator pick its renderer (QR <img> vs hCaptcha WebView).
-	const char* kindStr = "none";
+	const char* kindStr;
 	switch (c.kind) {
 		case ChallengeQRCode:  kindStr = "qrcode";  break;
 		case ChallengeCaptcha: kindStr = "captcha"; break;

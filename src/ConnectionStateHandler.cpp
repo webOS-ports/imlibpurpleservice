@@ -188,7 +188,7 @@ MojErr ConnectionState::ConnectionStateHandler::connectionManagerResult(MojObjec
 			bool prevWifiConnected = m_connState->m_wifiConnected;
 			bool found = false;
 			MojObject wifiObj;
-			err = internetRequirements.getRequired("wifi", wifiObj);
+			internetRequirements.getRequired("wifi", wifiObj);
 			MojString wifiState;
 			err = wifiObj.getRequired("state", wifiState);
 			m_connState->m_wifiConnected = (err == MojErrNone && wifiState.compare("connected") == 0);
@@ -335,9 +335,12 @@ MojErr ConnectionState::ConnectionChangedScheduler::scheduleActivityResult(MojOb
 				{
 					MojRefCountedPtr<MojServiceRequest> req;
 					err = m_service->createRequest(req);
-					MojObject completeParams;
-					completeParams.put(_T("activityId"), activityId);
-					err = req->send(m_activityCompleteSlot, "com.palm.activitymanager", "complete", completeParams, 1);
+					if (!err)
+					{
+						MojObject completeParams;
+						completeParams.put(_T("activityId"), activityId);
+						err = req->send(m_activityCompleteSlot, "com.palm.activitymanager", "complete", completeParams, 1);
+					}
 				}
 				else {
 					MojLogError(IMServiceApp::s_log,_T("ConnectionChangedScheduler::scheduleActivityResult - missing activityId"));
