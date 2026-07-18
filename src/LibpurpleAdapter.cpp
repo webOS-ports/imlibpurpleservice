@@ -2658,6 +2658,44 @@ static bool isBlankName(const char* s)
 	return true;
 }
 
+// True if a WhatsApp buddy string is just a raw id (no human push-name): the part before '@' is
+// only digits/phone punctuation. A real push-name ("Alan", "Vladushka") has a letter there.
+static bool isWhatsAppRawId(const char* s)
+{
+	if (s == NULL || *s == '\0')
+		return true;
+	std::string u(s);
+	size_t at = u.find('@');
+	std::string local = (at == std::string::npos) ? u : u.substr(0, at);
+	if (local.empty())
+		return true;
+	for (size_t i = 0; i < local.size(); ++i)
+	{
+		char c = local[i];
+		if (!((c >= '0' && c <= '9') || c == '+' || c == '.' || c == ':' || c == '-'))
+			return false; // a letter/other -> real push-name
+	}
+	return true;
+}
+
+// Human-friendly display name for a WhatsApp buddy: prefer a real push-name; otherwise format the
+// phone JID "<digits>@s.whatsapp.net" as "+<digits>". Never emit the raw "<id>@s.whatsapp.net" /
+// "<id>@lid" (a "@lid" is an opaque LinkedID with no phone -> fall back to its bare id).
+static std::string whatsAppDisplayName(const char* alias, const char* username)
+{
+	if (!isWhatsAppRawId(alias))
+		return alias;
+	std::string u = username ? username : "";
+	size_t at = u.find('@');
+	std::string local = (at == std::string::npos) ? u : u.substr(0, at);
+	std::string suffix = (at == std::string::npos) ? std::string() : u.substr(at);
+	if (!local.empty() && local[0] == '+')
+		local.erase(0, 1);
+	if (suffix == "@s.whatsapp.net" && !local.empty())
+		return "+" + local;
+	return local.empty() ? u : local;
+}
+
 bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* username)
 {
 	MojLogInfo(IMServiceApp::s_log, "%s called.", __FUNCTION__);
@@ -2723,10 +2761,18 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 			// to the numeric username), which is exactly the "is this buddy nameless?" test we want.
 			const char* resolvedAlias = purple_buddy_get_alias_only(buddyToBeAdded);
 
+			// WhatsApp buddies always get a readable name (push-name, else a formatted "+<phone>")
+			// -- never skipped and never shown as the raw "<id>@s.whatsapp.net" / "<id>@lid".
+			bool isWhatsApp = (serviceName != NULL && strcmp(serviceName, "type_whatsapp") == 0);
+			std::string waName;
+			if (isWhatsApp)
+			{
+				waName = whatsAppDisplayName(resolvedAlias, buddyToBeAdded->name);
+			}
 			// webOS Telegram port: skip deleted/nameless users. tdlib gives them no name, so the
 			// contact would otherwise show a raw "id<number>". Not reporting them here also makes the
 			// BuddyListConsolidator delete any such contacts left from a previous (pre-filter) sync.
-			if (isBlankName(resolvedAlias))
+			else if (isBlankName(resolvedAlias))
 			{
 				MojLogInfo(IMServiceApp::s_log, _T("getFullBuddyList: skipping nameless buddy %s (deleted user?)"), buddyToBeAdded->name);
 				continue;
@@ -2747,7 +2793,12 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 			int availability = getPalmAvailabilityFromPurpleAvailability(newStatusPrimitive);
 			buddyObj.putInt("availability", availability);
 
-			if (resolvedAlias != NULL)
+			if (isWhatsApp)
+			{
+				std::string cleanName = stripAstral(waName.c_str());
+				buddyObj.putString("displayName", cleanName.empty() ? waName.c_str() : cleanName.c_str());
+			}
+			else if (resolvedAlias != NULL)
 			{
 				// webOS Telegram port: strip only astral emoji/flags (unrenderable on this WebKit), keep
 				// all BMP text (Thai/Cyrillic/CJK/Latin) which renders via the fallback-font slots. If the
