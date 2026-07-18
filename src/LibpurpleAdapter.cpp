@@ -1059,12 +1059,55 @@ static void buddy_added_cb(PurpleBuddy* buddy)
 // handler) deletes the connection/account while libpurple is still using it up the stack; with a
 // large synced buddy list (WhatsApp) the re-entrant mass blist teardown crashes the transport.
 // Deferring via a 0-timeout runs the delete after the signal has finished dispatching.
+// Context for the deferred preview-account delete: the account plus a retry counter, so the
+// delete can wait for an in-flight (async, Go-backed) disconnect to finish before freeing.
+struct PreviewDeleteCtx
+{
+	PurpleAccount* acct;
+	int tries;
+};
+
 static gboolean deferredDeletePreviewAccount(gpointer data)
 {
-	PurpleAccount* acct = (PurpleAccount*)data;
-	if (acct != NULL)
-		purple_accounts_delete(acct);
-	return FALSE; // one-shot
+	PreviewDeleteCtx* ctx = (PreviewDeleteCtx*)data;
+	if (ctx == NULL)
+		return FALSE;
+	PurpleAccount* acct = ctx->acct;
+	if (acct == NULL)
+	{
+		delete ctx;
+		return FALSE;
+	}
+	// Do not free the account until its connection is fully torn down. Session-based, Go-backed
+	// prpls (whatsmeow/WhatsApp) run the disconnect as an ASYNC client shutdown; calling
+	// purple_accounts_delete() while that is still in flight frees the account out from under the
+	// goroutine still using it -> SIGSEGV a few hundred ms later (the deferral-to-next-tick was not
+	// enough). Poll until the connection object is gone (or give up after ~10s and delete anyway).
+	if ((purple_account_is_connecting(acct) || purple_account_is_connected(acct) ||
+	     purple_account_get_connection(acct) != NULL) && ctx->tries < 40)
+	{
+		ctx->tries++;
+		return TRUE; // reschedule on the next 250ms tick
+	}
+	purple_accounts_delete(acct);
+	delete ctx;
+	return FALSE; // done
+}
+
+// Disconnect + disable a disposable QR-preview account, then delete it once its connection has
+// fully torn down (see deferredDeletePreviewAccount). Shared by both confirm paths -- the
+// "signed-on" handler and the token-poll fallback -- so neither frees a still-connecting account.
+static void schedulePreviewAccountDelete(PurpleAccount* acct)
+{
+	if (acct == NULL)
+		return;
+	if (purple_account_is_connected(acct) || purple_account_is_connecting(acct))
+		purple_account_disconnect(acct);
+	purple_account_set_enabled(acct, UI_ID, FALSE);
+	PreviewDeleteCtx* ctx = new PreviewDeleteCtx();
+	ctx->acct = acct;
+	ctx->tries = 0;
+	purple_timeout_add(250, deferredDeletePreviewAccount, ctx);
 }
 
 // Cancel + free any pending buddy-resync debounce timer for an account about to be torn down,
@@ -1148,10 +1191,7 @@ static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 		// DEFER the delete off this signal-callback stack: deleting the account here (with a large
 		// synced buddy list, e.g. WhatsApp) re-entrantly tears down the blist while libpurple is
 		// still using this connection -> crash. Disconnect+disable now; delete on the next tick.
-		if (purple_account_is_connected(loggedInAccount) || purple_account_is_connecting(loggedInAccount))
-			purple_account_disconnect(loggedInAccount);
-		purple_account_set_enabled(loggedInAccount, UI_ID, FALSE);
-		purple_timeout_add(0, deferredDeletePreviewAccount, loggedInAccount);
+		schedulePreviewAccountDelete(loggedInAccount);
 		return;
 	}
 
@@ -1297,6 +1337,13 @@ static void account_login_failed_cb(PurpleConnection* gc, PurpleConnectionError 
 		s_qrPreviewKeys.erase(accountKey);
 		s_pendingAccountData.erase(accountKey);
 		s_onlineAccountData.erase(accountKey);
+		cancelBuddyResync(accountKey);
+		// CRITICAL: tear the failed preview down. Previously this path only erased tracking maps and
+		// returned, leaving the disposable account PERSISTED + ENABLED in accounts.xml. It then
+		// auto-logged-in on every transport (re)start and hammered the server -- for WhatsApp that is
+		// a permanent 429 "rate-overlimit" loop even though no real account was ever created. Delete
+		// it (once its connection is fully torn down) exactly like the confirm path does.
+		schedulePreviewAccountDelete(account);
 		return;
 	}
 
@@ -1636,6 +1683,13 @@ gboolean connectTimeoutCallback(gpointer data)
 		{
 			std::string const& svc = getServiceNameFromPurpleAccount(account);
 			s_authChannel->setChallengeState(svc.c_str(), account->username, AuthChannel::StateExpired, "QR code expired");
+		}
+		// Tear the timed-out preview down so it is not left persisted + enabled in accounts.xml
+		// (it would auto-log-in on every boot otherwise -- see account_login_failed_cb).
+		if (account)
+		{
+			cancelBuddyResync(accountKey);
+			schedulePreviewAccountDelete(account);
 		}
 		return FALSE;
 	}
@@ -2966,10 +3020,7 @@ static gboolean qrTokenPollCallback(gpointer data)
 		// exactly why deleting the account from the UI did not clear it. The token was already
 		// handed to the UI above; the real account is created by the UI and logs in directly
 		// with that token (passed as its credential -> discord_login uses it, no second QR).
-		if (purple_account_is_connected(ctx->account) || purple_account_is_connecting(ctx->account))
-			purple_account_disconnect(ctx->account);
-		purple_account_set_enabled(ctx->account, UI_ID, FALSE);
-		purple_accounts_delete(ctx->account);
+		schedulePreviewAccountDelete(ctx->account);
 
 		delete ctx;
 		return FALSE;
