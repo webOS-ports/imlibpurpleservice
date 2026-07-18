@@ -1407,12 +1407,25 @@ static void account_login_failed_cb(PurpleConnection* gc, PurpleConnectionError 
 		}
 	}
 
-	// Special handling for broken network connection errors (due to bad coverage or flight mode)
-	// We need to set noRetry to false if there was a network type error regardless of if we were pending or online.
-	if (type == PURPLE_CONNECTION_ERROR_NETWORK_ERROR)
+	// Retry on ANY transient/connection failure; only a genuine credential/config error should park
+	// the account offline (retrying with bad credentials just hammers the server). Previously ONLY
+	// PURPLE_CONNECTION_ERROR_NETWORK_ERROR was retryable, so presage (Signal) reporting a dropped
+	// connection as OTHER_ERROR (16) -- e.g. its async runtime ending on a transient "Invalid
+	// response" -- set noRetry=true and parked Signal at availability=OFFLINE *forever*, requiring a
+	// manual re-toggle in the availability menu. Park only on the real auth/settings errors.
+	switch (type)
 	{
-		MojLogError(IMServiceApp::s_log, _T("We had a network error. Reason: %s, prpl error code: %i. Need to retry"), description, type);
-		noRetry = false;
+		case PURPLE_CONNECTION_ERROR_INVALID_USERNAME:
+		case PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED:
+		case PURPLE_CONNECTION_ERROR_AUTHENTICATION_IMPOSSIBLE:
+		case PURPLE_CONNECTION_ERROR_INVALID_SETTINGS:
+			noRetry = true; // credential/config problem -> do not auto-retry (would hammer)
+			break;
+		default:
+			MojLogInfo(IMServiceApp::s_log, _T("account_login_failed_cb: transient error (type %i: %s) -> retry, not park"),
+			           type, description ? description : "");
+			noRetry = false; // network / other / encryption / cert / name-in-use / ... -> retry
+			break;
 	}
 
 	const char* mojoFriendlyErrorCode = getMojoFriendlyErrorCode(type);
@@ -1474,6 +1487,44 @@ static void account_auth_accept_cb(PurpleAccount* account, const char* remote_us
 {
 	// nothing to do
 	MojLogInfo(IMServiceApp::s_log, _T("account_auth_accept_cb called. account: %s, remote_user: %s"), account->username, remote_user);
+}
+
+/*
+ * Find a buddy-list chat for this account whose "id" component equals `id`.
+ *
+ * webOS Servers/Rooms: purple-discord names a channel *conversation* by the raw channel snowflake
+ * (e.g. "1410895923755880"), but the blist PurpleChat is keyed by its human name ("general") with
+ * the snowflake stored in the "id" component. So purple_blist_find_chat(account, <snowflake>) - which
+ * matches on the chat's display name - misses for Discord, and we never recover the human channel
+ * name or the parent guild. Walk the blist and match the "id" component instead. Other prpls whose
+ * conversation name is already the human/keyed name resolve via purple_blist_find_chat and never
+ * reach this fallback.
+ */
+static PurpleChat* findChatByIdComponent(PurpleAccount* account, const char* id)
+{
+	if (account == NULL || id == NULL || *id == '\0')
+		return NULL;
+
+	for (PurpleBlistNode* node = purple_blist_get_root(); node != NULL; node = node->next)
+	{
+		if (!PURPLE_BLIST_NODE_IS_GROUP(node))
+			continue;
+		for (PurpleBlistNode* child = node->child; child != NULL; child = child->next)
+		{
+			if (!PURPLE_BLIST_NODE_IS_CHAT(child))
+				continue;
+			PurpleChat* chat = (PurpleChat*)child;
+			if (purple_chat_get_account(chat) != account)
+				continue;
+			GHashTable* comps = purple_chat_get_components(chat);
+			if (comps == NULL)
+				continue;
+			const char* compId = (const char*)g_hash_table_lookup(comps, "id");
+			if (compId != NULL && strcmp(compId, id) == 0)
+				return chat;
+		}
+	}
+	return NULL;
 }
 
 
@@ -1553,8 +1604,20 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 		if (channelName && *channelName)
 		{
 			PurpleChat* chat = purple_blist_find_chat(account, channelName);
+			// purple-discord names the conversation by the raw channel snowflake, so the lookup
+			// above (which matches the chat's human display name) misses - fall back to matching
+			// the "id" component. See findChatByIdComponent.
+			if (chat == NULL)
+				chat = findChatByIdComponent(account, channelName);
 			if (chat != NULL)
 			{
+				// Human channel name for display: purple_chat_get_name() returns the prpl's
+				// get_chat_name (Discord -> components["name"], e.g. "general"). Prefer it over the
+				// conversation title, which for Discord is just the snowflake. Falls through to the
+				// title/name for prpls that don't provide a distinct human name.
+				const char* humanName = purple_chat_get_name(chat);
+				if (humanName != NULL && *humanName != '\0')
+					channelDisplayName = humanName;
 				// The chat's parent blist node is its group; for purple-discord that group
 				// is the guild (server). Use direct field access (public struct member) so we
 				// don't depend on any particular libpurple accessor version.
