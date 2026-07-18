@@ -1054,6 +1054,32 @@ static void buddy_added_cb(PurpleBuddy* buddy)
 	ctx->timerId = purple_timeout_add_seconds(BUDDY_RESYNC_DEBOUNCE_SECONDS, buddyResyncTimeoutCallback, ctx);
 }
 
+// Delete a disposable QR-preview account OFF the signal-callback stack. Calling
+// purple_accounts_delete() directly from account_logged_in_cb (the account's own "signed-on"
+// handler) deletes the connection/account while libpurple is still using it up the stack; with a
+// large synced buddy list (WhatsApp) the re-entrant mass blist teardown crashes the transport.
+// Deferring via a 0-timeout runs the delete after the signal has finished dispatching.
+static gboolean deferredDeletePreviewAccount(gpointer data)
+{
+	PurpleAccount* acct = (PurpleAccount*)data;
+	if (acct != NULL)
+		purple_accounts_delete(acct);
+	return FALSE; // one-shot
+}
+
+// Cancel + free any pending buddy-resync debounce timer for an account about to be torn down,
+// so buddyResyncTimeoutCallback can't fire against a deleted account.
+static void cancelBuddyResync(const std::string& accountKey)
+{
+	std::unordered_map<std::string, BuddyResyncCtx*>::iterator it = s_buddyResyncCtx.find(accountKey);
+	if (it != s_buddyResyncCtx.end())
+	{
+		purple_timeout_remove(it->second->timerId);
+		delete it->second;
+		s_buddyResyncCtx.erase(it);
+	}
+}
+
 static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 {
 	void* blist_handle = purple_blist_get_handle();
@@ -1114,14 +1140,18 @@ static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 		s_qrPreviewKeys.erase(accountKey);
 		s_pendingAccountData.erase(accountKey);
 		s_onlineAccountData.erase(accountKey);
+		cancelBuddyResync(accountKey);
 		// Delete the disposable preview account entirely (see qrTokenPollCallback): keeping it
 		// persisted would leave an untagged orphan (no webosAccountId) that auto-logs-in +
 		// floods and that onDelete can never remove. The token is already handed to the UI;
 		// the real account is created by the UI and logs in directly with that token.
+		// DEFER the delete off this signal-callback stack: deleting the account here (with a large
+		// synced buddy list, e.g. WhatsApp) re-entrantly tears down the blist while libpurple is
+		// still using this connection -> crash. Disconnect+disable now; delete on the next tick.
 		if (purple_account_is_connected(loggedInAccount) || purple_account_is_connecting(loggedInAccount))
 			purple_account_disconnect(loggedInAccount);
 		purple_account_set_enabled(loggedInAccount, UI_ID, FALSE);
-		purple_accounts_delete(loggedInAccount);
+		purple_timeout_add(0, deferredDeletePreviewAccount, loggedInAccount);
 		return;
 	}
 
