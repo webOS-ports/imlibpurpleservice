@@ -1721,7 +1721,12 @@ gboolean connectTimeoutCallback(gpointer data)
 {
 
 	MojLogError(IMServiceApp::s_log, _T("connectTimeoutCallback called - we not neither success nor failure callback from the last login attempt."));
-	bool noRetry = true;
+	// A connect timeout is transient -- a slow or interrupted login (e.g. the login-state machine
+	// re-logging-in an account that was already online, then racing its own re-evaluation). Retry
+	// rather than parking the account at availability=OFFLINE forever, which previously knocked ALL
+	// accounts offline in a burst and required a manual availability re-toggle. A genuinely
+	// unreachable account just times out again on the next (backed-off) retry.
+	bool noRetry = false;
 	std::string* data_ptr = reinterpret_cast<std::string*> (data);
 	std::string accountKey = *data_ptr;
 	delete data_ptr;
