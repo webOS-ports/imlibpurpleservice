@@ -163,7 +163,7 @@ struct AccountMetaData
 };
 
 static void incoming_message_cb(PurpleConversation *conv, const char *who, const char *alias, const char *message,	PurpleMessageFlags flags, time_t mtime);
-static std::string const& getServiceNameFromPurpleAccount(PurpleAccount* account);
+static std::string getServiceNameFromPurpleAccount(PurpleAccount* account);
 // human-friendly WhatsApp display name (push-name, else "+<phone>"); defined lower, used in incoming_message_cb
 static std::string whatsAppDisplayName(const char* alias, const char* username);
 static void adapterUIInit(void);
@@ -576,17 +576,70 @@ static const char* getMojoFriendlyErrorCode(PurpleConnectionError type)
 
 static std::string getAccountKey(std::string const& username, std::string const& serviceName)
 {
-	// whatsmeow (WhatsApp) renames the account username to the full JID "<digits>@s.whatsapp.net"
-	// once pairing completes, while the webOS account layer + validator use the bare digits. Strip
-	// the JID suffix so a WhatsApp account maps to ONE stable transport key no matter which form we
-	// are handed -- otherwise sendMessage, preview adoption, and post-restart auto-login would key
-	// the same account differently and "lose" the logged-in session. No other service's username
-	// contains this suffix, so this is a no-op for them.
+	// WhatsApp identity arrives in three interchangeable forms: the +E.164 the webOS account layer
+	// now stores for display ("+31652044684"), whatsmeow's device-ID JID ("31652044684@s.whatsapp.net")
+	// that the prpl renames the account to once pairing completes, and (older paths) the bare digits.
+	// Normalize all three to the bare digits so a WhatsApp account maps to ONE stable transport key --
+	// otherwise sendMessage, preview adoption, and post-restart auto-login would key the same account
+	// differently and "lose" the logged-in session.
+	std::string key = username;
 	static const std::string waSuffix = "@s.whatsapp.net";
-	if (username.size() > waSuffix.size() &&
-	    username.compare(username.size() - waSuffix.size(), waSuffix.size(), waSuffix) == 0)
-		return username.substr(0, username.size() - waSuffix.size()) + "_" + serviceName;
-	return username + "_" + serviceName;
+	if (key.size() > waSuffix.size() &&
+	    key.compare(key.size() - waSuffix.size(), waSuffix.size(), waSuffix) == 0)
+		key.erase(key.size() - waSuffix.size());
+	// Strip the display '+' only for WhatsApp: Signal/Telegram usernames are legitimately +E.164 and
+	// must keep it (their key must stay distinct from any bare-digit form).
+	if (serviceName == "type_whatsapp" && !key.empty() && key[0] == '+')
+		key.erase(0, 1);
+	return key + "_" + serviceName;
+}
+
+// Map a webOS-side WhatsApp username (+E.164 for display, or bare digits) to the JID whatsmeow
+// requires ("<digits>@s.whatsapp.net"): gowhatsapp compares the purple account username against its
+// device ID and errors ("username does not match the main device's ID") on anything else. Idempotent
+// when already a JID; a no-op for every other service (their username reaches the prpl verbatim).
+static std::string getPurpleUsername(std::string const& username, std::string const& serviceName)
+{
+	if (serviceName != "type_whatsapp")
+		return username;
+	// Anything already carrying an '@' is a real whatsmeow id -- the phone JID
+	// ("<digits>@s.whatsapp.net"), an opaque linked id ("<id>@lid"), or a group ("<id>@g.us") -- and
+	// must pass through untouched. Only the display +E.164 form ("+31638307067") or bare digits, which
+	// have no '@', get mapped to the device-JID the prpl needs. This makes the helper safe for buddy
+	// addresses (which can be @lid/@g.us), not just the account's own phone username.
+	if (username.find('@') != std::string::npos)
+		return username;
+	std::string digits;
+	for (std::string::size_type i = 0; i < username.size(); ++i)
+		if (username[i] >= '0' && username[i] <= '9')
+			digits += username[i];
+	if (digits.empty())
+		return username;
+	return digits + "@s.whatsapp.net";
+}
+
+// Inverse of getPurpleUsername: map a prpl account's username BACK to the webOS-side username the
+// account layer keys everything on. For WhatsApp the purple account is the device JID
+// ("31652044684@s.whatsapp.net") but the webOS account + imloginstate + immessage records use +E.164
+// ("+31652044684"). Any callback that reports an account owner to the webOS layer (login state, buddy
+// re-sync, incoming message) MUST translate, or it targets a username no webOS record is keyed on --
+// e.g. requestBuddyResync's imloginstate bump silently matches nothing and the buddy sync never runs.
+// No-op for every other service and for an already-+E.164/foreign form.
+static std::string getWebosUsername(const char* purpleUsername, std::string const& serviceName)
+{
+	std::string u(purpleUsername ? purpleUsername : "");
+	if (serviceName != "type_whatsapp")
+		return u;
+	static const std::string waSuffix = "@s.whatsapp.net";
+	if (u.size() > waSuffix.size() &&
+	    u.compare(u.size() - waSuffix.size(), waSuffix.size(), waSuffix) == 0)
+	{
+		std::string digits = u.substr(0, u.size() - waSuffix.size());
+		if (!digits.empty() && digits[0] != '+')
+			return "+" + digits;
+		return digits;
+	}
+	return u;
 }
 
 static char* getAuthRequestKey(const char* username, const char* serviceName, const char* remoteUsername)
@@ -624,16 +677,25 @@ static std::string const& getAccountKeyFromPurpleAccount(PurpleAccount* account)
 	return ((AccountMetaData*)account->ui_data)->account_key;
 }
 
-static std::string const& getServiceNameFromPurpleAccount(PurpleAccount* account)
+static std::string getServiceNameFromPurpleAccount(PurpleAccount* account)
 {
-    static const std::string empty = "";
-	if (!account || !account->ui_data)
+	if (account == NULL)
 	{
-		MojLogError(IMServiceApp::s_log, _T("getAccountKeyFromPurpleAccount called with empty account"));
-		return empty;
+		MojLogError(IMServiceApp::s_log, _T("getServiceNameFromPurpleAccount called with NULL account"));
+		return "";
 	}
-
-	return ((AccountMetaData*)account->ui_data)->servicename;
+	// Prefer the servicename stashed in ui_data at login/adoption.
+	if (account->ui_data)
+		return ((AccountMetaData*)account->ui_data)->servicename;
+	// ui_data isn't set yet when libpurple auto-logged the account in before the transport tracked it
+	// (see the adoption note in login()). Derive the service from the prpl protocol id so callbacks
+	// (incoming messages, buddy status) still resolve it -- otherwise an empty serviceName makes the
+	// WhatsApp +E.164 translation (and other per-service logic) silently no-op and the JID leaks through.
+	const char* prpl = account->protocol_id;
+	if (prpl != NULL && *prpl != '\0')
+		return getServiceNameFromPrplProtocolId(prpl);
+	MojLogError(IMServiceApp::s_log, _T("getServiceNameFromPurpleAccount: account has neither ui_data nor protocol_id"));
+	return "";
 }
 
 /**
@@ -916,7 +978,10 @@ static void buddy_signed_on_off_cb(PurpleBuddy* buddy, gpointer data)
 
 	// call into the imlibpurpletransport
 	// buddy->name is stored in the imbuddyStatus DB kind in the libpurple format - ie. for AIM without the "@aol.com" so that is how we need to search for it
-	s_imServiceHandler->updateBuddyStatus(accountId.c_str(), serviceName.c_str(), buddy->name, newAvailabilityValue, customMessage, groupName, buddyAvatarLocation);
+	// WhatsApp: report under the +E.164 address so the status keys the same as the contact's ims.value
+	// (otherwise the JID-keyed status never matches the "+<phone>"-keyed contact -> buddy shows offline).
+	std::string const buddyWebosName = getWebosUsername(buddy->name, serviceName);
+	s_imServiceHandler->updateBuddyStatus(accountId.c_str(), serviceName.c_str(), buddyWebosName.c_str(), newAvailabilityValue, customMessage, groupName, buddyAvatarLocation);
 
 	g_message(
 			"%s says: %s's presence: availability: '%i', custom message: '%s', avatar location: '%s', display name: '%s', group name: '%s'",
@@ -1063,13 +1128,17 @@ static void buddy_status_changed_cb(PurpleBuddy* buddy, PurpleStatus* old_status
 	// Perf (#2): presence-only ticks are coalesced + flushed as a batch. Only avatar-changed ticks
 	// (avatarToForward != NULL, gated by #3) take the immediate per-buddy path, which also does the
 	// contact avatar update - those are rare, so per-buddy is fine for them.
+	// Report the buddy under its webOS-facing address (+E.164 for WhatsApp) so the imbuddystatus record
+	// is keyed the same as the contact's ims.value; otherwise a JID-keyed status would never match the
+	// "+<phone>"-keyed contact. No-op for @lid/group ids and other services.
+	std::string const buddyWebosName = getWebosUsername(buddy->name, serviceName);
 	if (avatarToForward != NULL)
 	{
-		s_imServiceHandler->updateBuddyStatus(accountId.c_str(), serviceName.c_str(), buddy->name, newAvailabilityValue, customMessage, groupName, avatarToForward);
+		s_imServiceHandler->updateBuddyStatus(accountId.c_str(), serviceName.c_str(), buddyWebosName.c_str(), newAvailabilityValue, customMessage, groupName, avatarToForward);
 	}
 	else
 	{
-		queuePresenceUpdate(accountId.c_str(), serviceName.c_str(), buddy->name, newAvailabilityValue, customMessage, groupName);
+		queuePresenceUpdate(accountId.c_str(), serviceName.c_str(), buddyWebosName.c_str(), newAvailabilityValue, customMessage, groupName);
 	}
 
 	g_message(
@@ -1182,8 +1251,10 @@ static void scheduleAccountResync(PurpleAccount* account)
 
 	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
 	std::string const& accountKey = getAccountKeyFromPurpleAccount(account);
-	const char* username = account->username;
-	if (serviceName.empty() || username == NULL || *username == '\0')
+	// Report the webOS-side owner username (imloginstate/db8 are keyed on it), not the prpl JID.
+	std::string const usernameStr = getWebosUsername(account->username, serviceName);
+	const char* username = usernameStr.c_str();
+	if (serviceName.empty() || *username == '\0')
 		return;
 
 	// Reset any pending debounce timer for this account so the re-sync fires once, after the LAST
@@ -1398,7 +1469,7 @@ static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 	// reply with login success
 	if (loginState)
 	{
-		((LoginCallbackInterface*)loginState)->loginResult(serviceName.c_str(), loggedInAccount->username, LoginCallbackInterface::LOGIN_SUCCESS, false, ERROR_NO_ERROR, true);
+		((LoginCallbackInterface*)loginState)->loginResult(serviceName.c_str(), getWebosUsername(loggedInAccount->username, serviceName).c_str(), LoginCallbackInterface::LOGIN_SUCCESS, false, ERROR_NO_ERROR, true);
 	}
 	else
 	{
@@ -1471,7 +1542,7 @@ static void account_signed_off_cb(PurpleConnection* gc, gpointer loginState)
 	if (loginState)
 	{
 		std::string const& serviceName = getServiceNameFromPurpleAccount(account);
-		((LoginCallbackInterface*)loginState)->loginResult(serviceName.c_str(), account->username, LoginCallbackInterface::LOGIN_SIGNED_OFF, false, ERROR_NO_ERROR, true);
+		((LoginCallbackInterface*)loginState)->loginResult(serviceName.c_str(), getWebosUsername(account->username, serviceName).c_str(), LoginCallbackInterface::LOGIN_SIGNED_OFF, false, ERROR_NO_ERROR, true);
 	}
 	else
 	{
@@ -1607,7 +1678,7 @@ static void account_login_failed_cb(PurpleConnection* gc, PurpleConnectionError 
 		std::string const& serviceName = getServiceNameFromPurpleAccount(account);
 		//TODO: determine if there are cases where noRetry should be false
 		//TODO: include "description" parameter because it had useful details?
-		((LoginCallbackInterface*)loginState)->loginResult(serviceName.c_str(), account->username, LoginCallbackInterface::LOGIN_FAILED, loggedOut, mojoFriendlyErrorCode, noRetry);
+		((LoginCallbackInterface*)loginState)->loginResult(serviceName.c_str(), getWebosUsername(account->username, serviceName).c_str(), LoginCallbackInterface::LOGIN_FAILED, loggedOut, mojoFriendlyErrorCode, noRetry);
 	}
 	else
 	{
@@ -2012,7 +2083,13 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 		if (!channelDisplayBuf.empty())
 			channelDisplayName = channelDisplayBuf.c_str();
 	}
-	s_imServiceHandler->incomingIM(serviceName.c_str(), account->username, usernameFromStripped.c_str(),
+	// Store the account owner AND the sender in the webOS +E.164 form (getWebosUsername) so the
+	// message threads to the same buddy/contact whose ims.value we now write as "+<phone>". The human
+	// from.name was already computed above from the raw JID, and the buddy lookups above used the raw
+	// JID, so only the STORED addresses change here. Held in locals so the c_str()s outlive the call.
+	std::string ownerWebos = getWebosUsername(account->username, serviceName);
+	std::string senderWebos = getWebosUsername(usernameFromStripped.c_str(), serviceName);
+	s_imServiceHandler->incomingIM(serviceName.c_str(), ownerWebos.c_str(), senderWebos.c_str(),
 			message, mtime, channelName, channelDisplayName, serverName, serverName, muted, usernameFromDisplay);
 }
 
@@ -2049,7 +2126,7 @@ static void *request_authorize_cb (PurpleAccount *account, const char *remote_us
 	logAuthRequestTableValues();
 
 	// call back into IMServiceHandler to create a receivedBuddyInvite imCommand.
-	s_imServiceHandler->receivedBuddyInvite(serviceName.c_str(), account->username, usernameFromStripped.c_str(), message);
+	s_imServiceHandler->receivedBuddyInvite(serviceName.c_str(), getWebosUsername(account->username, serviceName).c_str(), usernameFromStripped.c_str(), message);
 
 	// don't free the authRequestKey - it is not copied, but held onto for the life of the hash table once inserted
 	return NULL;
@@ -2128,7 +2205,7 @@ gboolean connectTimeoutCallback(gpointer data)
 		// TODO - should noRetry be false here in other cases?
 		// Can't really tell - we will get here if the proper sa security certificate is not installed, which is a permanent failure.
 		// libpurple just does not reliably call the login failed callback in all cases...this is not the same as a connection timeout.
-		s_loginState->loginResult(serviceName.c_str(), account->username, LoginCallbackInterface::LOGIN_TIMEOUT, false, ERROR_NETWORK_ERROR, noRetry);
+		s_loginState->loginResult(serviceName.c_str(), getWebosUsername(account->username, serviceName).c_str(), LoginCallbackInterface::LOGIN_TIMEOUT, false, ERROR_NETWORK_ERROR, noRetry);
 	}
 	else
 	{
@@ -2440,14 +2517,18 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 			/* Create the account */
     		std::string prplProtocolId = getPrplProtocolIdFromServiceName(params.serviceName.data());
 
+			/* WhatsApp's webOS username is +E.164 (for display); whatsmeow requires the JID as the
+			 * purple account username (getPurpleUsername). Every other service passes through verbatim. */
+			std::string const purpleUsername = getPurpleUsername(params.username.data(), params.serviceName.data());
+
 			/* webOS Teams port: persist the PurpleAccount in accounts.xml so the rotated
 			 * OAuth refresh_token (the prpl stores it as the account password) and the
 			 * buddy list survive transport restarts natively — no out-of-band token files.
 			 * Reuse the persisted account across restarts; only create+add a fresh one. */
-			account = purple_accounts_find(params.username.data(), prplProtocolId.c_str());
+			account = purple_accounts_find(purpleUsername.c_str(), prplProtocolId.c_str());
 			if (!account)
 			{
-				account = Util::createPurpleAccount(params.username.data(), prplProtocolId.c_str(), params.config);
+				account = Util::createPurpleAccount(purpleUsername.c_str(), prplProtocolId.c_str(), params.config);
 				if (!account)
 				{
 					MojLogError(IMServiceApp::s_log, _T("LibpurpleAdapter::login failed to create new Purple account"));
@@ -2521,6 +2602,38 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 		 * so honoring remember_password here makes subsequent reconnects silent. Benign for prpls that
 		 * ignore the flag. */
 		purple_account_set_remember_password(account, TRUE);
+	}
+
+	// webOS: the prpl account may ALREADY be connected. libpurple auto-logs-in accounts persisted in
+	// accounts.xml (auto-login=1) at startup, frequently BEFORE the transport registered its "signed-on"
+	// handler (assignIMLoginState), so account_logged_in_cb never fired: the account is online at the
+	// prpl level but untracked here. When login() then runs (needsToLogin, after the user goes
+	// available), re-enabling an already-connected account does NOT re-emit signed-on -- so without this
+	// it would stay untracked forever: availability never resets to ONLINE, getFullBuddyList never runs,
+	// and callbacks see an empty serviceName (the JID then leaks into contacts + incoming messages).
+	// Adopt the live connection instead: ensure ui_data, register it online, and report LOGIN_SUCCESS so
+	// the login-state machine advances to GETTING_BUDDIES. A freshly-created account is NOT yet connected
+	// here, so it correctly falls through to the normal connect path below.
+	if (result == OK && account != NULL && purple_account_is_connected(account) &&
+	    s_onlineAccountData.count(accountKey) == 0)
+	{
+		if (account->ui_data == NULL)
+		{
+			AccountMetaData* amd = new AccountMetaData;
+			amd->account_key = accountKey;
+			amd->servicename = params.serviceName.data();
+			account->ui_data = (void*)amd;
+		}
+		if (!params.accountId.empty())
+			purple_account_set_string(account, "webosAccountId", params.accountId.data());
+		s_onlineAccountData[accountKey] = account;
+		s_pendingAccountData.erase(accountKey);
+		s_ipAddressesBoundTo[accountKey] = params.localIpAddress.data();
+		MojLogInfo(IMServiceApp::s_log, _T("LibpurpleAdapter::login: adopting already-connected account %s (auto-login raced the signed-on handler)"), accountKey.c_str());
+		if (loginState)
+			((LoginCallbackInterface*)loginState)->loginResult(params.serviceName.data(), params.username.data(),
+			    LoginCallbackInterface::LOGIN_SUCCESS, false, ERROR_NO_ERROR, true);
+		return OK;
 	}
 
 	if (result == OK)
@@ -3148,6 +3261,28 @@ static std::string whatsAppDisplayName(const char* alias, const char* username)
 	return local.empty() ? u : local;
 }
 
+// If a WhatsApp buddy id is a phone-number JID ("<digits>@s.whatsapp.net"), return the bare digits so
+// the contact record can carry a +E.164 phoneNumber (BuddyListConsolidator prepends the "+"). That
+// lets the contacts linker MERGE the buddy into the device contact that already has that number,
+// instead of creating a duplicate JID-only contact -- and the linked contact then shows its real name.
+// Returns "" for opaque "@lid" ids, group ids, or any id whose local part isn't purely digits (e.g. a
+// ":NN" device suffix), where no phone number can be trusted.
+static std::string whatsAppPhoneFromJid(const char* username)
+{
+	std::string u = username ? username : "";
+	static const std::string waSuffix = "@s.whatsapp.net";
+	if (u.size() <= waSuffix.size() ||
+	    u.compare(u.size() - waSuffix.size(), waSuffix.size(), waSuffix) != 0)
+		return "";
+	std::string local = u.substr(0, u.size() - waSuffix.size());
+	if (local.empty())
+		return "";
+	for (std::string::size_type i = 0; i < local.size(); ++i)
+		if (local[i] < '0' || local[i] > '9')
+			return "";
+	return local;
+}
+
 bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* username)
 {
 	MojLogInfo(IMServiceApp::s_log, "%s called.", __FUNCTION__);
@@ -3221,6 +3356,12 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 			if (isWhatsApp)
 			{
 				waName = whatsAppDisplayName(resolvedAlias, buddyToBeAdded->name);
+				// Carry the buddy's phone number (bare digits; BuddyListConsolidator adds "+") so the
+				// contacts linker merges this buddy into the existing device contact with that number
+				// instead of creating a JID-only duplicate. Empty for "@lid" / group ids -> no merge.
+				std::string waPhone = whatsAppPhoneFromJid(buddyToBeAdded->name);
+				if (!waPhone.empty())
+					buddyObj.putString("phoneNumber", waPhone.c_str());
 			}
 			// webOS Signal: never DROP a Signal contact for being nameless. On a linked (secondary)
 			// device purple-presage often has no synced address-book name, so the buddy arrives with
@@ -3241,7 +3382,13 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 				continue;
 			}
 
-			buddyObj.putString("username", buddyToBeAdded->name);
+			// Store the buddy's webOS-facing address: for WhatsApp the raw whatsmeow phone JID
+			// ("<digits>@s.whatsapp.net") becomes "+<digits>", so the contact's ims.value + remoteId (and
+			// the conversation "to") read as "+31638307067" instead of the JID, matching the +E.164 the
+			// incoming-message from.addr now uses. Opaque "@lid"/group ids pass through unchanged. The
+			// display name (waName, above) and phone-merge were already derived from the raw JID.
+			std::string const buddyWebosName = getWebosUsername(buddyToBeAdded->name, serviceName);
+			buddyObj.putString("username", buddyWebosName.c_str());
 			buddyObj.putString("serviceName", serviceName);
 
 			group = purple_buddy_get_group(buddyToBeAdded);
@@ -3534,6 +3681,13 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceNa
 
 	std::string accountKey = getAccountKey(username, serviceName);
 
+	// The Messaging app addresses WhatsApp buddies by the +E.164 ims.value we now store
+	// ("+31638307067"); whatsmeow needs the device JID. Translate back here so channel lookup and the
+	// 1:1 conversation both target the id the prpl knows. Group ("@g.us")/opaque ("@lid") ids and every
+	// other service pass through unchanged. Repoint the local so all downstream uses see the JID.
+	std::string const usernameToBuf = getPurpleUsername(usernameTo, serviceName);
+	usernameTo = usernameToBuf.c_str();
+
 	PurpleAccount* accountToSendFrom = NULL;
 	if (s_onlineAccountData.count(accountKey))
 	{
@@ -3648,6 +3802,11 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendFile(const char* serviceName,
 	}
 
 	std::string accountKey = getAccountKey(username, serviceName);
+
+	// Same +E.164 -> device-JID translation as sendMessage (see there); WhatsApp attachments address
+	// the buddy by "+<phone>". No-op for group/@lid ids and other services.
+	std::string const usernameToBuf = getPurpleUsername(usernameTo, serviceName);
+	usernameTo = usernameToBuf.c_str();
 
 	PurpleAccount* accountToSendFrom = NULL;
 	if (s_onlineAccountData.count(accountKey))
@@ -4004,6 +4163,10 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::startQRLogin(const char* service
 
 	std::string prplProtocolId = getPrplProtocolIdFromServiceName(serviceName);
 
+	/* WhatsApp's webOS username is +E.164 (for display); whatsmeow requires the JID as the purple
+	 * account username. Translate here so find/create hit the same account the prpl will pair. */
+	std::string const purpleUsername = getPurpleUsername(username, serviceName);
+
 	/* A previously-saved Discord account auto-logs-in on transport start with its stored
 	 * "token", so by the time the user opens Add-Account it is already CONNECTED (and
 	 * quietly flooding messages). prpl-discord's discord_login does a DIRECT login whenever
@@ -4013,7 +4176,7 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::startQRLogin(const char* service
 	 * and start from a brand-new, tokenless account. purple_accounts_delete disconnects it
 	 * (if connected) and removes it from accounts.xml, which also kills the auto-login flood
 	 * source. The real account is (re)created by the UI after confirm with the fresh token. */
-	PurpleAccount* account = purple_accounts_find(username, prplProtocolId.c_str());
+	PurpleAccount* account = purple_accounts_find(purpleUsername.c_str(), prplProtocolId.c_str());
 	if (account)
 	{
 		if (purple_account_is_connected(account) || purple_account_is_connecting(account))
@@ -4028,7 +4191,7 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::startQRLogin(const char* service
 	s_offlineAccountData.erase(accountKey);
 
 	MojObject emptyConfig;
-	account = Util::createPurpleAccount(username, prplProtocolId.c_str(), emptyConfig);
+	account = Util::createPurpleAccount(purpleUsername.c_str(), prplProtocolId.c_str(), emptyConfig);
 	if (!account)
 	{
 		MojLogError(IMServiceApp::s_log, _T("startQRLogin: failed to create Purple account"));

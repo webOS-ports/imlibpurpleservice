@@ -97,6 +97,15 @@ private:
      * does not reliably run on delete - the account is already gone from the account
      * manager, so its username/serviceName can't be resolved there). */
     MojErr purgeAccountData(const char* accountId, const char* username, const char* serviceName);
+
+    /* Batch-delete every leftover db8 record for a whole service (contacts, messages, commands,
+     * buddystatus), keyed on serviceName/ims.type rather than accountId -- for orphans left behind
+     * when an account was removed without a clean purge (its accountId is no longer known). Reuses
+     * the purgeAccountData del slots. */
+    MojErr purgeServiceData(const char* serviceName);
+    /* At startup, consume a plain-text sentinel (PURGE_SENTINEL_PATH: one serviceName per line) and
+     * purgeServiceData() each -- a luna-send-free way to reset a service's data from the shell. */
+    void checkPurgeSentinel();
     MojDbClient::Signal::Slot<IMServiceHandler> m_deleteImLoginStateSlot;
     MojErr deleteImLoginStateResult(MojObject& payload, MojErr err);
     MojDbClient::Signal::Slot<IMServiceHandler> m_deleteImMessagesSlot;

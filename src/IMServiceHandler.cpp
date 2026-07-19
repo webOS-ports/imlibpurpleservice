@@ -25,6 +25,10 @@
 
 
 #include <set>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 #include "IMServiceHandler.h"
 #include "LibpurpleAdapter.h"
 #include "IncomingIMHandler.h"
@@ -112,6 +116,9 @@ MojErr IMServiceHandler::init()
 	// create the interactive-login (QR) challenge channel and hand it to the adapter
 	m_authChannel = new AuthChannel(m_service);
 	LibpurpleAdapter::assignAuthChannel(m_authChannel);
+
+	// consume a one-shot purge sentinel, if present (shell-driven service reset without luna-send)
+	checkPurgeSentinel();
 
 	return MojErrNone;
 }
@@ -262,6 +269,86 @@ MojErr IMServiceHandler::purgeAccountData(const char* accountId, const char* use
 	}
 
 	return MojErrNone;
+}
+
+// Sentinel a shell (novacom) can drop to purge a whole service's leftover data at next start --
+// one serviceName per line ("type_whatsapp"), '#' comments and blanks ignored. Consumed (deleted)
+// after processing so it fires exactly once. Lives on /media/internal so it survives a reboot but
+// is trivially writable without luna-send.
+#define PURGE_SENTINEL_PATH "/media/internal/.im-purge-services"
+
+MojErr IMServiceHandler::purgeServiceData(const char* serviceName)
+{
+	if (serviceName == NULL || *serviceName == '\0')
+		return MojErrNone;
+	MojLogInfo(IMServiceApp::s_log, _T("purgeServiceData: purging all db8 records for serviceName=%s"), serviceName);
+
+	MojErr err;
+	MojString svc;
+	err = svc.assign(serviceName);
+	MojErrCheck(err);
+
+	// contacts - com.palm.contact.libpurple. No accountId available for an orphan, but the kind is
+	// queryable by ims.type (leading prop of the byUsernameAndServiceName index) and a buddy's IM
+	// entry type IS the serviceName.
+	MojDbQuery queryContact;
+	queryContact.from(IM_CONTACT_KIND);
+	err = queryContact.where(_T("ims.type"), MojDbQuery::OpEq, svc);
+	MojErrCheck(err);
+	err = m_dbClient.del(m_deleteContactsSlot, queryContact);
+	MojErrCheck(err);
+
+	// immessage - serviceAndUsername index, leading prop serviceName.
+	MojDbQuery queryMessage;
+	queryMessage.from(IM_IMMESSAGE_KIND);
+	err = queryMessage.where(_T("serviceName"), MojDbQuery::OpEq, svc);
+	MojErrCheck(err);
+	err = m_dbClient.del(m_deleteImMessagesSlot, queryMessage);
+	MojErrCheck(err);
+
+	// imcommand - pendingBuddyInvite index, leading prop serviceName.
+	MojDbQuery queryCommand;
+	queryCommand.from(IM_IMCOMMAND_KIND);
+	err = queryCommand.where(_T("serviceName"), MojDbQuery::OpEq, svc);
+	MojErrCheck(err);
+	err = m_dbClient.del(m_deleteImCommandsSlot, queryCommand);
+	MojErrCheck(err);
+
+	// imbuddystatus - tempdb (byUserName index, leading prop serviceName). tempdb clears on reboot
+	// anyway, but purge here too so an in-session reset takes effect immediately.
+	MojDbQuery queryBuddyStatus;
+	queryBuddyStatus.from(IM_BUDDYSTATUS_KIND);
+	err = queryBuddyStatus.where(_T("serviceName"), MojDbQuery::OpEq, svc);
+	MojErrCheck(err);
+	err = m_tempdbClient.del(m_deleteImBuddyStatusSlot, queryBuddyStatus);
+	MojErrCheck(err);
+
+	return MojErrNone;
+}
+
+void IMServiceHandler::checkPurgeSentinel()
+{
+	FILE* f = fopen(PURGE_SENTINEL_PATH, "r");
+	if (f == NULL)
+		return;
+	MojLogInfo(IMServiceApp::s_log, _T("checkPurgeSentinel: %s present -- purging listed services"), PURGE_SENTINEL_PATH);
+	char line[256];
+	while (fgets(line, sizeof(line), f) != NULL)
+	{
+		char* s = line;
+		while (*s == ' ' || *s == '\t')
+			++s;
+		size_t n = strlen(s);
+		while (n > 0 && (s[n-1] == '\n' || s[n-1] == '\r' || s[n-1] == ' ' || s[n-1] == '\t'))
+			s[--n] = '\0';
+		if (*s == '\0' || *s == '#')
+			continue;
+		purgeServiceData(s);
+	}
+	fclose(f);
+	// One-shot: remove the sentinel so it does not purge again on the next start.
+	if (unlink(PURGE_SENTINEL_PATH) != 0)
+		MojLogError(IMServiceApp::s_log, _T("checkPurgeSentinel: failed to remove %s"), PURGE_SENTINEL_PATH);
 }
 
 MojErr IMServiceHandler::deleteImLoginStateResult(MojObject& payload, MojErr err)
@@ -1183,6 +1270,18 @@ gboolean IMServiceHandler::ShutdownCallback(void* data)
  */
 bool IMServiceHandler::OkToShutdown()
 {
+	// When launched as the resident upstart daemon (imdaemon.sh sets IM_RESIDENT=1), never
+	// self-terminate on idle: the daemon owns the process lifecycle and respawns us immediately, so
+	// an idle self-shutdown just produces a shutdown<->respawn churn every SHUTDOWN_DELAY window that
+	// tears down and reloads every prpl each cycle -- including purple-signal's in-process JVM, which
+	// looks like "Signal keeps crashing" and never lets slow accounts (Signal's JVM, WhatsApp's
+	// contact sync) reach a stable connection. Staying resident lets the login-state machine retry
+	// with backoff until accounts reconnect. The on-demand .service path (no IM_RESIDENT) keeps the
+	// original idle-out behaviour. An external SIGTERM (reboot / upstart stop) still shuts us down.
+	static const bool resident = (getenv("IM_RESIDENT") != NULL);
+	if (resident)
+		return false;
+
 	// ask libpurple if all accounts are logged off
 	if (0 == m_activeProcesses) {
 		return LibpurpleAdapter::allAccountsOffline();

@@ -60,7 +60,18 @@ std::string AuthChannel::accountKey(const char* serviceName, const char* usernam
 {
 	std::string s(serviceName ? serviceName : "");
 	std::string u(username ? username : "");
-	return u + "_" + s;   // matches LibpurpleAdapter getAccountKey(username, serviceName)
+	// Must match LibpurpleAdapter::getAccountKey so the two sides of a WhatsApp QR pairing meet on the
+	// SAME key: the validator subscribes with the webOS username (+E.164, e.g. "+31652044684") while
+	// gowhatsapp raises the QR challenge with the *purple* username (the device JID,
+	// "31652044684@s.whatsapp.net"). Normalize both to the bare digits ("31652044684") -- strip the
+	// "@s.whatsapp.net" suffix, then the WhatsApp display "+". Other services pass through unchanged.
+	static const std::string waSuffix = "@s.whatsapp.net";
+	if (u.size() > waSuffix.size() &&
+	    u.compare(u.size() - waSuffix.size(), waSuffix.size(), waSuffix) == 0)
+		u.erase(u.size() - waSuffix.size());
+	if (s == "type_whatsapp" && !u.empty() && u[0] == '+')
+		u.erase(0, 1);
+	return u + "_" + s;
 }
 
 // ---- producers (called from LibpurpleAdapter, glib main loop) ----------------
