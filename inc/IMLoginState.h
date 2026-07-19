@@ -262,7 +262,7 @@ class IMLoginFailRetryHandler : public MojSignalHandler {
 public:
 	IMLoginFailRetryHandler(MojService* service);
 
-	MojErr startTimerActivity(const MojString& serviceName, const MojDbQuery& query, const MojObject& mergeProps);
+	MojErr startTimerActivity(const MojString& serviceName, const MojDbQuery& query, const MojObject& mergeProps, int delaySeconds = 2);
 
 private:
 	MojDbClient::Signal::Slot<IMLoginFailRetryHandler> m_activitySubscriptionSlot;

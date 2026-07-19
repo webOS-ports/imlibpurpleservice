@@ -1184,17 +1184,18 @@ void IMLoginStateHandler::loginResult(const char* serviceName, const char* usern
 		m_loginStateController->resetRetryCount();
 	}
 	else {
-		// happens for login_failed or timeout and we had a network error
-		if (m_loginStateController->hitMaxRetry()) {
-			// done retrying
-			m_loginStateController->resetRetryCount();
-			noRetry = true;
-			MojLogError(IMServiceApp::s_log, _T("loginResult: max retries exceeded. giving up login attempts for %s on %s"), username, serviceName);
-		}
-		else {
-			m_loginStateController->incrementRetryCount();
-			MojLogInfo(IMServiceApp::s_log, _T("loginResult: incrementing retry count to %i."), m_loginStateController->getRetryCount());
-		}
+		// happens for login_failed or timeout and we had a network error.
+		// webOS: do NOT give up and park the account OFFLINE after a fixed number of tries. The old
+		// behaviour (MAX_RETRY=6, 2s apart) exhausted its budget in ~12s, so any WiFi blip or sleep/wake
+		// longer than that parked availability=OFFLINE; because needsToLogin() is availability-gated the
+		// account then stayed offline even after the network came back, and the user had to toggle their
+		// status to recover. Instead keep retrying indefinitely with an exponential backoff (see the
+		// delay computed for startTimerActivity below) so the account auto-reconnects whenever the
+		// network returns. The retry count is reset on a successful login. A genuinely permanent,
+		// non-network error still arrives with noRetry==true from the adapter and parks below, so this
+		// does not mask a misconfigured account.
+		m_loginStateController->incrementRetryCount();
+		MojLogInfo(IMServiceApp::s_log, _T("loginResult: network login failure for %s on %s, retry #%i (backoff, no permanent give-up)"), username, serviceName, m_loginStateController->getRetryCount());
 	}
 
 	// Want to merge the new state and errorCode values for the given username and serviceName
@@ -1244,7 +1245,17 @@ void IMLoginStateHandler::loginResult(const char* serviceName, const char* usern
 		MojRefCountedPtr<IMLoginFailRetryHandler> handler(new IMLoginFailRetryHandler(m_service));
 		mergeProps.putString("state", LOGIN_STATE_OFFLINE);
 		mergeProps.put("errorCode", errorCodeMoj);
-		handler->startTimerActivity(serviceNameMoj, query, mergeProps);
+		// Exponential backoff capped at 30s: 2,4,8,16,30s. A transient blip OR a slow/flaky reboot (where
+		// several accounts fail their first login attempts before the network settles) recovers within
+		// ~30s. The earlier 300s cap left accounts stuck offline for MINUTES after such a reboot. 30s
+		// still avoids a tight retry loop against a genuinely-down network, and there is no OFFLINE
+		// parking, so an account always reconnects on its own once the network is back - no user toggle.
+		int retryDelaySeconds = 2;
+		for (MojUInt32 k = 1; k < m_loginStateController->getRetryCount() && retryDelaySeconds < 30; k++)
+			retryDelaySeconds *= 2;
+		if (retryDelaySeconds > 30)
+			retryDelaySeconds = 30;
+		handler->startTimerActivity(serviceNameMoj, query, mergeProps, retryDelaySeconds);
 	}
 	else
 	{
@@ -1439,9 +1450,9 @@ IMLoginFailRetryHandler::IMLoginFailRetryHandler(MojService* service)
 {
 }
 
-MojErr IMLoginFailRetryHandler::startTimerActivity(const MojString& serviceName, const MojDbQuery& query, const MojObject& mergeProps)
+MojErr IMLoginFailRetryHandler::startTimerActivity(const MojString& serviceName, const MojDbQuery& query, const MojObject& mergeProps, int delaySeconds)
 {
-	MojLogInfo(IMServiceApp::s_log, _T("IMLoginFailRetryHandler::startTimerActivity"));
+	MojLogInfo(IMServiceApp::s_log, _T("IMLoginFailRetryHandler::startTimerActivity (retry in %ds)"), delaySeconds);
 	MojRefCountedPtr<MojServiceRequest> req;
 	MojErr err = m_service->createRequest(req);
 	if (err != MojErrNone)
@@ -1479,7 +1490,7 @@ MojErr IMLoginFailRetryHandler::startTimerActivity(const MojString& serviceName,
 		if (time(&targetDate) == (time_t)-1) {
 			MojLogError(IMServiceApp::s_log, _T("IMLoginFailRetryHandler: time() failed"));
 		}
-		targetDate += 2; // schedule for 2 seconds in the future
+		targetDate += delaySeconds; // schedule the retry after the (backoff) delay
 		tm* ptm = gmtime(&targetDate);
 		char scheduleTime[50];
 		if (ptm == NULL) {
