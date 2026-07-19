@@ -162,6 +162,11 @@ public:
 	static SendResult authorizeBuddy(const char* serviceName, const char* username, const char* buddyUsername);
 	static SendResult declineBuddy(const char* serviceName, const char* username, const char* buddyUsername);
 	static SendResult sendMessage(const char *serviceName, const char *username, const char *usernameTo, const char *messageText);
+	// webOS attachment send: transmit a local file (absolute path, must exist and be readable in the
+	// transport process) to usernameTo. Mirrors sendMessage's account resolution + channel detection:
+	// a group-channel target routes through serv_chat_send_file, a 1:1 IM through serv_send_file. All
+	// of this build's prpls treat a non-NULL filename as an already-accepted xfer (no UI dialog).
+	static SendResult sendFile(const char *serviceName, const char *username, const char *usernameTo, const char *filePath);
 	static bool queuePresenceUpdates(bool enable);
 	static bool deviceConnectionClosed(bool all, const char* ipAddress);
 	static bool allAccountsOffline();

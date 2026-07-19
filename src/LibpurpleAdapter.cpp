@@ -1701,6 +1701,50 @@ static PurpleChat* findChatByIdComponent(PurpleAccount* account, const char* id)
  *    the server is the part before the first ": " (the guild/team). The remainder (Discord category)
  *    is returned via outCategory for imchannel.parentId.
  */
+// webOS Servers/Rooms: display-name cleanup for server/channel names read from the prpl blist. Some
+// prpls hand back HTML-escaped names (Teams "LuneOS &amp; webOS-OSE"), which the app shows literally;
+// decode the common entities so the user sees "LuneOS & webOS-OSE".
+static std::string htmlUnescape(const std::string& in)
+{
+	std::string out;
+	out.reserve(in.size());
+	for (size_t i = 0; i < in.size(); )
+	{
+		if (in[i] == '&')
+		{
+			if      (in.compare(i, 5, "&amp;")  == 0) { out += '&';  i += 5; continue; }
+			else if (in.compare(i, 4, "&lt;")   == 0) { out += '<';  i += 4; continue; }
+			else if (in.compare(i, 4, "&gt;")   == 0) { out += '>';  i += 4; continue; }
+			else if (in.compare(i, 6, "&quot;") == 0) { out += '"';  i += 6; continue; }
+			else if (in.compare(i, 6, "&apos;") == 0) { out += '\''; i += 6; continue; }
+			else if (in.compare(i, 5, "&#39;")  == 0) { out += '\''; i += 5; continue; }
+		}
+		out += in[i++];
+	}
+	return out;
+}
+
+// True if `name` is a raw Teams/Skype thread id like "19:<hex>@thread.skype" / "@thread.v2" - i.e. a
+// group chat with no topic set. purple-teams uses that id as the chat title, so it would otherwise be
+// shown to the user verbatim.
+static bool isRawThreadId(const std::string& name)
+{
+	return name.compare(0, 3, "19:") == 0 && name.find("@thread.") != std::string::npos;
+}
+
+// Clean a channel display name for storage/UI: decode HTML entities, and replace an un-named Teams
+// group chat's raw thread id with a readable placeholder. (Proper participant-derived names - "Alice,
+// Bob, ..." like the real client - need the resolved member list and are a purple-teams follow-up.)
+static std::string cleanChannelDisplayName(const char* rawName)
+{
+	if (rawName == NULL || *rawName == '\0')
+		return std::string();
+	std::string n = htmlUnescape(rawName);
+	if (isRawThreadId(n))
+		return std::string("Group chat");
+	return n;
+}
+
 static std::string deriveServerName(PurpleAccount* account, const char* groupName, std::string* outCategory)
 {
 	if (outCategory)
@@ -1714,14 +1758,19 @@ static std::string deriveServerName(PurpleAccount* account, const char* groupNam
 	if (groupName == NULL || *groupName == '\0')
 		return std::string();
 	std::string g = groupName;
+	// webOS Teams: purple-teams files ALL Teams chats under one blist group named "Teams - <tenantId>"
+	// (teams_get_blist_group), and for a personal account the tenant is the consumer GUID - so the
+	// Servers tab showed a "server" literally called "Teams - 9188040d-6c67-...". Collapse it to "Teams".
+	if (g == "Teams" || g.compare(0, 8, "Teams - ") == 0)
+		return std::string("Teams");
 	std::string::size_type sep = g.find(": ");
 	if (sep != std::string::npos)
 	{
 		if (outCategory)
-			*outCategory = g.substr(sep + 2);
-		return g.substr(0, sep);
+			*outCategory = htmlUnescape(g.substr(sep + 2));
+		return htmlUnescape(g.substr(0, sep));
 	}
-	return g;
+	return htmlUnescape(g);
 }
 
 /*
@@ -1767,6 +1816,34 @@ static PurpleConversation* joinChannelChat(PurpleAccount* account, const char* c
 }
 
 
+// webOS receive attachments: true if `message` is nothing but a libpurple imgstore image reference
+// (e.g. <img id="7">), optionally surrounded by whitespace. presage emits such a message as an inline
+// copy of a received image IN ADDITION to the file:// URL message we rely on (the auto-download path
+// template writes both), so we drop the redundant inline one to avoid a duplicate/broken image bubble.
+// A real image delivered as a URL (Discord/Telegram) arrives as text, not an <img> tag, so is unaffected.
+static bool isPureImgstoreMessage(const char* message)
+{
+	if (message == NULL)
+		return false;
+	const char* p = message;
+	while (*p && isspace((unsigned char)*p)) p++;
+	if (strncasecmp(p, "<img", 4) != 0)
+		return false;
+	const char* end = strchr(p, '>');
+	if (end == NULL)
+		return false;
+	// must be an imgstore-id reference ("<img id=...>"), not a src=URL <img> - check within the tag
+	std::string tag(p, end - p);
+	for (size_t i = 0; i + 2 < tag.size(); i++)
+		if ((tag[i]=='i'||tag[i]=='I') && (tag[i+1]=='d'||tag[i+1]=='D') && tag[i+2]=='=')
+		{
+			end++;
+			while (*end && isspace((unsigned char)*end)) end++;
+			return *end == '\0';   // nothing follows the single <img id=...> tag
+		}
+	return false;
+}
+
 void incoming_message_cb(PurpleConversation* conv, const char* who, const char* alias, const char* message,
 		PurpleMessageFlags flags, time_t mtime)
 {
@@ -1801,6 +1878,14 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 	if ((flags & PURPLE_MESSAGE_RECV) != PURPLE_MESSAGE_RECV)
 	{
 		/* this is a sent message. ignore it. */
+		return;
+	}
+
+	// webOS receive attachments: drop a redundant inline-imgstore copy of a received image (presage
+	// emits one alongside the file:// URL message we actually render). See isPureImgstoreMessage.
+	if (isPureImgstoreMessage(message))
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("incoming_message_cb: dropping redundant inline-image (imgstore) message"));
 		return;
 	}
 
@@ -1917,6 +2002,16 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 	// stable value from the blist group alone, so mirror serverName for now - Milestone 1 will
 	// pull the real guild id from the chat's components.
 	const char* serverName = serverNameStr.empty() ? NULL : serverNameStr.c_str();
+	// webOS Servers/Rooms: decode HTML entities and replace an un-named Teams group chat's raw thread id
+	// with a readable placeholder, so the stored/displayed room title matches what deriveServerName
+	// already does for the server. channelName (the match key) stays raw.
+	std::string channelDisplayBuf;
+	if (channelDisplayName != NULL && *channelDisplayName != '\0')
+	{
+		channelDisplayBuf = cleanChannelDisplayName(channelDisplayName);
+		if (!channelDisplayBuf.empty())
+			channelDisplayName = channelDisplayBuf.c_str();
+	}
 	s_imServiceHandler->incomingIM(serviceName.c_str(), account->username, usernameFromStripped.c_str(),
 			message, mtime, channelName, channelDisplayName, serverName, serverName, muted, usernameFromDisplay);
 }
@@ -2246,10 +2341,20 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 			}
 		}
 		std::string const& accountBoundToIpAddress = s_ipAddressesBoundTo[accountKey];
-		if (params.localIpAddress.data() == accountBoundToIpAddress)
+		// Only force a logout+relogin when we have a NEW, non-empty local IP that GENUINELY differs from
+		// the one this account is bound to. A wake-from-sleep or connection-manager blip can deliver an
+		// empty/stale localIpAddress; treating that as an interface change tore every account down and
+		// parked them all offline (availability OFFLINE), and the repeated churn never cleanly reconnected.
+		// If the incoming IP is unknown (empty) or the account was never bound to one, keep the existing
+		// connection - a genuinely dead socket is caught by libpurple's own SIGNED_OFF handling, which
+		// re-drives login through IMLoginState.
+		bool ipReallyChanged = !params.localIpAddress.empty()
+				&& !accountBoundToIpAddress.empty()
+				&& params.localIpAddress.data() != accountBoundToIpAddress;
+		if (!ipReallyChanged)
 		{
 			/*
-			 * We're using the right interface for this account
+			 * We're using the right interface for this account (or the local IP is unknown - don't churn)
 			 */
 			if (accountIsAlreadyPending)
 			{
@@ -2268,7 +2373,8 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 			 * We're not using the right interface. Close the current connection for this account and create a new one
 			 */
 			MojLogError(IMServiceApp::s_log,
-					_T("LibpurpleAdapter::login: We have to logout and login again since the local IP address has changed. Logging out from account."));
+					_T("LibpurpleAdapter::login: We have to logout and login again since the local IP address has changed (bound=%s, new=%s). Logging out from account."),
+					accountBoundToIpAddress.c_str(), params.localIpAddress.data());
 			/*
 			 * Once the current connection is closed we don't want to let mojo know that the account was disconnected.
 			 * Since mojo went down and came back up it didn't know that the account was connected anyways.
@@ -2365,6 +2471,32 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 			 * restarts; the in-memory ui_data does not). */
 			if (!params.accountId.empty())
 				purple_account_set_string(account, "webosAccountId", params.accountId.data());
+		}
+
+		// webOS receive attachments: make image-capable prpls auto-download incoming files to a
+		// persistent, WebKit-readable location (/media/internal) and surface them as a file:// URL in
+		// the conversation body, which the Messaging app renders inline (same path as remote image
+		// URLs). These are plain prpl account options - no plugin rebuild. gowhatsapp's "xfer" image
+		// mode emits ONLY the file:// URL (its inline imgstore copy is suppressed); presage emits the
+		// URL plus a redundant inline imgstore copy that incoming_message_cb drops. Set every login so
+		// accounts persisted before this feature also pick it up.
+		{
+			std::string svc = params.serviceName.data();
+			std::string attachDir;
+			if (svc == "type_whatsapp")
+				attachDir = "/media/internal/.im-attachments/whatsapp";
+			else if (svc == "type_signal")
+				attachDir = "/media/internal/.im-attachments/signal";
+			if (!attachDir.empty())
+			{
+				purple_build_dir(attachDir.c_str(), 0755);
+				// $hash is a per-image content hash, $extension includes the leading dot -> unique,
+				// stable filenames; re-receiving the same image just overwrites in place.
+				std::string tmpl = attachDir + "/$hash$extension";
+				purple_account_set_string(account, "attachment-path-template", tmpl.c_str());
+				if (svc == "type_whatsapp")
+					purple_account_set_string(account, "handle-images", "xfer");
+			}
 		}
 
 		MojLogInfo(IMServiceApp::s_log, _T("Logging in..."));
@@ -3292,7 +3424,10 @@ bool LibpurpleAdapter::enumerateServersChannels(const char* serviceName, const c
 
 			MojObject channel;
 			channel.putString(_T("remoteId"), chanId);
-			channel.putString(_T("name"), chanName ? chanName : chanId);
+			std::string chanDisplay = cleanChannelDisplayName(chanName ? chanName : chanId);
+			if (chanDisplay.empty())
+				chanDisplay = chanId;
+			channel.putString(_T("name"), chanDisplay.c_str());
 			if (!categoryName.empty())
 				channel.putString(_T("parentId"), categoryName.c_str());
 			channel.putInt(_T("position"), position++);
@@ -3485,6 +3620,123 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceNa
 	return retVal;
 }
 
+/*
+ * webOS attachment send. Mirrors sendMessage's account resolution + channel detection, but instead of
+ * serv_send_im / serv_chat_send it hands the local file to libpurple's file-transfer path:
+ *   - group channel target -> serv_chat_send_file(gc, chatId, path)  (gated by chat_can_receive_file)
+ *   - 1:1 IM target        -> serv_send_file(gc, who, path)
+ * Every prpl in this build implements send_file with the headless-friendly contract: a non-NULL
+ * filename means the xfer is already accepted (purple_xfer_request_accepted), so no UI dialog is
+ * needed. filePath must be an absolute path that EXISTS and is READABLE in the transport process
+ * (e.g. /media/internal/...); a URL or a path only valid in the app sandbox will fail.
+ */
+LibpurpleAdapter::SendResult LibpurpleAdapter::sendFile(const char* serviceName, const char* username, const char* usernameTo, const char* filePath)
+{
+	if (!serviceName || !username || !usernameTo || !filePath || !filePath[0])
+	{
+		MojLogError(IMServiceApp::s_log, _T("sendFile: Invalid parameter. Please double check the passed parameters."));
+		return LibpurpleAdapter::INVALID_PARAMS;
+	}
+
+	MojLogInfo(IMServiceApp::s_log, _T("%s called."), __FUNCTION__);
+
+	// The prpl back-end reads the file from disk itself, so the path has to resolve in THIS process.
+	if (!g_file_test(filePath, G_FILE_TEST_EXISTS) || !g_file_test(filePath, G_FILE_TEST_IS_REGULAR))
+	{
+		MojLogError(IMServiceApp::s_log, _T("sendFile: file does not exist or is not a regular file: %s"), filePath);
+		return LibpurpleAdapter::SEND_FAILED;
+	}
+
+	std::string accountKey = getAccountKey(username, serviceName);
+
+	PurpleAccount* accountToSendFrom = NULL;
+	if (s_onlineAccountData.count(accountKey))
+	{
+		accountToSendFrom = s_onlineAccountData[accountKey];
+	}
+	else if (s_pendingAccountData.count(accountKey))
+	{
+		accountToSendFrom = s_pendingAccountData[accountKey];
+	}
+
+	if (accountToSendFrom == NULL)
+	{
+		MojLogError(IMServiceApp::s_log, _T("sendFile: Trying to send from an account that is not logged in. service name %s"), serviceName);
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	}
+
+	PurpleConnection* gc = purple_account_get_connection(accountToSendFrom);
+	if (gc == NULL)
+	{
+		MojLogError(IMServiceApp::s_log, _T("sendFile: no active connection for service %s"), serviceName);
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	}
+
+	LibpurpleAdapter::SendResult retVal = LibpurpleAdapter::SENT;
+
+	// Servers/Rooms: if the target resolves to a group channel (blist chat, matched by its id
+	// component or by name), route the file into the CHAT via serv_chat_send_file. Join first if the
+	// conversation isn't open yet (same pattern as sendMessage's channel branch).
+	PurpleChat* channelChat = findChatByIdComponent(accountToSendFrom, usernameTo);
+	if (channelChat == NULL)
+		channelChat = purple_blist_find_chat(accountToSendFrom, usernameTo);
+	if (channelChat != NULL)
+	{
+		PurpleConversation* chatConv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, usernameTo, accountToSendFrom);
+		if (chatConv == NULL)
+		{
+			GHashTable* components = purple_chat_get_components(channelChat);
+			if (components != NULL)
+				serv_join_chat(gc, components);
+			chatConv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, usernameTo, accountToSendFrom);
+		}
+
+		if (chatConv == NULL)
+		{
+			MojLogError(IMServiceApp::s_log, _T("sendFile: could not open chat conversation for channel %s"), usernameTo);
+			return LibpurpleAdapter::SEND_FAILED;
+		}
+
+		int chatId = purple_conv_chat_get_id(purple_conversation_get_chat_data(chatConv));
+
+		// Only attempt the chat file-send if the prpl advertises it (Discord/Telegram/Teams do;
+		// a prpl without chat_send_file would otherwise no-op or crash).
+		PurplePlugin* prpl = purple_connection_get_prpl(gc);
+		PurplePluginProtocolInfo* prpl_info = prpl ? PURPLE_PLUGIN_PROTOCOL_INFO(prpl) : NULL;
+		if (prpl_info == NULL || prpl_info->chat_send_file == NULL)
+		{
+			MojLogError(IMServiceApp::s_log, _T("sendFile: prpl for %s does not support chat file transfer"), serviceName);
+			return LibpurpleAdapter::SEND_FAILED;
+		}
+		if (prpl_info->chat_can_receive_file != NULL && !prpl_info->chat_can_receive_file(gc, chatId))
+		{
+			MojLogError(IMServiceApp::s_log, _T("sendFile: chat %s cannot receive files"), usernameTo);
+			return LibpurpleAdapter::SEND_FAILED;
+		}
+
+		serv_chat_send_file(gc, chatId, filePath);
+		MojLogInfo(IMServiceApp::s_log, _T("sendFile: initiated chat file transfer to channel %s: %s"), usernameTo, filePath);
+		return retVal;
+	}
+
+	// 1:1 IM file transfer. serv_send_file dispatches to prpl->send_file; with a non-NULL path our
+	// prpls accept the xfer immediately without a UI prompt. Guard on send_file so a prpl without it
+	// fails cleanly here instead of falling into libpurple's generic (UI-driven) xfer path.
+	{
+		PurplePlugin* prpl = purple_connection_get_prpl(gc);
+		PurplePluginProtocolInfo* prpl_info = prpl ? PURPLE_PLUGIN_PROTOCOL_INFO(prpl) : NULL;
+		if (prpl_info == NULL || prpl_info->send_file == NULL)
+		{
+			MojLogError(IMServiceApp::s_log, _T("sendFile: prpl for %s does not support file transfer"), serviceName);
+			return LibpurpleAdapter::SEND_FAILED;
+		}
+	}
+	serv_send_file(gc, usernameTo, filePath);
+	MojLogInfo(IMServiceApp::s_log, _T("sendFile: initiated file transfer to %s: %s"), usernameTo, filePath);
+
+	return retVal;
+}
+
 
 // Called by IMLoginState whenever a connection interface goes down.
 // If all==true, then all interfaces went down.
@@ -3660,29 +3912,62 @@ static gboolean qrTokenPollCallback(gpointer data)
 		return FALSE;
 	}
 
+	// prpl-discord persists the obtained credential as the "token" account string.
 	const char* token = purple_account_get_string(ctx->account, "token", NULL);
-	if (token && *token)
+	// Session prpls (gowhatsapp/whatsmeow) never set "token"; they store the reconnect
+	// credential (deviceJID|registrationId) as BOTH the account password and the "credentials"
+	// account string the instant pairing completes (gowhatsapp_store_credentials) -- which is
+	// well BEFORE they signal PURPLE_CONNECTED. gowhatsapp only goes "online" (-> signed-on ->
+	// account_logged_in_cb) after a full contact sync finishes, and on a fresh QR pair that
+	// sync is huge and its end-marker often never arrives in time, so signed-on never fires and
+	// the account is never confirmed -> connectTimeout, stuck on the QR page. Polling the stored
+	// "credentials" instead confirms as soon as pairing is done, independent of that sync.
+	// "credentials" == gowhatsapp's GOWHATSAPP_CREDENTIALS_KEY (its constants.h; inlined to avoid a
+	// prpl header dependency in the transport). Non-session prpls never set it, so this is a no-op there.
+	const char* sessionCred = purple_account_get_string(ctx->account, "credentials", NULL);
+	bool haveToken = (token && *token);
+	bool haveSession = (!haveToken && sessionCred && *sessionCred);
+	if (haveToken || haveSession)
 	{
-		MojLogInfo(IMServiceApp::s_log, _T("qrTokenPoll: token obtained for %s -> confirm + tear down preview"), ctx->accountKey.c_str());
+		const char* cred = haveToken ? token : sessionCred;
+		MojLogInfo(IMServiceApp::s_log, _T("qrTokenPoll: %s credential obtained for %s -> confirm"),
+		           haveToken ? "token" : "session", ctx->accountKey.c_str());
 		if (s_authChannel)
-			s_authChannel->setConfirmed(ctx->serviceName.c_str(), ctx->username.c_str(), token);
+			s_authChannel->setConfirmed(ctx->serviceName.c_str(), ctx->username.c_str(), cred);
 
 		s_qrPreviewKeys.erase(ctx->accountKey);
 		s_pendingAccountData.erase(ctx->accountKey);
-		s_onlineAccountData.erase(ctx->accountKey);
 		if (s_accountLoginTimers.count(ctx->accountKey))
 		{
 			purple_timeout_remove(s_accountLoginTimers[ctx->accountKey]);
 			s_accountLoginTimers.erase(ctx->accountKey);
 		}
-		// Delete the disposable preview account entirely -- disconnect it (so it never syncs)
-		// AND remove it from accounts.xml. Keeping it persisted leaves an UNTAGGED orphan (no
-		// webosAccountId), which auto-logs-in on every transport restart and floods, and which
-		// onDelete (deleteAccountByWebosId, matched on webosAccountId) can NEVER clean up --
-		// exactly why deleting the account from the UI did not clear it. The token was already
-		// handed to the UI above; the real account is created by the UI and logs in directly
-		// with that token (passed as its credential -> discord_login uses it, no second QR).
-		schedulePreviewAccountDelete(ctx->account);
+
+		if (haveToken)
+		{
+			// Discord (token-based): delete the disposable preview entirely -- disconnect it (so it
+			// never syncs) AND remove it from accounts.xml. Keeping it persisted leaves an UNTAGGED
+			// orphan (no webosAccountId) that auto-logs-in on every transport restart and floods, and
+			// that onDelete (matched on webosAccountId) can NEVER clean up. The token was handed to the
+			// UI above; the real account is created by the UI and logs in directly with it (no 2nd QR).
+			s_onlineAccountData.erase(ctx->accountKey);
+			schedulePreviewAccountDelete(ctx->account);
+		}
+		else
+		{
+			// Session prpl (whatsmeow): do NOT tear down. Disconnecting a freshly-paired whatsmeow
+			// client SIGSEGVs, and the live paired session is exactly what we want to reuse. Keep it
+			// alive and register it as an online account with no webOS accountId yet; when the UI
+			// creates the real account, its onEnabled -> LibpurpleAdapter::login() finds THIS session
+			// already online and adopts it (stamps the webosAccountId, reuses the connection -- see the
+			// adoption block in login()). Mirrors account_logged_in_cb's adoption path but fires on
+			// credential-stored rather than the unreliable signed-on signal. The preview already holds
+			// the "credentials" string in accounts.xml, so post-restart auto-login reconnects it too.
+			s_onlineAccountData[ctx->accountKey] = ctx->account;
+			if (s_ipAddressesBoundTo.count(ctx->accountKey) == 0)
+				s_ipAddressesBoundTo[ctx->accountKey] = "";
+			MojLogInfo(IMServiceApp::s_log, _T("qrTokenPoll: keeping paired preview %s alive for adoption"), ctx->accountKey.c_str());
+		}
 
 		delete ctx;
 		return FALSE;
