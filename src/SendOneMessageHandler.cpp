@@ -73,6 +73,10 @@ MojErr SendOneMessageHandler::doSend(const MojObject imMsg) {
 	err = imMsg.get(MOJDB_MSG_TEXT, m_messageText, found);
 	MojErrCheck(err);
 
+	// webOS attachment send: optional local file path (absent on text-only messages).
+	err = imMsg.get(MOJDB_FILE_PATH, m_filePath, found);
+	MojErrCheck(err);
+
 	// userNameTo - use "to" address
 	MojObject addrArray; // array
 	found = imMsg.get(MOJDB_TO, addrArray);
@@ -420,7 +424,23 @@ MojErr SendOneMessageHandler::sendToTransport()
 
 	// Note, libpurple does not return errors on send - adapter only checks that the parameters are valid and that the user is logged in
 	// otherwise assume success...
-	LibpurpleAdapter::SendResult retVal = LibpurpleAdapter::sendMessage(m_serviceName.data(), m_username.data(), m_usernameTo.data(), m_messageText.data());
+	LibpurpleAdapter::SendResult retVal;
+	if (!m_filePath.empty())
+	{
+		// webOS attachment send: transmit the file first. If the message also carries text, send it as
+		// a follow-up caption (libpurple's file-transfer API has no caption parameter). The file send
+		// determines the stored status; the caption is best-effort and does not override a SENT status.
+		MojLogInfo(IMServiceApp::s_log, "sending attachment to transport. id: %s, path: %s", m_currentMsgdbId.data(), m_filePath.data());
+		retVal = LibpurpleAdapter::sendFile(m_serviceName.data(), m_username.data(), m_usernameTo.data(), m_filePath.data());
+		if (LibpurpleAdapter::SENT == retVal && !m_messageText.empty())
+		{
+			LibpurpleAdapter::sendMessage(m_serviceName.data(), m_username.data(), m_usernameTo.data(), m_messageText.data());
+		}
+	}
+	else
+	{
+		retVal = LibpurpleAdapter::sendMessage(m_serviceName.data(), m_username.data(), m_usernameTo.data(), m_messageText.data());
+	}
 
 	// Now save the status
 	MojObject propObject;

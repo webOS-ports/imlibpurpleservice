@@ -71,6 +71,13 @@ typedef enum {
 #define MOJDB_ERROR_CODE	        _T("errorCode")
 #define MOJDB_ERROR_CATEGORY	    _T("errorCategory")
 
+// webOS attachment send: absolute local path of a file to send with this outgoing message
+// (e.g. /media/internal/...). Written by the Messaging app when the user attaches a file; absent
+// on ordinary text-only messages. The transport reads it in SendOneMessageHandler and routes the
+// send through LibpurpleAdapter::sendFile (serv_send_file / serv_chat_send_file). db8 is schemaless
+// so this needs no immessage kind change.
+#define MOJDB_FILE_PATH             _T("filePath")
+
 // webOS Servers/Rooms: multi-user-chat (MUC) properties. Only written for group-chat messages
 // (Discord channels, IRC channels, ...); absent on 1:1 IMs. db8 is schemaless so these need no
 // kind change; query indexes are added in Milestone 1.
