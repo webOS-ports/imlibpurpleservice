@@ -166,6 +166,8 @@ static void incoming_message_cb(PurpleConversation *conv, const char *who, const
 static std::string getServiceNameFromPurpleAccount(PurpleAccount* account);
 // human-friendly WhatsApp display name (push-name, else "+<phone>"); defined lower, used in incoming_message_cb
 static std::string whatsAppDisplayName(const char* alias, const char* username);
+// true if s is a bare Signal ACI UUID (8-4-4-4-12 hex); defined lower, used in incoming_message_cb
+static bool isSignalUuid(const char* s);
 static void adapterUIInit(void);
 static GHashTable* getClientInfo(void);
 static gboolean adapterInvokeIO(GIOChannel *source, GIOCondition condition, gpointer data);
@@ -2066,6 +2068,25 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 		}
 	}
 
+	// webOS Signal: contacts are opaque ACI UUIDs. presage sets a profile-name alias when it has
+	// one; when it doesn't, never surface the raw UUID -- show the alias if human, else a generic
+	// label. from.addr keeps the routable UUID.
+	if (usernameFromDisplay == NULL && serviceName == "type_signal")
+	{
+		PurpleBuddy* senderBuddy = purple_find_buddy(account, usernameFrom);
+		const char* senderAlias = senderBuddy ? purple_buddy_get_alias_only(senderBuddy) : NULL;
+		if (senderAlias && *senderAlias && !isSignalUuid(senderAlias))
+		{
+			usernameFromDisplayBuf = senderAlias;
+			usernameFromDisplay = usernameFromDisplayBuf.c_str();
+		}
+		else if (isSignalUuid(usernameFrom))
+		{
+			usernameFromDisplayBuf = "Signal user";
+			usernameFromDisplay = usernameFromDisplayBuf.c_str();
+		}
+	}
+
 	// call the transport service incoming message handler
 	// webOS Teams port: forward the libpurple message time (mtime, secs) so history/
 	// offline messages are stored with their original send time, not the arrival time.
@@ -3225,6 +3246,27 @@ static bool isBlankName(const char* s)
 
 // True if a WhatsApp buddy string is just a raw id (no human push-name): the part before '@' is
 // only digits/phone punctuation. A real push-name ("Alan", "Vladushka") has a letter there.
+// true if s is a bare Signal ACI UUID like "1594a976-5256-4fc6-b855-d23232cc5579" (8-4-4-4-12 hex).
+static bool isSignalUuid(const char* s)
+{
+	if (s == NULL)
+		return false;
+	std::string u(s);
+	if (u.size() != 36)
+		return false;
+	for (size_t i = 0; i < 36; ++i)
+	{
+		char c = u[i];
+		if (i == 8 || i == 13 || i == 18 || i == 23)
+		{
+			if (c != '-') return false;
+		}
+		else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+			return false;
+	}
+	return true;
+}
+
 static bool isWhatsAppRawId(const char* s)
 {
 	if (s == NULL || *s == '\0')
@@ -3258,7 +3300,10 @@ static std::string whatsAppDisplayName(const char* alias, const char* username)
 		local.erase(0, 1);
 	if (suffix == "@s.whatsapp.net" && !local.empty())
 		return "+" + local;
-	return local.empty() ? u : local;
+	// "@lid" (LinkedID) or any other non-phone JID: no phone number is available and the local part
+	// is an opaque identifier. Never surface that raw id to the user -- WhatsApp normally supplies a
+	// push-name (used above when alias is non-raw); when even that is missing, show a generic label.
+	return "WhatsApp user";
 }
 
 // If a WhatsApp buddy id is a phone-number JID ("<digits>@s.whatsapp.net"), return the bare digits so
