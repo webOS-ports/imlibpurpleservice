@@ -523,16 +523,16 @@ MojErr IMServiceHandler::syncFindServersResult(MojObject& payload, MojErr err)
 		}
 	}
 
-	// servers that disappeared from the roster -> delete by _id
-	for (std::map<std::string, MojString>::iterator e = existing.begin(); e != existing.end(); ++e)
-		if (incoming.find(e->first) == incoming.end())
-			MojErrCheck(delGoneServers.push(e->second));
+	// ADDITIVE/MERGE-ONLY: do NOT delete servers that are absent from this roster snapshot. The async
+	// prpls (tdlib/whatsmeow) populate the blist in waves after login, so any single enumeration is a
+	// PARTIAL view - a server missing right now is almost always still-loading, not "left". Deleting it
+	// cascaded into deleting its channels, which orphaned their chatthreads and spawned duplicate threads
+	// when the server reloaded. Left-behind servers are handled by an explicit cleanup instead.
+	(void)incoming; (void)delGoneServers;
 
 	// fire cleanup (does not gate m_syncInFlight - the put-chain does)
 	if (!mergeServers.empty())
 		m_dbClient.merge(m_syncMergeServersSlot, mergeServers.begin(), mergeServers.end());
-	if (!delGoneServers.empty())
-		m_dbClient.del(m_syncDelGoneServersSlot, delGoneServers.arrayBegin(), delGoneServers.arrayEnd());
 
 	// put new servers if any (need their _ids for channels); otherwise the server map is complete now.
 	if (!putServers.empty())
@@ -676,14 +676,14 @@ MojErr IMServiceHandler::syncFindChannelsResult(MojObject& payload, MojErr err)
 		}
 	}
 
-	for (std::map<std::string, MojString>::iterator e = existing.begin(); e != existing.end(); ++e)
-		if (incoming.find(e->first) == incoming.end())
-			MojErrCheck(delGoneChannels.push(e->second));
+	// ADDITIVE/MERGE-ONLY: do NOT delete channels absent from this (possibly partial) roster snapshot.
+	// A channel missing from one enumeration is almost always still loading (tdlib loads chats in waves),
+	// not removed. Deleting it orphaned the channel's chatthread and produced a duplicate thread when the
+	// channel reloaded - the exact recurring-duplicate bug. See the servers block above.
+	(void)incoming; (void)delGoneChannels;
 
 	if (!mergeChannels.empty())
 		m_dbClient.merge(m_syncMergeChannelsSlot, mergeChannels.begin(), mergeChannels.end());
-	if (!delGoneChannels.empty())
-		m_dbClient.del(m_syncDelGoneChannelsSlot, delGoneChannels.arrayBegin(), delGoneChannels.arrayEnd());
 
 	if (!putChannels.empty())
 	{
