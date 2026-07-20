@@ -30,6 +30,16 @@ for L in libcrypto.so.3 libssl.so.3; do
     cp -f "$W/$L" "$S/$L" 2>/dev/null
   fi
 done
+# ENTROPY: this 2.6.35 kernel has no getrandom(2) syscall, so crypto that seeds from the OS
+# (SQLCipher/OpenSSL/ring inside purple-presage) falls back to BLOCKING /dev/random. With the tiny
+# entropy pool (~130 bits) that read stalls during dlopen, so the presage plugin load HANGS and the
+# whole transport looks dead -- intermittently, depending on how much entropy exists at respawn time
+# (this is why presage "loaded at boot but crashed on a later respawn"). Point /dev/random at the
+# non-blocking /dev/urandom (cryptographically fine post-boot). /dev is a tmpfs, so re-apply each launch.
+if [ ! -L /dev/random ]; then
+  rm -f /dev/random && ln -s /dev/urandom /dev/random 2>/dev/null
+fi
+
 exec env \
   LD_PRELOAD="$B/libstdc++.so.6 $G/lib/librt.so.1" \
   LD_LIBRARY_PATH="$S:$G/lib:$B:$W:/usr/lib:/lib" \
