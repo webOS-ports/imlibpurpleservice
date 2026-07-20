@@ -24,9 +24,61 @@
  */
 
 #include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 #include "IMMessage.h"
 #include "IMServiceHandler.h"
 #include "sanitize.h"
+
+// Recover http(s) URLs that live only inside HTML tag attributes (src=/href=/alt=). sanitizeHtml
+// below strips every non-trusted tag entirely — attributes and all — so a URL present only in an
+// attribute would be destroyed. Discord's "display images" mode delivers image URLs exactly like
+// that (<img alt="URL">, <a href="URL">), which is why those images vanished. Append each unique
+// attribute-URL as plain text so it survives sanitize and the Messaging app can render/linkify it.
+// Returns a malloc'd string (caller frees) or NULL if nothing was recovered.
+static char *recoverAttributeUrls(const char *html)
+{
+	if (!html) return NULL;
+	size_t inlen = strlen(html);
+	// worst case appends one space per recovered URL plus the URL bytes; 2*inlen is a safe bound.
+	char *extras = (char *)malloc(2 * inlen + 2);
+	if (!extras) return NULL;
+	extras[0] = '\0';
+	size_t extralen = 0;
+	const char *p = html;
+	const char *marker;
+	while ((marker = strstr(p, "://")) != NULL) {
+		const char *s = marker; // walk back over the scheme letters (http/https)
+		while (s > html && isalpha((unsigned char)*(s - 1))) s--;
+		// require the scheme to sit inside an attribute value: preceded by =" or ='
+		if (s >= html + 2 && (*(s - 1) == '"' || *(s - 1) == '\'') && *(s - 2) == '=') {
+			char quote = *(s - 1);
+			const char *e = marker + 3;
+			while (*e && *e != quote && *e != '<' && *e != '>' && !isspace((unsigned char)*e)) e++;
+			size_t urllen = (size_t)(e - s);
+			if (urllen > 8 && urllen < 2048 &&
+			    (strncmp(s, "http://", 7) == 0 || strncmp(s, "https://", 8) == 0)) {
+				char tmp[2048];
+				memcpy(tmp, s, urllen);
+				tmp[urllen] = '\0';
+				if (!strstr(extras, tmp)) { // dedup (alt= and href= usually repeat the URL)
+					extras[extralen++] = ' ';
+					memcpy(extras + extralen, s, urllen);
+					extralen += urllen;
+					extras[extralen] = '\0';
+				}
+			}
+		}
+		p = marker + 3;
+	}
+	if (extralen == 0) { free(extras); return NULL; }
+	char *result = (char *)malloc(inlen + extralen + 1);
+	if (!result) { free(extras); return NULL; }
+	memcpy(result, html, inlen);
+	memcpy(result + inlen, extras, extralen + 1);
+	free(extras);
+	return result;
+}
 
 const char* IMMessage::statusStrings[] = {
 	"successful",
@@ -94,13 +146,17 @@ MojErr IMMessage::initFromCallback(const char* serviceName, const char* username
 	// message is const char* - need a char* version
 	char *unescapedMessage = unsanitizeHtml((char*)message);
 
+	// Pull URLs out of tag attributes (Discord image mode etc.) before they're sanitized away.
+	char *recoveredMessage = recoverAttributeUrls(unescapedMessage);
+	const char *toSanitize = recoveredMessage ? recoveredMessage : unescapedMessage;
+
 	// now remove offending html
 	// char * sanitizeHtml(const char *input, char **except, bool remove);
 	//     remove set to true if you want the the tags to actually be removed vs just "escaped".
 	//     except is an array of char* containing tags to ignore when sanitizing. The
 	//          last element must be a null. You need to include both beginning and ending
 	//          tag if you want both removed (i.e. "b", "/b", "i", "/i")
-	char *sanitizedMessage = sanitizeHtml(unescapedMessage, (char**)IMMessage::trustedTags, true);
+	char *sanitizedMessage = sanitizeHtml(toSanitize, (char**)IMMessage::trustedTags, true);
 
 	// can't keep this log...
 	//MojLogInfo(IMServiceApp::s_log, _T("original message: %s, unescaped message: %s, sanitized message: %s"), message, unescapedMessage, sanitizedMessage);
@@ -115,6 +171,7 @@ MojErr IMMessage::initFromCallback(const char* serviceName, const char* username
 	free(emojiSafeMessage);
 	MojErrCheck(err);
 	// cleanup
+	if (recoveredMessage) free(recoveredMessage);
 	free(unescapedMessage);
 	free(sanitizedMessage);
 
