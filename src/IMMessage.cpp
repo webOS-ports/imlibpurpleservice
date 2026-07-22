@@ -353,6 +353,14 @@ MojErr IMMessage::createDBObject(MojObject& returnObj) {
 		}
 	}
 
+	// webOS reactions: persist the prpl's own message id so a later reaction can target this row.
+	// Schemaless field; the reaction handler queries it via the serviceMessageId index. Absent when
+	// the prpl didn't stash one on the conversation, so pre-reaction behaviour is unchanged.
+	if (!serviceMessageId.empty()) {
+		err = returnObj.putString(MOJDB_SERVICE_MSG_ID, serviceMessageId);
+		MojErrCheck(err);
+	}
+
 	IMServiceHandler::privatelogIMMessage(_T("DB Message object %s:"), returnObj, MOJDB_MSG_TEXT);
 
 	return err;

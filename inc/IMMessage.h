@@ -81,6 +81,15 @@ typedef enum {
 // webOS Servers/Rooms: multi-user-chat (MUC) properties. Only written for group-chat messages
 // (Discord channels, IRC channels, ...); absent on 1:1 IMs. db8 is schemaless so these need no
 // kind change; query indexes are added in Milestone 1.
+// webOS reactions (cross-prpl): the prpl's own stable id for THIS message, stashed by the prpl on
+// the conversation ("webos-msg-id") right before serv_got_im and read in incoming_message_cb. A
+// later reaction references it (see MOJDB_REACTIONS) to attach itself to this row. Schemaless field;
+// an index (serviceName,username,serviceMessageId) is added to the kind for the reaction lookup.
+#define MOJDB_SERVICE_MSG_ID        _T("serviceMessageId")
+// Array of { emoji, sender } objects merged onto the TARGET message by the reaction handler; the
+// Messaging app renders these as inline badges instead of a separate "reacted with X" message.
+#define MOJDB_REACTIONS             _T("reactions")
+
 #define MOJDB_CHAT_TYPE             _T("chatType")     // "groupchat" for MUC messages
 #define MOJDB_CHANNEL_NAME          _T("channelName")  // stable room key (e.g. Discord channel id, Telegram chat-<id>)
 #define MOJDB_CHANNEL_DISPLAY_NAME  _T("channelDisplayName")  // human room title (e.g. Telegram group title)
@@ -141,6 +150,7 @@ private:
 	// webOS Servers/Rooms: multi-user-chat (MUC) metadata. isGroupChat gates whether the fields
 	// below (and the MUC db8 properties) are written; all empty/false for ordinary 1:1 IMs.
 	bool isGroupChat;
+	MojString serviceMessageId;  // the prpl's own id for this message (for reactions/replies to target); empty if the prpl didn't supply one
 	MojString channelName;   // stable room key (e.g. Discord channel id/name, Telegram chat-<id>)
 	MojString channelDisplayName;   // human room title (Telegram group name); channelName stays the match key
 	MojString serverId;      // parent server id (Discord guild id) - mirrors serverName until M1
