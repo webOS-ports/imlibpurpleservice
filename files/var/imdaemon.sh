@@ -8,4 +8,9 @@
 # fight each other in a ~30s churn loop that reloads every prpl (incl. purple-signal's JVM) each
 # cycle and never lets slow accounts connect. The on-demand .service path leaves it unset.
 export IM_RESIDENT=1
-exec /var/imwrap.sh -c '{"log":{"appender":{"type":"stdout"},"levels":{"imlibpurple":"debug"}}}' PalmPre Palm-Pre/1.5
+# Log at "info", not "debug": this is a RESIDENT daemon, so debug-level logging (every libpurple
+# prpl_debug_misc line - tdlib "Displaying message", HTTP request tracing, "Incoming update", ...)
+# streams continuously to imstdout.log at tens of MB/hour and fills /media/internal. "info" keeps
+# the useful operational lines (connect/login/incoming-message) and drops the prpl debug flood.
+# Bump back to "debug" temporarily when actively debugging a specific connector.
+exec /var/imwrap.sh -c '{"log":{"appender":{"type":"stdout"},"levels":{"imlibpurple":"info"}}}' PalmPre Palm-Pre/1.5
