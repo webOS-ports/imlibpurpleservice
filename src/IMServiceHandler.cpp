@@ -32,6 +32,7 @@
 #include "IMServiceHandler.h"
 #include "LibpurpleAdapter.h"
 #include "IncomingIMHandler.h"
+#include "ReactionHandler.h"
 #include "IMMessage.h"
 #include "OutgoingIMCommandHandler.h"
 #include "OnEnabledHandler.h"
@@ -945,7 +946,7 @@ MojErr IMServiceHandler::IMSendCmd(MojServiceMessage* serviceMsg, const MojObjec
  */
 bool IMServiceHandler::incomingIM(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp,
 		const char* channelName, const char* channelDisplayName, const char* serverId, const char* serverName, bool muted,
-		const char* usernameFromDisplay)
+		const char* usernameFromDisplay, const char* serviceMessageId)
 {
 
 	MojLogTrace(IMServiceApp::s_log);
@@ -964,6 +965,11 @@ bool IMServiceHandler::incomingIM(const char* serviceName, const char* username,
 	// the message but suppresses the notification banner.
 	MojErr err = imMessage->initFromCallback(serviceName, username, usernameFrom, message, timestamp, channelName, channelDisplayName, serverId, serverName, muted, usernameFromDisplay);
 
+	// webOS reactions: remember the prpl's own id for this message so a later reaction can target it.
+	if (!err && serviceMessageId != NULL && *serviceMessageId != '\0') {
+		err = imMessage->setServiceMessageId(serviceMessageId);
+	}
+
 	if (!err) {
 		// handle the message
 		MojRefCountedPtr<IncomingIMHandler> incomingIMHandler(new IncomingIMHandler(m_service, this));
@@ -976,6 +982,29 @@ bool IMServiceHandler::incomingIM(const char* serviceName, const char* username,
 		return false;
 	}
 
+	return true;
+}
+
+/*
+ * webOS reactions: a reaction arrived for the message identified by targetServiceMessageId. Spin up
+ * a ReactionHandler to find that message row (by serviceMessageId) and merge the sender's reaction
+ * onto it. Mirrors incomingIM's async-handler pattern; self-retained via the handler's DB slots.
+ */
+bool IMServiceHandler::handleReaction(const char* serviceName, const char* username, const char* targetServiceMessageId,
+		const char* emoji, const char* sender)
+{
+	MojLogInfo(IMServiceApp::s_log, _T("handleReaction: service %s target %s emoji '%s' sender %s"),
+			serviceName ? serviceName : "", targetServiceMessageId ? targetServiceMessageId : "",
+			emoji ? emoji : "", sender ? sender : "");
+
+	MojRefCountedPtr<ReactionHandler> reactionHandler(new ReactionHandler(m_service, this));
+	MojErr err = reactionHandler->handleReaction(serviceName, username, targetServiceMessageId, emoji, sender);
+	if (err) {
+		MojString error;
+		MojErrToString(err, error);
+		MojLogError(IMServiceApp::s_log, _T("handleReaction failed: %d - %s"), err, error.data());
+		return false;
+	}
 	return true;
 }
 

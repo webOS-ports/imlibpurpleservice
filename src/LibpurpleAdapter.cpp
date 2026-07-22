@@ -163,6 +163,8 @@ struct AccountMetaData
 };
 
 static void incoming_message_cb(PurpleConversation *conv, const char *who, const char *alias, const char *message,	PurpleMessageFlags flags, time_t mtime);
+// webOS reactions: handler for the "webos-im-reaction" signal a prpl emits; routes to the DB reaction merge.
+static void im_reaction_cb(PurpleAccount* account, const char* targetServiceMessageId, const char* emoji, const char* sender, void* data);
 static std::string getServiceNameFromPurpleAccount(PurpleAccount* account);
 // human-friendly WhatsApp display name (push-name, else "+<phone>"); defined lower, used in incoming_message_cb
 static std::string whatsAppDisplayName(const char* alias, const char* username);
@@ -2110,8 +2112,39 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 	// JID, so only the STORED addresses change here. Held in locals so the c_str()s outlive the call.
 	std::string ownerWebos = getWebosUsername(account->username, serviceName);
 	std::string senderWebos = getWebosUsername(usernameFromStripped.c_str(), serviceName);
+
+	// webOS reactions: the prpl stashes its own id for THIS message on the conversation right before
+	// serv_got_im (which synchronously drives us here). Read it so incomingIM can persist it as
+	// serviceMessageId, then free + clear it (the prpl g_strdup'd it; this handoff owns the free).
+	char* svcMsgId = (char*) purple_conversation_get_data(conv, "webos-msg-id");
+
 	s_imServiceHandler->incomingIM(serviceName.c_str(), ownerWebos.c_str(), senderWebos.c_str(),
-			message, mtime, channelName, channelDisplayName, serverName, serverName, muted, usernameFromDisplay);
+			message, mtime, channelName, channelDisplayName, serverName, serverName, muted, usernameFromDisplay, svcMsgId);
+
+	if (svcMsgId != NULL) {
+		g_free(svcMsgId);
+		purple_conversation_set_data(conv, "webos-msg-id", NULL);
+	}
+}
+
+/*
+ * webOS reactions (cross-prpl): a prpl emitted "webos-im-reaction" for a message it identifies by
+ * targetServiceMessageId. Resolve the owning account + reacting sender to webOS usernames and hand
+ * off to IMServiceHandler, which merges the reaction onto the target message row (ReactionHandler).
+ * emoji=="" (or NULL) means the sender removed their reaction. sender may be NULL/empty for a 1:1
+ * chat (the reactor is the peer); a group reaction carries the member id.
+ */
+static void im_reaction_cb(PurpleAccount* account, const char* targetServiceMessageId, const char* emoji, const char* sender, void* data)
+{
+	if (account == NULL || targetServiceMessageId == NULL || *targetServiceMessageId == '\0' || s_imServiceHandler == NULL)
+		return;
+
+	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
+	std::string ownerWebos  = getWebosUsername(account->username, serviceName);
+	std::string senderWebos = (sender != NULL && *sender != '\0') ? getWebosUsername(sender, serviceName) : std::string();
+
+	s_imServiceHandler->handleReaction(serviceName.c_str(), ownerWebos.c_str(), targetServiceMessageId,
+			emoji ? emoji : "", senderWebos.c_str());
 }
 
 /*
@@ -4061,6 +4094,27 @@ void LibpurpleAdapter::assignIMLoginState(LoginCallbackInterface* loginState)
 	{
 		MojLogInfo(IMServiceApp::s_log, _T("Connecting new signals."));
 		s_registeredForAccountSignals = TRUE;
+
+		// webOS reactions (cross-prpl): register the "webos-im-reaction" signal ONCE for the process.
+		// Any prpl emits it on purple_conversations_get_handle() when a reaction arrives, carrying
+		// (account, targetServiceMessageId, emoji, sender). We attach the reaction to the target
+		// message row (ReactionHandler) instead of storing a "reacted with X" message.
+		static bool s_reactionSignalRegistered = false;
+		if (!s_reactionSignalRegistered)
+		{
+			s_reactionSignalRegistered = true;
+			void* convHandle = purple_conversations_get_handle();
+			purple_signal_register(convHandle, "webos-im-reaction",
+					purple_marshal_VOID__POINTER_POINTER_POINTER_POINTER, NULL, 4,
+					purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+					purple_value_new(PURPLE_TYPE_STRING),
+					purple_value_new(PURPLE_TYPE_STRING),
+					purple_value_new(PURPLE_TYPE_STRING));
+			purple_signal_connect(convHandle, "webos-im-reaction", &handle,
+					PURPLE_CALLBACK(im_reaction_cb), NULL);
+			MojLogInfo(IMServiceApp::s_log, _T("registered webos-im-reaction signal"));
+		}
+
 		/*
 		 * Listen for a number of different signals:
 		 */

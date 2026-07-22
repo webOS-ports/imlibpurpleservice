@@ -55,7 +55,9 @@ public:
 	// messages (Discord channels etc.), NULL for 1:1 IMs.
 	virtual bool incomingIM(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp = 0,
 			const char* channelName = NULL, const char* channelDisplayName = NULL, const char* serverId = NULL, const char* serverName = NULL, bool muted = false,
-			const char* usernameFromDisplay = NULL);
+			const char* usernameFromDisplay = NULL, const char* serviceMessageId = NULL);
+	virtual bool handleReaction(const char* serviceName, const char* username, const char* targetServiceMessageId,
+			const char* emoji, const char* sender);
 	virtual bool updateBuddyStatus(const char* accountId, const char* serviceName, const char* username, int availability,
 			const char* customMessage, const char* groupName, const char* buddyAvatarLoc);
 	// Perf (#2): batched presence for one account (see IMServiceCallbackInterface / BuddyStatusHandler).

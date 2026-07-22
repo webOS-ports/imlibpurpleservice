@@ -87,7 +87,12 @@ public:
 	// from.addr stays the id; NULL for 1:1 IMs and where usernameFrom is already the display name (Discord).
 	virtual bool incomingIM(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp = 0,
 				const char* channelName = NULL, const char* channelDisplayName = NULL, const char* serverId = NULL, const char* serverName = NULL, bool muted = false,
-				const char* usernameFromDisplay = NULL) = 0;
+				const char* usernameFromDisplay = NULL, const char* serviceMessageId = NULL) = 0;
+	// webOS reactions: `sender` reacted (emoji, or "" to remove) to the message the prpl identifies by
+	// `targetServiceMessageId`. Attaches to that message's `reactions` array (see ReactionHandler)
+	// rather than storing a new message. Cross-prpl: driven by the "webos-im-reaction" signal.
+	virtual bool handleReaction(const char* serviceName, const char* username, const char* targetServiceMessageId,
+				const char* emoji, const char* sender) = 0;
 	virtual bool updateBuddyStatus(const char* accountId, const char* serviceName, const char* username, int availability,
 				const char* customMessage, const char* groupName, const char* buddyAvatarLoc) = 0;
 	// Perf (#2): batched presence for one account - `updates` is an array of { username, availability,

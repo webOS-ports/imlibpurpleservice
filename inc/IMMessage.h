@@ -127,6 +127,9 @@ public:
 	MojErr createDBObject(MojObject& returnObject);
 	MojErr unformatFromAddress(const MojString formattedScreenName, MojString& unformattedName);
 
+	// webOS reactions: set the prpl's own id for this message (persisted so a later reaction targets it).
+	MojErr setServiceMessageId(const char* id) { return serviceMessageId.assign(id ? id : ""); }
+
 private:
 	MojString msgText;
 	MojString fromAddress;
