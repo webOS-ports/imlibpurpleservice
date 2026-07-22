@@ -2262,8 +2262,12 @@ static void initializeLibpurple()
 	/* Set a custom user directory (optional) */
 	purple_util_set_user_dir(CUSTOM_USER_DIRECTORY);
 
-	/* We do not want any debugging for now to keep the noise to a minimum. */
-	purple_debug_set_enabled(TRUE);
+	/* libpurple prpl debug (prpl_debug_misc: tdlib "Displaying message", HTTP request tracing,
+	 * "Incoming update", ...) is a huge, continuous drain on this RESIDENT daemon - it fills
+	 * /media/internal/imstdout.log at tens of MB/hour. It is NOT gated by the PmLog level, so
+	 * gate it here: OFF by default, ON only when IM_PURPLE_DEBUG is set in the environment
+	 * (see /var/imdaemon.sh). Flip it on when actively debugging a specific connector. */
+	purple_debug_set_enabled(getenv("IM_PURPLE_DEBUG") != NULL);
 
 	/* Set the core-uiops, which is used to
 	 * 	- initialize the ui specific preferences.

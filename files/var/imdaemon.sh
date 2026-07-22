@@ -12,5 +12,6 @@ export IM_RESIDENT=1
 # prpl_debug_misc line - tdlib "Displaying message", HTTP request tracing, "Incoming update", ...)
 # streams continuously to imstdout.log at tens of MB/hour and fills /media/internal. "info" keeps
 # the useful operational lines (connect/login/incoming-message) and drops the prpl debug flood.
-# Bump back to "debug" temporarily when actively debugging a specific connector.
+# Bump back to "debug" temporarily when actively debugging a specific connector; to also get the
+# libpurple prpl debug (tdlib "Displaying message", HTTP tracing, ...) add: export IM_PURPLE_DEBUG=1
 exec /var/imwrap.sh -c '{"log":{"appender":{"type":"stdout"},"levels":{"imlibpurple":"info"}}}' PalmPre Palm-Pre/1.5
