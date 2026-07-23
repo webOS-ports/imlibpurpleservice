@@ -165,6 +165,7 @@ struct AccountMetaData
 static void incoming_message_cb(PurpleConversation *conv, const char *who, const char *alias, const char *message,	PurpleMessageFlags flags, time_t mtime);
 // webOS reactions: handler for the "webos-im-reaction" signal a prpl emits; routes to the DB reaction merge.
 static void im_reaction_cb(PurpleAccount* account, const char* targetServiceMessageId, const char* emoji, const char* sender, void* data);
+static void im_reaction_set_cb(PurpleAccount* account, const char* targetServiceMessageId, const char* serialized, const char* unused, void* data);
 static std::string getServiceNameFromPurpleAccount(PurpleAccount* account);
 // human-friendly WhatsApp display name (push-name, else "+<phone>"); defined lower, used in incoming_message_cb
 static std::string whatsAppDisplayName(const char* alias, const char* username);
@@ -1952,7 +1953,37 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 
 	if ((flags & PURPLE_MESSAGE_RECV) != PURPLE_MESSAGE_RECV)
 	{
-		/* this is a sent message. ignore it. */
+		// A message WE sent. A plain local echo (app-initiated send) is already persisted by
+		// OutgoingIMHandler, so ignore it. But a carbon of a message we sent from ANOTHER client
+		// (PURPLE_MESSAGE_REMOTE_SEND - e.g. the Telegram/Signal/WhatsApp phone app) has no local
+		// row, so store it as an Outbox message so it shows on the sent side of the thread (and a
+		// reaction can attach to it). 1:1 only for now - group carbons need sender attribution.
+		if ((flags & PURPLE_MESSAGE_REMOTE_SEND) && s_imServiceHandler != NULL &&
+		    purple_conversation_get_type(conv) == PURPLE_CONV_TYPE_IM)
+		{
+			PurpleAccount* sentAccount = purple_conversation_get_account(conv);
+			if (sentAccount != NULL)
+			{
+				std::string const& sentService = getServiceNameFromPurpleAccount(sentAccount);
+				const char* peer = purple_conversation_get_name(conv); // the recipient (1:1 peer)
+				if (peer != NULL && *peer != '\0')
+				{
+					std::string ownerWebos = getWebosUsername(sentAccount->username, sentService);
+					std::string peerStripped = stripResourceFromJabberUsername(peer, sentService);
+					std::string peerWebos = getWebosUsername(peerStripped.c_str(), sentService);
+					// serviceMessageId the prpl stashed on the conv right before this write (its own id).
+					char* svcMsgId = (char*) purple_conversation_get_data(conv, "webos-msg-id");
+					s_imServiceHandler->incomingIM(sentService.c_str(), ownerWebos.c_str(), peerWebos.c_str(),
+							message, mtime, NULL, NULL, NULL, NULL, false, NULL,
+							(svcMsgId && *svcMsgId) ? svcMsgId : NULL, /* outgoing */ true);
+					if (svcMsgId != NULL)
+					{
+						g_free(svcMsgId);
+						purple_conversation_set_data(conv, "webos-msg-id", NULL);
+					}
+				}
+			}
+		}
 		return;
 	}
 
@@ -2145,6 +2176,24 @@ static void im_reaction_cb(PurpleAccount* account, const char* targetServiceMess
 
 	s_imServiceHandler->handleReaction(serviceName.c_str(), ownerWebos.c_str(), targetServiceMessageId,
 			emoji ? emoji : "", senderWebos.c_str());
+}
+
+/*
+ * webOS reactions (aggregated/REPLACE): a prpl emitted "webos-im-reaction-set" carrying the whole
+ * reaction summary for one message (serialized as "count<SP>emoji" records separated by '\n'). Used
+ * by prpls that only expose aggregated counts (Telegram). Resolve the owning account and REPLACE the
+ * target message's reactions with this set (an empty `serialized` clears them all).
+ */
+static void im_reaction_set_cb(PurpleAccount* account, const char* targetServiceMessageId, const char* serialized, const char* unused, void* data)
+{
+	if (account == NULL || targetServiceMessageId == NULL || *targetServiceMessageId == '\0' || s_imServiceHandler == NULL)
+		return;
+
+	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
+	std::string ownerWebos = getWebosUsername(account->username, serviceName);
+
+	s_imServiceHandler->handleReactionSet(serviceName.c_str(), ownerWebos.c_str(), targetServiceMessageId,
+			serialized ? serialized : "");
 }
 
 /*

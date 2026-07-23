@@ -946,7 +946,7 @@ MojErr IMServiceHandler::IMSendCmd(MojServiceMessage* serviceMsg, const MojObjec
  */
 bool IMServiceHandler::incomingIM(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp,
 		const char* channelName, const char* channelDisplayName, const char* serverId, const char* serverName, bool muted,
-		const char* usernameFromDisplay, const char* serviceMessageId)
+		const char* usernameFromDisplay, const char* serviceMessageId, bool outgoing)
 {
 
 	MojLogTrace(IMServiceApp::s_log);
@@ -963,7 +963,7 @@ bool IMServiceHandler::incomingIM(const char* serviceName, const char* username,
 	// set the message fields based on the incoming parameters. muted (chat muted on the server
 	// side, e.g. a muted Telegram chat) becomes flags.noNotification so the Messaging app stores
 	// the message but suppresses the notification banner.
-	MojErr err = imMessage->initFromCallback(serviceName, username, usernameFrom, message, timestamp, channelName, channelDisplayName, serverId, serverName, muted, usernameFromDisplay);
+	MojErr err = imMessage->initFromCallback(serviceName, username, usernameFrom, message, timestamp, channelName, channelDisplayName, serverId, serverName, muted, usernameFromDisplay, outgoing);
 
 	// webOS reactions: remember the prpl's own id for this message so a later reaction can target it.
 	if (!err && serviceMessageId != NULL && *serviceMessageId != '\0') {
@@ -1003,6 +1003,28 @@ bool IMServiceHandler::handleReaction(const char* serviceName, const char* usern
 		MojString error;
 		MojErrToString(err, error);
 		MojLogError(IMServiceApp::s_log, _T("handleReaction failed: %d - %s"), err, error.data());
+		return false;
+	}
+	return true;
+}
+
+/*
+ * webOS reactions (aggregated/REPLACE): a prpl reported the whole reaction summary for one message
+ * (Telegram's updateMessageInteractionInfo). Spin up a ReactionHandler to REPLACE the target row's
+ * reactions with the parsed {emoji,count} set.
+ */
+bool IMServiceHandler::handleReactionSet(const char* serviceName, const char* username, const char* targetServiceMessageId,
+		const char* serialized)
+{
+	MojLogInfo(IMServiceApp::s_log, _T("handleReactionSet: service %s target %s"),
+			serviceName ? serviceName : "", targetServiceMessageId ? targetServiceMessageId : "");
+
+	MojRefCountedPtr<ReactionHandler> reactionHandler(new ReactionHandler(m_service, this));
+	MojErr err = reactionHandler->handleReactionSet(serviceName, username, targetServiceMessageId, serialized);
+	if (err) {
+		MojString error;
+		MojErrToString(err, error);
+		MojLogError(IMServiceApp::s_log, _T("handleReactionSet failed: %d - %s"), err, error.data());
 		return false;
 	}
 	return true;

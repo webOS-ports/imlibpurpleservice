@@ -30,6 +30,13 @@ public:
 	MojErr handleReaction(const char* serviceName, const char* username, const char* targetId,
 			const char* emoji, const char* sender);
 
+	// Aggregated (REPLACE) path, for prpls that expose the whole reaction summary at once rather than
+	// per-sender events (e.g. Telegram's updateMessageInteractionInfo). `serialized` is a list of
+	// "count<SP>emoji" records separated by '\n'; the target row's `reactions` array is REPLACED with
+	// {emoji,count} entries (an empty/whitespace `serialized` clears all reactions).
+	MojErr handleReactionSet(const char* serviceName, const char* username, const char* targetId,
+			const char* serialized);
+
 private:
 	MojDbClient::Signal::Slot<ReactionHandler> m_findSlot;
 	MojErr findResult(MojObject& result, MojErr err);
@@ -42,6 +49,11 @@ private:
 	MojString m_targetId;
 	MojString m_emoji;
 	MojString m_sender;
+
+	// REPLACE mode: when true, findResult swaps the row's reactions for m_setReactions wholesale
+	// instead of the per-sender merge. Set by handleReactionSet.
+	bool m_replace;
+	MojObject m_setReactions;
 
 	MojService* m_service;
 	IMServiceApp::Listener* m_listener;

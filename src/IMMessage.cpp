@@ -128,7 +128,7 @@ IMMessage::~IMMessage() {
  */
 MojErr IMMessage::initFromCallback(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp,
 		const char* channelName, const char* channelDisplayName, const char* serverId, const char* serverName, bool muted,
-		const char* usernameFromDisplay) {
+		const char* usernameFromDisplay, bool outgoing) {
 
 	// Remember whether the source conversation is muted; createDBObject turns this into
 	// flags.noNotification so the Messaging app stores the message but skips the banner.
@@ -197,6 +197,18 @@ MojErr IMMessage::initFromCallback(const char* serviceName, const char* username
 
 	err = toAddress.assign(username);
 	MojErrCheck(err);
+
+	// Outgoing carbon (a message we sent from another client): the parties are reversed - we are the
+	// sender and usernameFrom is really the recipient. Swap so from = self, to = peer, and file it in
+	// the Outbox. fromDisplayName (a sender-name label) is meaningless for our own messages -> clear it.
+	if (outgoing) {
+		MojString peer = fromAddress;   // usernameFrom, unformatted above -> the recipient
+		fromAddress = toAddress;        // self (account username)
+		toAddress = peer;
+		fromDisplayName.clear();
+		folder = Outbox;
+	}
+
 	err = msgType.assign(serviceName);
 	MojErrCheck(err);
 
@@ -302,8 +314,10 @@ MojErr IMMessage::createDBObject(MojObject& returnObj) {
 	err = returnObj.putString(MOJDB_MSG_TEXT, msgText);
 	MojErrCheck(err);
 
-	// username - since this is incoming message, the username is always in toAddress
-	err = returnObj.putString(MOJDB_USERNAME, toAddress);
+	// username = the account owner (self). For an incoming message that's the recipient (toAddress);
+	// for an outgoing carbon we are the sender, so it's fromAddress. Getting this right keeps the
+	// message scoped to the correct account and threaded into the right conversation.
+	err = returnObj.putString(MOJDB_USERNAME, folder == Outbox ? fromAddress : toAddress);
 	MojErrCheck(err);
 
 	// service name

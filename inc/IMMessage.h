@@ -121,9 +121,12 @@ public:
 
 	// webOS Servers/Rooms: channelName/serverId/serverName describe a multi-user-chat (MUC)
 	// message's room + parent server; NULL for ordinary 1:1 IMs.
+	// `outgoing` = this is a carbon of a message WE sent from another client (Telegram/Signal/WhatsApp
+	// phone app etc.). Then from = self (username), to = the peer (usernameFrom) and folder = Outbox,
+	// so it shows on the sent side of the thread. Default false = an ordinary received (inbox) message.
 	MojErr initFromCallback(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp = 0,
 			const char* channelName = NULL, const char* channelDisplayName = NULL, const char* serverId = NULL, const char* serverName = NULL, bool muted = false,
-			const char* usernameFromDisplay = NULL);
+			const char* usernameFromDisplay = NULL, bool outgoing = false);
 	MojErr createDBObject(MojObject& returnObject);
 	MojErr unformatFromAddress(const MojString formattedScreenName, MojString& unformattedName);
 
