@@ -2721,18 +2721,22 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
          * user's phone; use the longer grace period so we don't tear the account down
          * mid-handshake. Telegram is likewise interactive: the user must type the login
          * code AND (if enabled) a 2FA password into the "Telegram" auth chat, which
-         * easily exceeds the normal 45s. Facebook is likewise interactive when the
-         * account has two-factor enabled: the prpl raises a login-code challenge and
-         * the user types the code into the "facebook" auth chat. Give all three the
-         * longer grace period; otherwise the 45s connect timeout fires mid-challenge
-         * and drives a retry loop that re-issues auth.login (a fresh machine_id each
-         * time) before the code can be entered. Other protocols keep the normal
-         * timeout. */
+         * easily exceeds the normal 45s. Facebook (E2EE, prpl-gometa) is likewise
+         * interactive when the account has two-factor enabled: messagix selects the
+         * "Notification on another device" (approve-from-another-device) method and then
+         * polls, waiting for the user to approve the login on their phone — which easily
+         * exceeds 45s. Give all these the longer grace period; otherwise the 45s connect
+         * timeout fires mid-approval, force-disconnects the healthy login (the in-flight
+         * poll then fails with "context canceled") and the account manager records it as
+         * AcctMgr_Bad_Authentication — i.e. the user sees "wrong username and password"
+         * even though the credentials were fine. Other protocols keep the normal timeout.
+         * (Note: the retired plain purple-facebook was "prpl-facebook"; the current E2EE
+         * plugin registers as "prpl-gometa".) */
         const char* protoId = purple_account_get_protocol_id(account);
         bool interactiveAuth = (protoId != NULL &&
                                 (strcmp(protoId, "prpl-discord") == 0 ||
                                  strcmp(protoId, "prpl-telegram") == 0 ||
-                                 strcmp(protoId, "prpl-facebook") == 0 ||
+                                 strcmp(protoId, "prpl-gometa") == 0 ||
                                  strcmp(protoId, "prpl-hehoe-presage") == 0));
         guint connectTimeout = interactiveAuth ? QR_CONNECT_TIMEOUT_SECONDS : CONNECT_TIMEOUT_SECONDS;
         guint timerHandle = purple_timeout_add_seconds(connectTimeout, connectTimeoutCallback, new std::string(accountKey));
@@ -4112,7 +4116,19 @@ void LibpurpleAdapter::assignIMLoginState(LoginCallbackInterface* loginState)
 					purple_value_new(PURPLE_TYPE_STRING));
 			purple_signal_connect(convHandle, "webos-im-reaction", &handle,
 					PURPLE_CALLBACK(im_reaction_cb), NULL);
-			MojLogInfo(IMServiceApp::s_log, _T("registered webos-im-reaction signal"));
+
+			// webOS reactions (aggregated/REPLACE): a prpl that exposes the whole reaction summary at
+			// once (Telegram) emits this instead, carrying (account, targetServiceMessageId, serialized,
+			// NULL). ReactionHandler REPLACES the row's reactions with the parsed {emoji,count} set.
+			purple_signal_register(convHandle, "webos-im-reaction-set",
+					purple_marshal_VOID__POINTER_POINTER_POINTER_POINTER, NULL, 4,
+					purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+					purple_value_new(PURPLE_TYPE_STRING),
+					purple_value_new(PURPLE_TYPE_STRING),
+					purple_value_new(PURPLE_TYPE_STRING));
+			purple_signal_connect(convHandle, "webos-im-reaction-set", &handle,
+					PURPLE_CALLBACK(im_reaction_set_cb), NULL);
+			MojLogInfo(IMServiceApp::s_log, _T("registered webos-im-reaction + webos-im-reaction-set signals"));
 		}
 
 		/*
