@@ -5,6 +5,7 @@
 #include "IMMessage.h"          // PALM_DB_IMMESSAGE_KIND, MOJDB_* field names
 #include "db/MojDbQuery.h"
 #include "IMServiceApp.h"
+#include "sanitize.h"           // encodeAstralEntities - same emoji-safe encoding as message text
 
 ReactionHandler::ReactionHandler(MojService* service, IMServiceApp::Listener* listener)
 : m_findSlot(this, &ReactionHandler::findResult),
@@ -30,7 +31,15 @@ MojErr ReactionHandler::handleReaction(const char* serviceName, const char* user
 	err = m_serviceName.assign(serviceName);          MojErrCheck(err);
 	err = m_username.assign(username);                MojErrCheck(err);
 	err = m_targetId.assign(targetId);                MojErrCheck(err);
-	err = m_emoji.assign(emoji ? emoji : "");         MojErrCheck(err);
+	// Encode the emoji the SAME way message text is (astral code points -> &#NNNNN; entities) so it
+	// survives the LS2/JS bridge to the app and emojify() renders it as an inline image. Without this
+	// a BMP emoji (❤️) survives raw but astral ones (😂👍) get mangled and show as tofu squares.
+	{
+		char *safeEmoji = encodeAstralEntities(emoji ? emoji : "");
+		err = m_emoji.assign(safeEmoji ? safeEmoji : "");
+		free(safeEmoji);
+		MojErrCheck(err);
+	}
 	err = m_sender.assign(sender ? sender : "");      MojErrCheck(err);
 
 	MojLogInfo(IMServiceApp::s_log, _T("ReactionHandler: %s reaction '%s' from '%s' on message %s (%s)"),
