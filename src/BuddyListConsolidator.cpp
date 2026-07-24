@@ -352,13 +352,14 @@ bool ContactConsolidationHelper::hasChanges(MojObject& oldContact, MojObject& ne
 		if (oldAvatar != newAvatar)
 		{
 			hasChanges = true;
-			MojObject newPhotos;
+			MojObject newPhotos(MojObject::TypeArray);
 			if (oldAvatar.length() > 1 && newAvatar.empty())
 			{
-				// To remove the photo, set the photos array to contain an empty object
-				// TODO: verify with contacts guys
-				MojObject emptyObject;
-				newPhotos.push(emptyObject);
+				// Remove the photo: leave the photos array EMPTY ([]). The old code pushed an
+				// empty {} object, writing photos:[{}] -- which fails com.palm.contact:1 schema
+				// validation ("required property not found - 'localPath' for property 'photos'"),
+				// spamming mojodb warnings and crashing the contacts.linker node (PJSON
+				// "Trying to access 0 as a number"). An empty array cleanly clears the photo.
 				MojLogInfo(IMServiceApp::s_log, _T("This new contact %s has no photo. Removing path."), newDisplayName.data());
 			}
 			else
