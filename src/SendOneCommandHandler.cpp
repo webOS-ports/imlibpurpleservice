@@ -131,6 +131,9 @@ MojErr SendOneCommandHandler::doSend(const MojObject imCmd) {
 	else if (0 == command.compare(_T("sendBuddyInvite"))) {
 		retVal = inviteBuddy(imCmd);
 	}
+	else if (0 == command.compare(_T("sendReaction"))) {
+		retVal = sendReaction(imCmd);
+	}
 	else if (0 == command.compare(_T("receivedBuddyInvite"))) {
 		retVal = receivedBuddyInvite(imCmd);
 	}
@@ -176,6 +179,13 @@ MojErr SendOneCommandHandler::doSend(const MojObject imCmd) {
 		MojLogError(IMServiceApp::s_log, _T("doSend: command failed"));
 		m_outgoingIMHandler->messageFinished();
 
+	}
+	else if (0 == command.compare(_T("sendReaction"))) {
+		// sendReaction completes SYNCHRONOUSLY (unlike the buddy verbs, which call messageFinished from
+		// their own async DB callbacks). Without this, messageFinished() is never reached on success, so
+		// the OutgoingIMHandler queue never advances and completeActivityManagerActivity(restart) never
+		// re-arms the pending-command watch - only ONE command would ever process per transport lifetime.
+		m_outgoingIMHandler->messageFinished();
 	}
 
 	return MojErrNone;
@@ -237,6 +247,27 @@ MojErr SendOneCommandHandler::imSaveCommandResult(MojObject& result, MojErr save
      }
  * }
  */
+/*
+ * webOS reactions (SEND): transmit a reaction the user placed from the device. params carry the
+ * target message's serviceMessageId and the emoji ("" = remove). m_username = our account, m_buddyName
+ * = the conversation peer (set in doSend).
+ */
+LibpurpleAdapter::SendResult SendOneCommandHandler::sendReaction(const MojObject imCmd) {
+	MojObject params;
+	imCmd.get(MOJDB_PARAMS, params);
+	IMServiceHandler::logMojObjectJsonString(_T("sendReaction params: %s"), params);
+
+	MojString targetId, emoji;
+	bool found = false;
+	params.get(XPORT_TARGET_MSG_ID, targetId, found);
+	params.get(XPORT_EMOJI, emoji, found);   // the emoji being added or removed (always supplied)
+	bool remove = false;
+	params.get(XPORT_REMOVE, remove); // true => remove my `emoji` reaction, else add it
+
+	return LibpurpleAdapter::sendReaction(m_serviceName.data(), m_username.data(), m_buddyName.data(),
+			targetId.data(), emoji.data(), remove);
+}
+
 LibpurpleAdapter::SendResult SendOneCommandHandler::blockBuddy(const MojObject imCmd) {
 
 	// params

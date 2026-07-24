@@ -60,6 +60,8 @@ public:
 			const char* emoji, const char* sender);
 	virtual bool handleReactionSet(const char* serviceName, const char* username, const char* targetServiceMessageId,
 			const char* serialized);
+	virtual bool handleOutboxId(const char* serviceName, const char* username, const char* serviceMessageId,
+			const char* text);
 	virtual bool updateBuddyStatus(const char* accountId, const char* serviceName, const char* username, int availability,
 			const char* customMessage, const char* groupName, const char* buddyAvatarLoc);
 	// Perf (#2): batched presence for one account (see IMServiceCallbackInterface / BuddyStatusHandler).

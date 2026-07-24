@@ -70,6 +70,7 @@
 //#include <lunaservice.h>
 //#include <json_utils.h>
 #include "IMServiceApp.h"
+#include "entities.h"       // decode_html_entities_utf8 - decode the app's &#NNNNN; emoji to UTF-8 for sendReaction
 
 
 static const guint PURPLE_GLIB_READ_COND  = (G_IO_IN | G_IO_HUP | G_IO_ERR);
@@ -165,6 +166,11 @@ struct AccountMetaData
 static void incoming_message_cb(PurpleConversation *conv, const char *who, const char *alias, const char *message,	PurpleMessageFlags flags, time_t mtime);
 // webOS reactions: handler for the "webos-im-reaction" signal a prpl emits; routes to the DB reaction merge.
 static void im_reaction_cb(PurpleAccount* account, const char* targetServiceMessageId, const char* emoji, const char* sender, void* data);
+// webOS: handler for "webos-im-outbox-id" - attaches a network id to the user's own app-sent message row.
+static void im_outbox_id_cb(PurpleAccount* account, const char* serviceMessageId, const char* text, void* data);
+// webOS: register+connect all cross-prpl reaction signals ONCE, early (from initializeLibpurple), before
+// any prpl logs in - so instant-reconnect prpls (whatsmeow) don't race the registration.
+static void registerWebosReactionSignals();
 static void im_reaction_set_cb(PurpleAccount* account, const char* targetServiceMessageId, const char* serialized, const char* unused, void* data);
 static std::string getServiceNameFromPurpleAccount(PurpleAccount* account);
 // human-friendly WhatsApp display name (push-name, else "+<phone>"); defined lower, used in incoming_message_cb
@@ -503,13 +509,16 @@ static std::string stripResourceFromJabberUsername(std::string const& username, 
  */
 static std::string getPrplProtocolIdFromServiceName(std::string const& serviceName)
 {
-	// webOS Teams port: the personal (Teams-for-Life) libpurple plugin registers
-	// as "prpl-teams-personal", which the generic "prpl-" + <type> transform below
-	// cannot derive from the "type_teams" service name. Map it explicitly so
-	// purple_account_new() finds the loaded prpl. Keep the service name "type_teams"
-	// (baked into db8 kinds / capability ids) decoupled from the plugin id.
+	// webOS Teams port: purple-teams (EionRobb) registers its OWN upstream protocol id, which the
+	// generic "prpl-" + <type> transform below cannot derive from the "type_teams" service name. Prefer
+	// the plugin's NATIVE personal-build id ("prpl-eionrobb-msteams-personal") so the plugin can be
+	// built STOCK from upstream with no webOS-specific id patch (-DTEAMS_PERSONAL_PLUGIN_ID); fall back
+	// to the legacy "prpl-teams-personal" that older webOS builds forced, so either plugin build works.
+	// The service name "type_teams" (baked into db8 kinds / capability ids) stays decoupled either way.
 	if (serviceName == "type_teams")
 	{
+		if (purple_find_prpl("prpl-eionrobb-msteams-personal") != NULL)
+			return "prpl-eionrobb-msteams-personal";
 		return "prpl-teams-personal";
 	}
 	// Signal maps to hoehermann/purple-presage (prpl-hehoe-presage) — the native Rust
@@ -541,7 +550,8 @@ static std::string getPrplProtocolIdFromServiceName(std::string const& serviceNa
 static std::string getServiceNameFromPrplProtocolId(const char* prplProtocolId)
 {
 	std::string prpl = prplProtocolId ? prplProtocolId : "";
-	if (prpl == "prpl-teams-personal")
+	// Accept BOTH the native upstream id and the legacy webOS-forced id (see the forward map above).
+	if (prpl == "prpl-teams-personal" || prpl == "prpl-eionrobb-msteams-personal")
 		return "type_teams";
 	if (prpl == "prpl-hehoe-presage")
 		return "type_signal";
@@ -2179,6 +2189,24 @@ static void im_reaction_cb(PurpleAccount* account, const char* targetServiceMess
 }
 
 /*
+ * webOS: a prpl emitted "webos-im-outbox-id" carrying the network id (serviceMessageId) it assigned to
+ * a message the user sent FROM THE APP, plus the sent text as a correlation hint. Resolve the owning
+ * account and hand off to IMServiceHandler, which finds the matching Outbox row and stores the id so a
+ * reaction can later attach to the user's own sent message.
+ */
+static void im_outbox_id_cb(PurpleAccount* account, const char* serviceMessageId, const char* text, void* data)
+{
+	if (account == NULL || serviceMessageId == NULL || *serviceMessageId == '\0' || s_imServiceHandler == NULL)
+		return;
+
+	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
+	std::string ownerWebos = getWebosUsername(account->username, serviceName);
+
+	s_imServiceHandler->handleOutboxId(serviceName.c_str(), ownerWebos.c_str(), serviceMessageId,
+			text ? text : "");
+}
+
+/*
  * webOS reactions (aggregated/REPLACE): a prpl emitted "webos-im-reaction-set" carrying the whole
  * reaction summary for one message (serialized as "count<SP>emoji" records separated by '\n'). Used
  * by prpls that only expose aggregated counts (Telegram). Resolve the owning account and REPLACE the
@@ -2367,6 +2395,11 @@ static void initializeLibpurple()
 		MojLogInfo(IMServiceApp::s_log, _T("libpurple initialization failed."));
 		abort();
 	}
+
+	// Register the webOS cross-prpl reaction signals NOW, before any account connects, so a prpl that
+	// reconnects instantly from a saved session (whatsmeow) can connect to "webos-im-send-reaction" in
+	// its login handler without racing the (previously per-first-login) registration.
+	registerWebosReactionSignals();
 
 	/* webOS: /var is a small partition (~62MB). libpurple's per-conversation logging duplicates
 	 * what db8 already stores and grows unbounded under /var/preferences/com.palm.purple/transport/logs.
@@ -3910,6 +3943,53 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceNa
 }
 
 /*
+ * webOS reactions (SEND): the user reacted (or removed a reaction) to a message from the TouchPad.
+ * Resolve the owning account and emit "webos-im-send-reaction" so the owning prpl transmits it over
+ * its backend. targetServiceMessageId is the prpl's own id for the reacted-to message (the same id we
+ * stored as serviceMessageId when it arrived); remove=true removes my `emoji` reaction, else adds it
+ * (emoji is always supplied so backends can remove a specific reaction); usernameTo is the peer/chat.
+ */
+LibpurpleAdapter::SendResult LibpurpleAdapter::sendReaction(const char* serviceName, const char* username, const char* usernameTo, const char* targetServiceMessageId, const char* emoji, bool remove)
+{
+	if (!serviceName || !username || !usernameTo || !targetServiceMessageId || *targetServiceMessageId == '\0')
+	{
+		MojLogError(IMServiceApp::s_log, _T("sendReaction: Invalid parameter."));
+		return LibpurpleAdapter::INVALID_PARAMS;
+	}
+
+	std::string accountKey = getAccountKey(username, serviceName);
+	std::string const usernameToBuf = getPurpleUsername(usernameTo, serviceName);
+
+	PurpleAccount* account = NULL;
+	if (s_onlineAccountData.count(accountKey))
+		account = s_onlineAccountData[accountKey];
+
+	if (account == NULL)
+	{
+		MojLogError(IMServiceApp::s_log, _T("sendReaction: account not logged in. service %s"), serviceName);
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	}
+
+	MojLogInfo(IMServiceApp::s_log, _T("sendReaction: %s emoji '%s' on message %s (%s)"),
+			remove ? _T("remove") : _T("add"), emoji ? emoji : "", targetServiceMessageId, serviceName);
+
+	// The app stores/sends the emoji as &#NNNNN; entities (raw astral emoji get mangled through db8);
+	// decode to real UTF-8 in-process so the prpl backend gets a usable emoji (supplied for removes too).
+	char *decodedEmoji = NULL;
+	if (emoji && *emoji) {
+		decodedEmoji = (char*) malloc(strlen(emoji) + 1);
+		if (decodedEmoji) { decode_html_entities_utf8(decodedEmoji, emoji); }
+	}
+
+	purple_signal_emit(purple_conversations_get_handle(), "webos-im-send-reaction",
+			account, targetServiceMessageId, decodedEmoji ? decodedEmoji : "", usernameToBuf.c_str(),
+			remove ? "1" : "0");
+
+	if (decodedEmoji) { free(decodedEmoji); }
+	return LibpurpleAdapter::SENT;
+}
+
+/*
  * webOS attachment send. Mirrors sendMessage's account resolution + channel detection, but instead of
  * serv_send_im / serv_chat_send it hands the local file to libpurple's file-transfer path:
  *   - group channel target -> serv_chat_send_file(gc, chatId, path)  (gated by chat_can_receive_file)
@@ -4116,6 +4196,64 @@ bool LibpurpleAdapter::deviceConnectionClosed(bool all, const char* ipAddress)
 	return TRUE;
 }
 
+// Register + connect the webOS cross-prpl reaction signals ONCE. Called from initializeLibpurple
+// (right after purple_core_init, BEFORE any prpl logs in) so a prpl that reconnects instantly from a
+// saved session (e.g. whatsmeow) can connect to "webos-im-send-reaction" in its login handler without
+// racing this registration. Previously this lived in assignIMLoginState, which runs per-account and
+// fired ~40s AFTER the combined WhatsApp/Facebook plugin had already tried (and failed) to connect,
+// silently dropping every WhatsApp/Facebook reaction. Idempotent via s_reactionSignalRegistered.
+static void registerWebosReactionSignals()
+{
+	static bool s_reactionSignalRegistered = false;
+	if (s_reactionSignalRegistered)
+		return;
+	s_reactionSignalRegistered = true;
+
+	static int webosHandle = 0x1AD6;
+	void* convHandle = purple_conversations_get_handle();
+
+	// RECV per-sender merge (WhatsApp/Facebook/Signal): (account, targetServiceMessageId, emoji, sender).
+	purple_signal_register(convHandle, "webos-im-reaction",
+			purple_marshal_VOID__POINTER_POINTER_POINTER_POINTER, NULL, 4,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+	purple_signal_connect(convHandle, "webos-im-reaction", &webosHandle,
+			PURPLE_CALLBACK(im_reaction_cb), NULL);
+
+	// RECV aggregated REPLACE (Telegram): (account, targetServiceMessageId, serialized, NULL).
+	purple_signal_register(convHandle, "webos-im-reaction-set",
+			purple_marshal_VOID__POINTER_POINTER_POINTER_POINTER, NULL, 4,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+	purple_signal_connect(convHandle, "webos-im-reaction-set", &webosHandle,
+			PURPLE_CALLBACK(im_reaction_set_cb), NULL);
+
+	// react-to-own-sent: a prpl emits (account, serviceMessageId, text) once it learns an app-sent
+	// message's network id; OutboxIdHandler attaches it to the Outbox row.
+	purple_signal_register(convHandle, "webos-im-outbox-id",
+			purple_marshal_VOID__POINTER_POINTER_POINTER, NULL, 3,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+	purple_signal_connect(convHandle, "webos-im-outbox-id", &webosHandle,
+			PURPLE_CALLBACK(im_outbox_id_cb), NULL);
+
+	// SEND: prpls CONNECT to this to transmit a reaction the user placed (account, targetServiceMessageId,
+	// emoji, peer, removeFlag "1"=remove). Emitted by LibpurpleAdapter::sendReaction; owning prpl handles it.
+	purple_signal_register(convHandle, "webos-im-send-reaction",
+			purple_marshal_VOID__POINTER_POINTER_POINTER_POINTER_POINTER, NULL, 5,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+	MojLogInfo(IMServiceApp::s_log, _T("registered webos-im-reaction + webos-im-reaction-set + webos-im-outbox-id + webos-im-send-reaction signals (early)"));
+}
+
 void LibpurpleAdapter::assignIMLoginState(LoginCallbackInterface* loginState)
 {
 	MojLogInfo(IMServiceApp::s_log, _T("%s called."), __FUNCTION__);
@@ -4148,37 +4286,10 @@ void LibpurpleAdapter::assignIMLoginState(LoginCallbackInterface* loginState)
 		MojLogInfo(IMServiceApp::s_log, _T("Connecting new signals."));
 		s_registeredForAccountSignals = TRUE;
 
-		// webOS reactions (cross-prpl): register the "webos-im-reaction" signal ONCE for the process.
-		// Any prpl emits it on purple_conversations_get_handle() when a reaction arrives, carrying
-		// (account, targetServiceMessageId, emoji, sender). We attach the reaction to the target
-		// message row (ReactionHandler) instead of storing a "reacted with X" message.
-		static bool s_reactionSignalRegistered = false;
-		if (!s_reactionSignalRegistered)
-		{
-			s_reactionSignalRegistered = true;
-			void* convHandle = purple_conversations_get_handle();
-			purple_signal_register(convHandle, "webos-im-reaction",
-					purple_marshal_VOID__POINTER_POINTER_POINTER_POINTER, NULL, 4,
-					purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
-					purple_value_new(PURPLE_TYPE_STRING),
-					purple_value_new(PURPLE_TYPE_STRING),
-					purple_value_new(PURPLE_TYPE_STRING));
-			purple_signal_connect(convHandle, "webos-im-reaction", &handle,
-					PURPLE_CALLBACK(im_reaction_cb), NULL);
-
-			// webOS reactions (aggregated/REPLACE): a prpl that exposes the whole reaction summary at
-			// once (Telegram) emits this instead, carrying (account, targetServiceMessageId, serialized,
-			// NULL). ReactionHandler REPLACES the row's reactions with the parsed {emoji,count} set.
-			purple_signal_register(convHandle, "webos-im-reaction-set",
-					purple_marshal_VOID__POINTER_POINTER_POINTER_POINTER, NULL, 4,
-					purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
-					purple_value_new(PURPLE_TYPE_STRING),
-					purple_value_new(PURPLE_TYPE_STRING),
-					purple_value_new(PURPLE_TYPE_STRING));
-			purple_signal_connect(convHandle, "webos-im-reaction-set", &handle,
-					PURPLE_CALLBACK(im_reaction_set_cb), NULL);
-			MojLogInfo(IMServiceApp::s_log, _T("registered webos-im-reaction + webos-im-reaction-set signals"));
-		}
+		// webOS cross-prpl reaction signals are registered early in initializeLibpurple (before any prpl
+		// logs in) via registerWebosReactionSignals(). This call is an idempotent fallback so the signals
+		// still exist even on a path where initializeLibpurple's registration didn't run.
+		registerWebosReactionSignals();
 
 		/*
 		 * Listen for a number of different signals:

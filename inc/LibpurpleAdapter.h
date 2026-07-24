@@ -99,6 +99,11 @@ public:
 	// records separated by '\n'. Driven by the "webos-im-reaction-set" signal.
 	virtual bool handleReactionSet(const char* serviceName, const char* username, const char* targetServiceMessageId,
 				const char* serialized) = 0;
+	// webOS: attach a network-assigned serviceMessageId to a message the user sent FROM THE APP (whose
+	// Outbox row was persisted with no id), so a reaction can later target it. Driven by the
+	// "webos-im-outbox-id" signal. `text` is the sent body, used only as a correlation hint.
+	virtual bool handleOutboxId(const char* serviceName, const char* username, const char* serviceMessageId,
+				const char* text) = 0;
 	virtual bool updateBuddyStatus(const char* accountId, const char* serviceName, const char* username, int availability,
 				const char* customMessage, const char* groupName, const char* buddyAvatarLoc) = 0;
 	// Perf (#2): batched presence for one account - `updates` is an array of { username, availability,
@@ -173,6 +178,8 @@ public:
 	static SendResult authorizeBuddy(const char* serviceName, const char* username, const char* buddyUsername);
 	static SendResult declineBuddy(const char* serviceName, const char* username, const char* buddyUsername);
 	static SendResult sendMessage(const char *serviceName, const char *username, const char *usernameTo, const char *messageText);
+	// webOS reactions (SEND): transmit a reaction the user placed from the device. emoji "" = remove.
+	static SendResult sendReaction(const char *serviceName, const char *username, const char *usernameTo, const char *targetServiceMessageId, const char *emoji, bool remove);
 	// webOS attachment send: transmit a local file (absolute path, must exist and be readable in the
 	// transport process) to usernameTo. Mirrors sendMessage's account resolution + channel detection:
 	// a group-channel target routes through serv_chat_send_file, a 1:1 IM through serv_send_file. All

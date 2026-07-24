@@ -33,6 +33,7 @@
 #include "LibpurpleAdapter.h"
 #include "IncomingIMHandler.h"
 #include "ReactionHandler.h"
+#include "OutboxIdHandler.h"
 #include "IMMessage.h"
 #include "OutgoingIMCommandHandler.h"
 #include "OnEnabledHandler.h"
@@ -1025,6 +1026,28 @@ bool IMServiceHandler::handleReactionSet(const char* serviceName, const char* us
 		MojString error;
 		MojErrToString(err, error);
 		MojLogError(IMServiceApp::s_log, _T("handleReactionSet failed: %d - %s"), err, error.data());
+		return false;
+	}
+	return true;
+}
+
+/*
+ * webOS: the prpl learned the network id of a message the user sent from the app (e.g. Telegram's
+ * updateMessageSendSucceeded). Spin up an OutboxIdHandler to find the matching Outbox row and merge
+ * the serviceMessageId onto it, so a reaction can later target the user's own sent message.
+ */
+bool IMServiceHandler::handleOutboxId(const char* serviceName, const char* username,
+		const char* serviceMessageId, const char* text)
+{
+	MojLogInfo(IMServiceApp::s_log, _T("handleOutboxId: service %s id %s"),
+			serviceName ? serviceName : "", serviceMessageId ? serviceMessageId : "");
+
+	MojRefCountedPtr<OutboxIdHandler> outboxHandler(new OutboxIdHandler(m_service, this));
+	MojErr err = outboxHandler->handleOutboxId(serviceName, username, serviceMessageId, text);
+	if (err) {
+		MojString error;
+		MojErrToString(err, error);
+		MojLogError(IMServiceApp::s_log, _T("handleOutboxId failed: %d - %s"), err, error.data());
 		return false;
 	}
 	return true;

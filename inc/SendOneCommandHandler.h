@@ -36,6 +36,9 @@
 #define XPORT_BLOCK		        	_T("block")
 #define XPORT_GROUP	        	    _T("group")
 #define XPORT_ACCEPT	        	_T("accept")
+#define XPORT_TARGET_MSG_ID			_T("targetServiceMessageId")
+#define XPORT_EMOJI					_T("emoji")
+#define XPORT_REMOVE				_T("remove")
 
 class SendOneCommandHandler : public MojSignalHandler
 {
@@ -82,6 +85,7 @@ private:
 	MojErr findAccountIdForRemoveResult(MojObject& result, MojErr err);
 
 	LibpurpleAdapter::SendResult blockBuddy(const MojObject imCmd);
+	LibpurpleAdapter::SendResult sendReaction(const MojObject imCmd);
 	LibpurpleAdapter::SendResult removeBuddy(const MojObject imCmd);
 	LibpurpleAdapter::SendResult inviteBuddy(const MojObject imCmd);
 	LibpurpleAdapter::SendResult receivedBuddyInvite(const MojObject imCmd);
