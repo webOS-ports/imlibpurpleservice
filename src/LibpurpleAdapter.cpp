@@ -1965,32 +1965,70 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 	{
 		// A message WE sent. A plain local echo (app-initiated send) is already persisted by
 		// OutgoingIMHandler, so ignore it. But a carbon of a message we sent from ANOTHER client
-		// (PURPLE_MESSAGE_REMOTE_SEND - e.g. the Telegram/Signal/WhatsApp phone app) has no local
-		// row, so store it as an Outbox message so it shows on the sent side of the thread (and a
-		// reaction can attach to it). 1:1 only for now - group carbons need sender attribution.
-		if ((flags & PURPLE_MESSAGE_REMOTE_SEND) && s_imServiceHandler != NULL &&
-		    purple_conversation_get_type(conv) == PURPLE_CONV_TYPE_IM)
+		// (PURPLE_MESSAGE_REMOTE_SEND - e.g. the Telegram/Signal/WhatsApp/Discord phone app) has no
+		// local row, so store it as an Outbox message so it shows on the sent side of the thread (and a
+		// reaction can attach to it). Both 1:1 IMs and guild CHANNEL carbons are handled below.
+		if ((flags & PURPLE_MESSAGE_REMOTE_SEND) && s_imServiceHandler != NULL)
 		{
 			PurpleAccount* sentAccount = purple_conversation_get_account(conv);
 			if (sentAccount != NULL)
 			{
 				std::string const& sentService = getServiceNameFromPurpleAccount(sentAccount);
-				const char* peer = purple_conversation_get_name(conv); // the recipient (1:1 peer)
-				if (peer != NULL && *peer != '\0')
+				std::string ownerWebos = getWebosUsername(sentAccount->username, sentService);
+				// serviceMessageId the prpl stashed on the conv right before this write (its own id).
+				char* svcMsgId = (char*) purple_conversation_get_data(conv, "webos-msg-id");
+
+				if (purple_conversation_get_type(conv) == PURPLE_CONV_TYPE_IM)
 				{
-					std::string ownerWebos = getWebosUsername(sentAccount->username, sentService);
-					std::string peerStripped = stripResourceFromJabberUsername(peer, sentService);
-					std::string peerWebos = getWebosUsername(peerStripped.c_str(), sentService);
-					// serviceMessageId the prpl stashed on the conv right before this write (its own id).
-					char* svcMsgId = (char*) purple_conversation_get_data(conv, "webos-msg-id");
-					s_imServiceHandler->incomingIM(sentService.c_str(), ownerWebos.c_str(), peerWebos.c_str(),
-							message, mtime, NULL, NULL, NULL, NULL, false, NULL,
-							(svcMsgId && *svcMsgId) ? svcMsgId : NULL, /* outgoing */ true);
-					if (svcMsgId != NULL)
+					const char* peer = purple_conversation_get_name(conv); // the recipient (1:1 peer)
+					if (peer != NULL && *peer != '\0')
 					{
-						g_free(svcMsgId);
-						purple_conversation_set_data(conv, "webos-msg-id", NULL);
+						std::string peerStripped = stripResourceFromJabberUsername(peer, sentService);
+						std::string peerWebos = getWebosUsername(peerStripped.c_str(), sentService);
+						s_imServiceHandler->incomingIM(sentService.c_str(), ownerWebos.c_str(), peerWebos.c_str(),
+								message, mtime, NULL, NULL, NULL, NULL, false, NULL,
+								(svcMsgId && *svcMsgId) ? svcMsgId : NULL, /* outgoing */ true);
 					}
+				}
+				else if (purple_conversation_get_type(conv) == PURPLE_CONV_TYPE_CHAT)
+				{
+					// webOS #2: a message WE sent in a guild CHANNEL from another device (e.g. the Discord
+					// phone app). Store it as an OUTGOING row in that channel (folder=outbox), resolving
+					// channel + server the same way the RECV channel path does so it groups under the same
+					// imserver. usernameFrom = us (the sender).
+					const char* channelName = purple_conversation_get_name(conv);
+					if (channelName != NULL && *channelName != '\0')
+					{
+						const char* channelDisplayName = purple_conversation_get_title(conv);
+						std::string parentGroupName;
+						PurpleChat* chat = purple_blist_find_chat(sentAccount, channelName);
+						if (chat == NULL)
+							chat = findChatByIdComponent(sentAccount, channelName);
+						if (chat != NULL)
+						{
+							const char* humanName = purple_chat_get_name(chat);
+							if (humanName != NULL && *humanName != '\0')
+								channelDisplayName = humanName;
+							PurpleBlistNode* parent = ((PurpleBlistNode*)chat)->parent;
+							if (parent != NULL && PURPLE_BLIST_NODE_IS_GROUP(parent))
+							{
+								const char* groupName = purple_group_get_name((PurpleGroup*)parent);
+								if (groupName != NULL)
+									parentGroupName = groupName;
+							}
+						}
+						std::string serverNameStr = deriveServerName(sentAccount, parentGroupName.empty() ? NULL : parentGroupName.c_str(), NULL);
+						const char* serverName = serverNameStr.empty() ? NULL : serverNameStr.c_str();
+						s_imServiceHandler->incomingIM(sentService.c_str(), ownerWebos.c_str(), ownerWebos.c_str(),
+								message, mtime, channelName, channelDisplayName, serverName, serverName, false, NULL,
+								(svcMsgId && *svcMsgId) ? svcMsgId : NULL, /* outgoing */ true);
+					}
+				}
+
+				if (svcMsgId != NULL)
+				{
+					g_free(svcMsgId);
+					purple_conversation_set_data(conv, "webos-msg-id", NULL);
 				}
 			}
 		}
