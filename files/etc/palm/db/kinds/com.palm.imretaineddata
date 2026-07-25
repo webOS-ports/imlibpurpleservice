@@ -11,6 +11,10 @@
             "props": [{"name": "serviceName"}]
         },
         {
+            "name": "byServiceAndUsername",
+            "props": [{"name": "serviceName"}, {"name": "username"}]
+        },
+        {
             "name": "byDeletedAt",
             "props": [{"name": "deletedAt"}]
         },

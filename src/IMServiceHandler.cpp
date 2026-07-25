@@ -206,6 +206,24 @@ MojErr IMServiceHandler::onDelete(MojServiceMessage* serviceMsg, const MojObject
      * label (alias + templateId, forwarded by the patched account service) and a deletedAt timestamp. */
     if (keepData)
     {
+        /* Dedupe: drop any earlier marker for this SAME account before writing the new one, so a
+         * remove -> re-add -> remove-with-keep cycle doesn't leave duplicates. The re-added account has
+         * a new accountId, so match on serviceName + username (byServiceAndUsername index). db8 processes
+         * this del before the put below (FIFO per client), so the fresh marker survives. */
+        if (!delServiceName.empty() && !delUsername.empty())
+        {
+            MojString dSvc, dUsr;
+            dSvc.assign(delServiceName.c_str());
+            dUsr.assign(delUsername.c_str());
+            MojDbQuery dedupQuery;
+            dedupQuery.from(_T("com.palm.imretaineddata:1"));
+            dedupQuery.where(_T("serviceName"), MojDbQuery::OpEq, dSvc);
+            dedupQuery.where(_T("username"), MojDbQuery::OpEq, dUsr);
+            MojErr derr = m_dbClient.del(m_deleteRetainedDataSlot, dedupQuery);
+            if (derr != MojErrNone)
+                MojLogError(IMServiceApp::s_log, _T("onDelete: dedupe del(imretaineddata) failed: %d"), derr);
+        }
+
         MojObject rec;
         rec.putString(_T("_kind"), _T("com.palm.imretaineddata:1"));
         rec.putString(_T("accountId"), accountId);
