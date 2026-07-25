@@ -14,4 +14,16 @@ export IM_RESIDENT=1
 # the useful operational lines (connect/login/incoming-message) and drops the prpl debug flood.
 # Bump back to "debug" temporarily when actively debugging a specific connector; to also get the
 # libpurple prpl debug (tdlib "Displaying message", HTTP tracing, ...) add: export IM_PURPLE_DEBUG=1
+
+# SELF-HEAL the PmLog init semaphore. libPmLogLib opens /dev/shm/sem.PmLogLib and takes a one-time
+# init lock on it; if a transport is killed mid-init (a kill -9 on a running system, OR the process
+# being reaped during the boot ordering) the sem stays LOCKED, and every subsequent transport then
+# blocks forever on its first PmLog call -- 1 thread, no log output, no LS2 hub connect, no accounts,
+# "no messages come in", and upstart eventually hits its respawn limit. Already-running services that
+# inited PmLog earlier are unaffected, so ONLY the (re)started transport hangs. A tmpfs /dev/shm is
+# cleared on boot, but the corruption also happens DURING boot, so clear it on every launch: unlinking
+# the name is harmless (sem_open recreates a fresh, unlocked one; other holders keep their handle).
+# See the imtransport-pmlog-sem-hang note. This is the durable fix for the recurring startup hang.
+rm -f /dev/shm/sem.PmLogLib
+
 exec /var/imwrap.sh -c '{"log":{"appender":{"type":"stdout"},"levels":{"imlibpurple":"info"}}}' PalmPre Palm-Pre/1.5
