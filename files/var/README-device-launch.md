@@ -66,6 +66,19 @@ linker builds `person.searchTerms` from names only — it ignores a contact's ow
 
 Reflash reverts both to stock — re-run the Install below.
 
+## Message reactions (serviceMessageId index)
+
+Inline reaction badges need the transport to find a reaction's target message by its network id.
+`ReactionHandler` queries `com.palm.immessage.libpurple:1` where
+`serviceName == && username == && serviceMessageId ==`, which requires the compound
+`serviceMessageId` index. That index ships in `etc/palm/db/kinds/com.palm.immessage.libpurple` here,
+but db8 does **not** add a new index to an already-registered kind from a file update alone — an
+explicit `putKind` (as the owning service, with `-i -f`) is required, or every reaction find fails
+`db: no index for query` (-3965) and no badge ever attaches. `var/provision-im-reactions.sh` does
+that registration. Reflash reverts the on-device kind to the stock (index-less) copy — re-run the
+Install below. (The prpl-side hooks — id-stash + the `webos-im-reaction` signal emit — ship in each
+plugin; this is only the db8 side.)
+
 ## Install
 
     mount -o remount,rw /
@@ -77,6 +90,10 @@ Reflash reverts both to stock — re-run the Install below.
     /var/provision-person-search.sh
     # search-by-service, part 2 (app): from the com.palm.app.contacts checkout
     cp app/patches.js /media/cryptofs/apps/usr/palm/applications/com.palm.app.contacts/app/patches.js
+    # message reactions (serviceMessageId index on the immessage kind):
+    cp etc/palm/db/kinds/com.palm.immessage.libpurple /etc/palm/db/kinds/com.palm.immessage.libpurple
+    cp var/provision-im-reactions.sh /var/ && chmod 755 /var/provision-im-reactions.sh
+    /var/provision-im-reactions.sh
     stop LunaSysMgr; start LunaSysMgr
     sync   # then tellbootie / reboot
 
