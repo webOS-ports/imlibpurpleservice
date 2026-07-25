@@ -349,28 +349,24 @@ bool ContactConsolidationHelper::hasChanges(MojObject& oldContact, MojObject& ne
 		firstPhoto = *photosItr;
 		MojString oldAvatar;
 		firstPhoto.get("localPath", oldAvatar, oldFound);
-		if (oldAvatar != newAvatar)
+		// Only UPDATE the photo when this buddy-list update carries a NEW, non-empty avatar.
+		// whatsmeow (and other prpls) deliver avatars via the buddy-icon API
+		// (presence.c -> purple_buddy_icons_set_for_user -> BuddyStatusHandler), NOT in the
+		// list-consolidation buddy data -- so an empty newAvatar here means "not included in
+		// this update", NOT "removed". The old code treated empty as removal and cleared the
+		// photo, which wiped every icon-set avatar (all WhatsApp contact photos vanished).
+		// Genuine removals arrive through the icon path. (Clearing with [{}] also failed
+		// com.palm.contact:1 schema validation and crashed the contacts.linker node.)
+		if (!newAvatar.empty() && oldAvatar != newAvatar)
 		{
 			hasChanges = true;
 			MojObject newPhotos(MojObject::TypeArray);
-			if (oldAvatar.length() > 1 && newAvatar.empty())
-			{
-				// Remove the photo: leave the photos array EMPTY ([]). The old code pushed an
-				// empty {} object, writing photos:[{}] -- which fails com.palm.contact:1 schema
-				// validation ("required property not found - 'localPath' for property 'photos'"),
-				// spamming mojodb warnings and crashing the contacts.linker node (PJSON
-				// "Trying to access 0 as a number"). An empty array cleanly clears the photo.
-				MojLogInfo(IMServiceApp::s_log, _T("This new contact %s has no photo. Removing path."), newDisplayName.data());
-			}
-			else
-			{
-				firstPhoto.put("localPath", newAvatar);
-				firstPhoto.put("value", newAvatar);
-				firstPhoto.putString("type", "type_square"); // AIM and GTalk generally send small, square-ish images
-				newPhotos.push(firstPhoto);
-				MojLogInfo(IMServiceApp::s_log, _T("Adding localPath %s for new contact %s."), newAvatar.data(), newDisplayName.data());
-			}
+			firstPhoto.put("localPath", newAvatar);
+			firstPhoto.put("value", newAvatar);
+			firstPhoto.putString("type", "type_square"); // AIM and GTalk generally send small, square-ish images
+			newPhotos.push(firstPhoto);
 			diffs.put("photos", newPhotos);
+			MojLogInfo(IMServiceApp::s_log, _T("Adding localPath %s for new contact %s."), newAvatar.data(), newDisplayName.data());
 		}
 	}
 
