@@ -1831,6 +1831,18 @@ static std::string cleanChannelDisplayName(const char* rawName)
 	return n;
 }
 
+// webOS WhatsApp Channels: true if `name` is a WhatsApp Channel/newsletter JID ("<id>@newsletter").
+// whatsmeow leaves IsGroup=false for the newsletter server, so these otherwise arrive as 1:1 IMs.
+static bool isWhatsAppNewsletter(const char* name)
+{
+	if (name == NULL)
+		return false;
+	size_t len = strlen(name);
+	static const char* suffix = "@newsletter";
+	size_t slen = strlen(suffix);
+	return len > slen && strcmp(name + len - slen, suffix) == 0;
+}
+
 static std::string deriveServerName(PurpleAccount* account, const char* groupName, std::string* outCategory)
 {
 	if (outCategory)
@@ -2130,6 +2142,30 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 		if (buddy != NULL)
 			muted = purple_blist_node_get_bool((PurpleBlistNode*)buddy, "muted")
 			        || purple_blist_node_get_bool((PurpleBlistNode*)buddy, "archived");
+	}
+
+	// webOS WhatsApp Channels: whatsmeow delivers a followed Channel (newsletter) as a 1:1 IM whose
+	// peer JID is "<id>@newsletter" (it leaves IsGroup=false for the newsletter server), so it lands in
+	// the else-branch above with channelName==NULL and would be stored as an ordinary chatthread. Route
+	// it into the Server/Channel tab instead by tagging it like a MUC: channelName = the JID (the stable
+	// match key, == purple_conversation_get_name so it dedups with the enumerated record), server = a
+	// synthetic "WhatsApp Channels". Setting channelName flips IMMessage isGroupChat true. The channel's
+	// human title comes from the buddy alias (best effort; the JID is the fallback).
+	if (channelName == NULL && serviceName == "type_whatsapp")
+	{
+		const char* imName = purple_conversation_get_name(conv);
+		if (isWhatsAppNewsletter(imName))
+		{
+			channelName = imName;
+			serverNameStr = "WhatsApp Channels";
+			PurpleBuddy* nlBuddy = purple_find_buddy(account, imName);
+			if (nlBuddy != NULL)
+			{
+				const char* alias = purple_buddy_get_alias(nlBuddy);
+				if (alias != NULL && *alias != '\0' && !isWhatsAppNewsletter(alias))
+					channelDisplayName = alias;
+			}
+		}
 	}
 
 	// webOS WhatsApp: the sender id is the raw JID "<digits>@s.whatsapp.net" (or opaque "<id>@lid"),
@@ -3791,6 +3827,51 @@ bool LibpurpleAdapter::enumerateServersChannels(const char* serviceName, const c
 			channels.push(channel);
 			server.put(_T("channels"), channels);
 		}
+	}
+
+	// webOS WhatsApp Channels: followed Channels (newsletters) are stored as BUDDIES ("<id>@newsletter")
+	// under the "Whatsapp" blist group, NOT as CHAT nodes, so the group/chat walk above misses them.
+	// Emit each as a channel under a synthetic "WhatsApp Channels" server so all followed channels show
+	// on login (not only after their next post). remoteId = the newsletter JID (== purple_conversation_
+	// get_name for its IM) so it dedups with the message-driven record from incoming_message_cb.
+	if (strcmp(serviceName, "type_whatsapp") == 0)
+	{
+		static const char* kWaChannelsServer = "WhatsApp Channels";
+		std::string waServer = kWaChannelsServer;
+		int nlPosition = 0;
+		GSList* buddies = purple_find_buddies(account, NULL);
+		for (GSList* b = buddies; b != NULL; b = b->next)
+		{
+			PurpleBuddy* buddy = (PurpleBuddy*)b->data;
+			const char* bname = buddy ? purple_buddy_get_name(buddy) : NULL;
+			if (!isWhatsAppNewsletter(bname))
+				continue;
+			sigSet.insert(waServer + std::string("\x1f") + bname);
+			if (serverByGuild.find(waServer) == serverByGuild.end())
+			{
+				MojObject server;
+				server.putString(_T("remoteId"), waServer.c_str());
+				server.putString(_T("name"), waServer.c_str());
+				MojObject emptyChannels(MojObject::TypeArray);
+				server.put(_T("channels"), emptyChannels);
+				serverByGuild[waServer] = server;
+			}
+			const char* alias = purple_buddy_get_alias(buddy);
+			std::string chanDisplay = cleanChannelDisplayName((alias && *alias && !isWhatsAppNewsletter(alias)) ? alias : bname);
+			if (chanDisplay.empty())
+				chanDisplay = bname;
+			MojObject channel;
+			channel.putString(_T("remoteId"), bname);
+			channel.putString(_T("name"), chanDisplay.c_str());
+			channel.putInt(_T("position"), nlPosition++);
+			MojObject& server = serverByGuild[waServer];
+			MojObject channels;
+			server.get(_T("channels"), channels);
+			channels.push(channel);
+			server.put(_T("channels"), channels);
+		}
+		if (buddies != NULL)
+			g_slist_free(buddies);
 	}
 
 	MojObject serversObj(MojObject::TypeArray);
