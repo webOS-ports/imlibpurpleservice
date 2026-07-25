@@ -49,7 +49,12 @@ fi
 # See the imtransport-pmlog-sem-hang note.
 rm -f /dev/shm/sem.PmLogLib
 
+# Also preload the SYSTEM libasound (/usr/lib/libasound.so.2): the in-plugin call bridges
+# (WhatsApp glue/call.c, Telegram tdlib-purple) open the "voip"/"voipsource" ALSA PCMs, but the
+# Atlas wpe-252 libasound on LD_LIBRARY_PATH can't find its pulse plugin module ("No such device").
+# The system libasound has /usr/lib/alsa-lib's pulse module + /etc/asound.conf's voip PCMs — the
+# same route the standalone wacallm/Signal engines used. Without this: "audio playback/capture-FAIL".
 exec env \
-  LD_PRELOAD="$B/libstdc++.so.6 $G/lib/librt.so.1" \
+  LD_PRELOAD="$B/libstdc++.so.6 $G/lib/librt.so.1 /usr/lib/libasound.so.2" \
   LD_LIBRARY_PATH="$S:$G/lib:$B:$W:/usr/lib:/lib" \
   /usr/bin/imlibpurpletransport "$@" >> "$LOG" 2>&1
