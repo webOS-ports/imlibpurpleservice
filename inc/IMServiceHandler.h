@@ -102,6 +102,8 @@ private:
      * (username/serviceName) + a friendly label (alias/templateId, forwarded by the account service). */
     MojDbClient::Signal::Slot<IMServiceHandler> m_putRetainedDataSlot;
     MojErr putRetainedDataResult(MojObject& payload, MojErr err);
+    MojDbClient::Signal::Slot<IMServiceHandler> m_deleteRetainedDataSlot;
+    MojErr deleteRetainedDataResult(MojObject& payload, MojErr err);
 
     /* On account delete, purge the account's db8 chat data so the Messaging app
      * doesn't keep showing old conversations after the account is gone. Mirrors
@@ -189,6 +191,10 @@ private:
 	MojErr onEnabled(MojServiceMessage* serviceMsg, const MojObject payload);
 	MojErr onCreate(MojServiceMessage* serviceMsg, const MojObject payload);
 	MojErr onDelete(MojServiceMessage* serviceMsg, const MojObject payload);
+	/* palm://com.palm.imlibpurple/purgeRetainedData {accountId, username, serviceName} - wipe the
+	 * on-device data that was kept when the account was removed with keepData, then delete the
+	 * com.palm.imretaineddata marker. Driven by the Accounts app "Delete Account Data" UI. */
+	MojErr purgeRetainedData(MojServiceMessage* serviceMsg, const MojObject payload);
 
 	MojErr handleLoginStateChange(MojServiceMessage* msg, const MojObject payload);
 	MojErr loginForTesting(MojServiceMessage* msg, const MojObject payload);

@@ -49,6 +49,7 @@ const IMServiceHandler::Method IMServiceHandler::s_methods[] = {
 	{_T("onEnabled"), (Callback) &IMServiceHandler::onEnabled},
     {_T("onCreate"), (Callback) &IMServiceHandler::onCreate},
     {_T("onDelete"), (Callback) &IMServiceHandler::onDelete},
+    {_T("purgeRetainedData"), (Callback) &IMServiceHandler::purgeRetainedData},
 	{_T("loginStateChanged"), (Callback) &IMServiceHandler::handleLoginStateChange},
 	{_T("sendIM"), (Callback) &IMServiceHandler::IMSend}, // callback for activity manager
 	{_T("sendCommand"), (Callback) &IMServiceHandler::IMSendCmd}, // callback for activity manager
@@ -65,6 +66,7 @@ IMServiceHandler::IMServiceHandler(MojService* service)
   m_deleteConfigSlot(this, &IMServiceHandler::deleteConfigResult),
   m_putConfigSlot(this, &IMServiceHandler::putConfigResult),
   m_putRetainedDataSlot(this, &IMServiceHandler::putRetainedDataResult),
+  m_deleteRetainedDataSlot(this, &IMServiceHandler::deleteRetainedDataResult),
   m_deleteImLoginStateSlot(this, &IMServiceHandler::deleteImLoginStateResult),
   m_deleteImMessagesSlot(this, &IMServiceHandler::deleteImMessagesResult),
   m_deleteImCommandsSlot(this, &IMServiceHandler::deleteImCommandsResult),
@@ -238,6 +240,44 @@ MojErr IMServiceHandler::onDelete(MojServiceMessage* serviceMsg, const MojObject
 
     m_dbClient.del(m_deleteConfigSlot, query);
 #endif // !IMLIBPURPLE_LEGACY_DB8
+
+    serviceMsg->replySuccess();
+    return MojErrNone;
+}
+
+MojErr IMServiceHandler::purgeRetainedData(MojServiceMessage* serviceMsg, const MojObject payload)
+{
+    /* Wipe the data that keepData preserved for a since-removed account. The Accounts app "Delete
+     * Account Data" list passes the marker's stored keys (captured at delete time; the account no
+     * longer exists so they can't be re-resolved). purgeAccountData(...,false) does the wipe; then we
+     * delete the com.palm.imretaineddata marker (indexed by accountId) so it drops out of the list. */
+    MojString accountId, username, serviceName;
+    bool found = false;
+    payload.get(_T("accountId"), accountId, found);
+    payload.get(_T("username"), username, found);
+    payload.get(_T("serviceName"), serviceName, found);
+
+    if (accountId.empty()) {
+        MojErr err = MojErrInvalidArg;
+        MojLogError(IMServiceApp::s_log, _T("purgeRetainedData: accountId required"));
+        serviceMsg->replyError(err);
+        return err;
+    }
+
+    MojLogInfo(IMServiceApp::s_log, _T("purgeRetainedData: accountId=%s username=%s serviceName=%s"),
+               accountId.data(), username.empty() ? "" : username.data(), serviceName.empty() ? "" : serviceName.data());
+
+    purgeAccountData(accountId.data(),
+                     username.empty() ? NULL : username.data(),
+                     serviceName.empty() ? NULL : serviceName.data(),
+                     false);
+
+    MojDbQuery q;
+    q.from(_T("com.palm.imretaineddata:1"));
+    q.where(_T("accountId"), MojDbQuery::OpEq, accountId);
+    MojErr err = m_dbClient.del(m_deleteRetainedDataSlot, q);
+    if (err != MojErrNone)
+        MojLogError(IMServiceApp::s_log, _T("purgeRetainedData: del(marker) failed: %d"), err);
 
     serviceMsg->replySuccess();
     return MojErrNone;
@@ -520,6 +560,13 @@ MojErr IMServiceHandler::putRetainedDataResult(MojObject& payload, MojErr err)
 {
 	if (err != MojErrNone)
 		MojLogError(IMServiceApp::s_log, _T("onDelete: put(imretaineddata) failed: %d"), err);
+	return MojErrNone;
+}
+
+MojErr IMServiceHandler::deleteRetainedDataResult(MojObject& payload, MojErr err)
+{
+	if (err != MojErrNone)
+		MojLogError(IMServiceApp::s_log, _T("purgeRetainedData: del(imretaineddata marker) failed: %d"), err);
 	return MojErrNone;
 }
 
