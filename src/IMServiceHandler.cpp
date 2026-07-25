@@ -68,6 +68,8 @@ IMServiceHandler::IMServiceHandler(MojService* service)
   m_deleteImCommandsSlot(this, &IMServiceHandler::deleteImCommandsResult),
   m_deleteContactsSlot(this, &IMServiceHandler::deleteContactsResult),
   m_deleteImBuddyStatusSlot(this, &IMServiceHandler::deleteImBuddyStatusResult),
+  m_deleteImServersSlot(this, &IMServiceHandler::deleteImServersResult),
+  m_deleteImChannelsSlot(this, &IMServiceHandler::deleteImChannelsResult),
   m_syncFindServersSlot(this, &IMServiceHandler::syncFindServersResult),
   m_syncPutServersSlot(this, &IMServiceHandler::syncPutServersResult),
   m_syncFindChannelsSlot(this, &IMServiceHandler::syncFindChannelsResult),
@@ -164,10 +166,22 @@ MojErr IMServiceHandler::onDelete(MojServiceMessage* serviceMsg, const MojObject
 		return err;
 	}
 
+    /* keepData: forwarded by the (patched) account service from deleteAccount when the user ticked
+     * "Keep this account's data on this device" in the Remove Account dialog. Absent/false => wipe the
+     * account's db8 data (the historical default). The live PurpleAccount teardown and login/config
+     * purge below always run, so the account is genuinely removed from Accounts either way; keepData
+     * only preserves the user-visible history (contacts / messages / server-room roster). */
+    bool keepData = false;
+    MojObject keepDataVal;
+    if (payload.get(_T("keepData"), keepDataVal))
+        keepData = keepDataVal.boolValue();
+    MojLogInfo(IMServiceApp::s_log, _T("IMServiceHandler::onDelete accountId=%s keepData=%d"), accountId.data(), keepData);
+
     /* webOS Teams port: remove the persisted PurpleAccount (accounts.xml + buddy list
      * + stored OAuth refresh_token) tagged with this webOS accountId, so re-adding the
      * account starts from a genuinely clean state. Grab the username + serviceName first
-     * so we can purge this account's db8 chat data below. */
+     * so we can purge this account's db8 chat data below. Always runs (unlinking the live
+     * account is independent of keeping its history). */
     std::string delUsername, delServiceName;
     LibpurpleAdapter::deleteAccountByWebosId(accountId.data(), &delUsername, &delServiceName);
 
@@ -175,10 +189,12 @@ MojErr IMServiceHandler::onDelete(MojServiceMessage* serviceMsg, const MojObject
      * conversations/contacts after the account is deleted. The disable path
      * (OnEnabledHandler::accountDisabled) does this on toggle-off, but on a real delete
      * the account is already gone from the account manager, so its username/serviceName
-     * can't be resolved there and the purge never runs. Do it explicitly here. */
+     * can't be resolved there and the purge never runs. Do it explicitly here - gated on
+     * keepData (imloginstate is still cleared inside; only the user data is preserved). */
     purgeAccountData(accountId.data(),
                      delUsername.empty() ? NULL : delUsername.c_str(),
-                     delServiceName.empty() ? NULL : delServiceName.c_str());
+                     delServiceName.empty() ? NULL : delServiceName.c_str(),
+                     keepData);
 
 #ifndef IMLIBPURPLE_LEGACY_DB8
     MojDbQuery query;
@@ -197,14 +213,18 @@ MojErr IMServiceHandler::onDelete(MojServiceMessage* serviceMsg, const MojObject
  * OnEnabledHandler::accountDisabled():
  *   - imloginstate / contact / imbuddystatus  keyed by accountId
  *   - immessage / imcommand                    keyed by username (+serviceName)
+ *   - imserver / imchannel                     keyed by serviceName (the Servers/Rooms roster)
  * The immessage/imcommand records carry username + serviceName (not accountId), so those
  * are only purged when we managed to resolve the username from the PurpleAccount. The
- * ChatThreader service removes the now-empty chats.
+ * imserver/imchannel roster rows (written by syncServersChannels) carry only serviceName
+ * (no username, no accountId), so those are purged when serviceName is resolved - otherwise
+ * a deleted Discord/Telegram account leaves orphaned server/channel rows that keep the app's
+ * chatthreads alive. The ChatThreader service removes the now-empty chats.
  */
-MojErr IMServiceHandler::purgeAccountData(const char* accountId, const char* username, const char* serviceName)
+MojErr IMServiceHandler::purgeAccountData(const char* accountId, const char* username, const char* serviceName, bool keepData)
 {
-	MojLogInfo(IMServiceApp::s_log, _T("purgeAccountData: accountId=%s username=%s serviceName=%s"),
-	           accountId ? accountId : "", username ? username : "", serviceName ? serviceName : "");
+	MojLogInfo(IMServiceApp::s_log, _T("purgeAccountData: accountId=%s username=%s serviceName=%s keepData=%d"),
+	           accountId ? accountId : "", username ? username : "", serviceName ? serviceName : "", keepData);
 
 	MojErr err;
 
@@ -221,6 +241,16 @@ MojErr IMServiceHandler::purgeAccountData(const char* accountId, const char* use
 	err = m_dbClient.del(m_deleteImLoginStateSlot, queryLoginState);
 	MojErrCheck(err);
 
+	// keepData: the user asked to unlink the account but KEEP its data on this device. imloginstate
+	// above is live session/login state (always cleared - the account is gone), but everything below is
+	// user-visible history - contacts, buddy presence, the Servers/Rooms roster, and messages/commands.
+	// Preserve it and return early. Default (keepData=false) falls through and wipes as before.
+	if (keepData)
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("purgeAccountData: keepData set - preserving contacts/messages/roster for accountId %s"), accountId ? accountId : "");
+		return MojErrNone;
+	}
+
 	// contact - keyed by accountId
 	MojDbQuery queryContact;
 	queryContact.from(IM_CONTACT_KIND);
@@ -234,6 +264,48 @@ MojErr IMServiceHandler::purgeAccountData(const char* accountId, const char* use
 	queryBuddyStatus.where(_T("accountId"), MojDbQuery::OpEq, accountIdStr);
 	err = m_tempdbClient.del(m_deleteImBuddyStatusSlot, queryBuddyStatus);
 	MojErrCheck(err);
+
+	// imserver + imchannel (the Servers/Rooms roster, com.palm.imserver:1 / com.palm.imchannel:1)
+	// are keyed by serviceName. syncServersChannels writes these rows with serviceName (+remoteId,
+	// +serverId for channels) but NEVER an accountId - the imserver "byAccountId" index in the kind
+	// def is defined but unpopulated - so serviceName is the only usable key, exactly as
+	// syncServersChannelsStart()/syncFindChannels() query them. Both properties are index leads
+	// (imserver "byservice"; imchannel "byRemoteId" = serviceName+remoteId), so the del is indexable.
+	// Without this a deleted account's guilds/channels linger and keep their chatthreads visible.
+	// Purge only when serviceName resolved (there is no per-row fallback key).
+	// NOTE: serviceName is a service TYPE (e.g. type_discord), not per-account, and these rows carry
+	// no per-account discriminator, so a hypothetical second still-present account of the SAME service
+	// would have its (shared) roster rows removed too; that account's next syncServersChannels
+	// enumeration re-creates them, so it self-heals. immessage/imcommand below stay username-scoped.
+	// imchannel holds chatThreadId; we do NOT delete chatthreads here - the ChatThreader service GCs
+	// the now-empty threads once their backing channel/messages are gone.
+	if (serviceName != NULL && *serviceName != '\0')
+	{
+		MojString svcNameStr;
+		err = svcNameStr.assign(serviceName);
+		MojErrCheck(err);
+
+		MojDbQuery queryServers;
+		queryServers.from(_T("com.palm.imserver:1"));
+		queryServers.where(_T("serviceName"), MojDbQuery::OpEq, svcNameStr);
+		err = m_dbClient.del(m_deleteImServersSlot, queryServers);
+		MojErrCheck(err);
+
+		MojDbQuery queryChannels;
+		queryChannels.from(_T("com.palm.imchannel:1"));
+		queryChannels.where(_T("serviceName"), MojDbQuery::OpEq, svcNameStr);
+		err = m_dbClient.del(m_deleteImChannelsSlot, queryChannels);
+		MojErrCheck(err);
+	}
+	else
+	{
+		MojLogError(IMServiceApp::s_log, _T("purgeAccountData: no serviceName resolved - imserver/imchannel not purged for accountId %s"), accountId ? accountId : "");
+	}
+
+	// TODO: the shared per-service on-disk caches (/var/luna/data/im-avatars and
+	// /media/internal/.im-attachments/<serviceName>) are cross-account and are intentionally NOT
+	// touched here - purging them needs last-account-of-service logic (only safe once the FINAL
+	// account of a service is removed), which is out of scope for this per-account delete.
 
 	// immessage + imcommand are keyed by username (the account owner), not accountId.
 	if (username != NULL && *username != '\0')
@@ -267,6 +339,13 @@ MojErr IMServiceHandler::purgeAccountData(const char* accountId, const char* use
 	}
 	else
 	{
+		// No accountId-based fallback is possible: com.palm.immessage.libpurple:1 /
+		// com.palm.imcommand.libpurple:1 (extending com.palm.immessage:1 / com.palm.imcommand:1)
+		// carry only serviceName + username (see the kind defs / IMMessage.cpp - no accountId prop),
+		// so with the username unresolved there is no per-account key to delete on. Deleting by
+		// serviceName alone would over-delete a co-existing same-service account's messages, so we
+		// intentionally skip rather than risk that. These rows are instead swept by purgeServiceData()
+		// (whole-service reset) if the service is later fully removed.
 		MojLogError(IMServiceApp::s_log, _T("purgeAccountData: no username resolved - immessage/imcommand not purged for accountId %s"), accountId ? accountId : "");
 	}
 
@@ -385,6 +464,20 @@ MojErr IMServiceHandler::deleteImBuddyStatusResult(MojObject& payload, MojErr er
 {
 	if (err != MojErrNone)
 		MojLogError(IMServiceApp::s_log, _T("purgeAccountData: del(imbuddystatus) failed: %d"), err);
+	return MojErrNone;
+}
+
+MojErr IMServiceHandler::deleteImServersResult(MojObject& payload, MojErr err)
+{
+	if (err != MojErrNone)
+		MojLogError(IMServiceApp::s_log, _T("purgeAccountData: del(imserver) failed: %d"), err);
+	return MojErrNone;
+}
+
+MojErr IMServiceHandler::deleteImChannelsResult(MojObject& payload, MojErr err)
+{
+	if (err != MojErrNone)
+		MojLogError(IMServiceApp::s_log, _T("purgeAccountData: del(imchannel) failed: %d"), err);
 	return MojErrNone;
 }
 

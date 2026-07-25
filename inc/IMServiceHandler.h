@@ -102,7 +102,7 @@ private:
      * OnEnabledHandler::accountDisabled() but driven from onDelete (the disable path
      * does not reliably run on delete - the account is already gone from the account
      * manager, so its username/serviceName can't be resolved there). */
-    MojErr purgeAccountData(const char* accountId, const char* username, const char* serviceName);
+    MojErr purgeAccountData(const char* accountId, const char* username, const char* serviceName, bool keepData);
 
     /* Batch-delete every leftover db8 record for a whole service (contacts, messages, commands,
      * buddystatus), keyed on serviceName/ims.type rather than accountId -- for orphans left behind
@@ -122,6 +122,14 @@ private:
     MojErr deleteContactsResult(MojObject& payload, MojErr err);
     MojDbClient::Signal::Slot<IMServiceHandler> m_deleteImBuddyStatusSlot;
     MojErr deleteImBuddyStatusResult(MojObject& payload, MojErr err);
+    /* onDelete-only purge of the messaging-app-owned server/channel roster kinds
+     * (com.palm.imserver:1 / com.palm.imchannel:1). syncServersChannels writes these rows with
+     * serviceName (+remoteId/serverId) but NO accountId - the imserver byAccountId index is never
+     * populated - so the purge keys on serviceName, matching how syncServersChannels itself queries. */
+    MojDbClient::Signal::Slot<IMServiceHandler> m_deleteImServersSlot;
+    MojErr deleteImServersResult(MojObject& payload, MojErr err);
+    MojDbClient::Signal::Slot<IMServiceHandler> m_deleteImChannelsSlot;
+    MojErr deleteImChannelsResult(MojObject& payload, MojErr err);
 
     /* webOS Servers/Rooms M3: enumerated server->channel roster upsert. A login-time (and debounced
      * post-buddy-change) sync that reconciles this account's imserver/imchannel rows against the live
