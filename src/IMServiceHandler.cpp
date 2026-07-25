@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include "IMServiceHandler.h"
 #include "LibpurpleAdapter.h"
@@ -63,6 +64,7 @@ IMServiceHandler::IMServiceHandler(MojService* service)
   m_tempdbClient(service, MojDbServiceDefs::TempServiceName),
   m_deleteConfigSlot(this, &IMServiceHandler::deleteConfigResult),
   m_putConfigSlot(this, &IMServiceHandler::putConfigResult),
+  m_putRetainedDataSlot(this, &IMServiceHandler::putRetainedDataResult),
   m_deleteImLoginStateSlot(this, &IMServiceHandler::deleteImLoginStateResult),
   m_deleteImMessagesSlot(this, &IMServiceHandler::deleteImMessagesResult),
   m_deleteImCommandsSlot(this, &IMServiceHandler::deleteImCommandsResult),
@@ -195,6 +197,39 @@ MojErr IMServiceHandler::onDelete(MojServiceMessage* serviceMsg, const MojObject
                      delUsername.empty() ? NULL : delUsername.c_str(),
                      delServiceName.empty() ? NULL : delServiceName.c_str(),
                      keepData);
+
+    /* keepData: the user kept this account's data. Record a com.palm.imretaineddata:1 marker so a later
+     * "Delete Account Data" UI can list it and purge it on demand. The account itself is gone from
+     * Accounts now, so stash the keys the later purge needs (username + serviceName) plus a friendly
+     * label (alias + templateId, forwarded by the patched account service) and a deletedAt timestamp. */
+    if (keepData)
+    {
+        MojObject rec;
+        rec.putString(_T("_kind"), _T("com.palm.imretaineddata:1"));
+        rec.putString(_T("accountId"), accountId);
+        if (!delUsername.empty())
+        {
+            MojString u; u.assign(delUsername.c_str());
+            rec.putString(_T("username"), u);
+        }
+        if (!delServiceName.empty())
+        {
+            MojString s; s.assign(delServiceName.c_str());
+            rec.putString(_T("serviceName"), s);
+        }
+        MojString aliasStr; bool aliasFound = false;
+        payload.get(_T("alias"), aliasStr, aliasFound);
+        if (aliasFound && !aliasStr.empty())
+            rec.putString(_T("alias"), aliasStr);
+        MojString templateIdStr; bool tidFound = false;
+        payload.get(_T("templateId"), templateIdStr, tidFound);
+        if (tidFound && !templateIdStr.empty())
+            rec.putString(_T("templateId"), templateIdStr);
+        rec.putInt(_T("deletedAt"), (MojInt64) time(NULL));
+        m_dbClient.put(m_putRetainedDataSlot, rec);
+        MojLogInfo(IMServiceApp::s_log, _T("onDelete: recorded retained-data marker for kept account %s (service %s)"),
+                   accountId.data(), delServiceName.empty() ? "?" : delServiceName.c_str());
+    }
 
 #ifndef IMLIBPURPLE_LEGACY_DB8
     MojDbQuery query;
@@ -478,6 +513,13 @@ MojErr IMServiceHandler::deleteImChannelsResult(MojObject& payload, MojErr err)
 {
 	if (err != MojErrNone)
 		MojLogError(IMServiceApp::s_log, _T("purgeAccountData: del(imchannel) failed: %d"), err);
+	return MojErrNone;
+}
+
+MojErr IMServiceHandler::putRetainedDataResult(MojObject& payload, MojErr err)
+{
+	if (err != MojErrNone)
+		MojLogError(IMServiceApp::s_log, _T("onDelete: put(imretaineddata) failed: %d"), err);
 	return MojErrNone;
 }
 

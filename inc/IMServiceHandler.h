@@ -97,6 +97,12 @@ private:
     MojDbClient::Signal::Slot<IMServiceHandler> m_putConfigSlot;
     MojErr putConfigResult(MojObject& payload, MojErr err);
 
+    /* On a keepData delete, record the kept account (com.palm.imretaineddata:1) so a later
+     * "Delete Account Data" UI can list it and purge it on demand. Stores accountId + the purge keys
+     * (username/serviceName) + a friendly label (alias/templateId, forwarded by the account service). */
+    MojDbClient::Signal::Slot<IMServiceHandler> m_putRetainedDataSlot;
+    MojErr putRetainedDataResult(MojObject& payload, MojErr err);
+
     /* On account delete, purge the account's db8 chat data so the Messaging app
      * doesn't keep showing old conversations after the account is gone. Mirrors
      * OnEnabledHandler::accountDisabled() but driven from onDelete (the disable path
