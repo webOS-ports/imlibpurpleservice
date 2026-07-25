@@ -5,7 +5,8 @@
     "allowedNames": [
       "com.palm.imlibpurple",
       "com.palm.telegram.call",
-      "com.palm.signal.call"
+      "com.palm.signal.call",
+      "com.palm.whatsapp.call"
     ]
   },
   "permissions": [
@@ -16,6 +17,11 @@
     },
     {
       "service": "com.palm.signal.call",
+      "inbound": ["*"],
+      "outbound": ["*"]
+    },
+    {
+      "service": "com.palm.whatsapp.call",
       "inbound": ["*"],
       "outbound": ["*"]
     }
