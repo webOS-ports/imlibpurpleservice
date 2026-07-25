@@ -40,6 +40,15 @@ if [ ! -L /dev/random ]; then
   rm -f /dev/random && ln -s /dev/urandom /dev/random 2>/dev/null
 fi
 
+# SELF-HEAL the PmLog init semaphore before EVERY transport launch. libPmLogLib takes a one-time init
+# lock on /dev/shm/sem.PmLogLib; if a transport was killed mid-init (kill -9, OR reaped during the boot
+# ordering) the sem stays LOCKED and the next transport hangs forever on its first PmLog call -- 1
+# thread, no log, no accounts ("no messages come in"). This lives in imwrap.sh (not just imdaemon.sh)
+# because BOTH launch paths exec here: the upstart resident daemon (imdaemon.sh) AND the on-demand LS2
+# .service. Unlinking is harmless -- sem_open recreates a fresh unlocked one; other holders keep theirs.
+# See the imtransport-pmlog-sem-hang note.
+rm -f /dev/shm/sem.PmLogLib
+
 exec env \
   LD_PRELOAD="$B/libstdc++.so.6 $G/lib/librt.so.1" \
   LD_LIBRARY_PATH="$S:$G/lib:$B:$W:/usr/lib:/lib" \
