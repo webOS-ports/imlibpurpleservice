@@ -169,6 +169,11 @@ static void incoming_message_cb(PurpleConversation *conv, const char *who, const
 static void im_reaction_cb(PurpleAccount* account, const char* targetServiceMessageId, const char* emoji, const char* sender, void* data);
 // webOS: handler for "webos-im-outbox-id" - attaches a network id to the user's own app-sent message row.
 static void im_outbox_id_cb(PurpleAccount* account, const char* serviceMessageId, const char* text, void* data);
+// webOS delivery/read receipts: a prpl reports the recipient delivered/read our outgoing message.
+// by-id (WhatsApp/Signal): (account, serviceMessageId, status). watermark (Telegram/Facebook/Teams):
+// (account, scope, watermark, status). status is "delivered" or "read".
+static void im_receipt_cb(PurpleAccount* account, const char* serviceMessageId, const char* status, void* data);
+static void im_receipt_hwm_cb(PurpleAccount* account, const char* scope, const char* watermark, const char* status, void* data);
 // webOS: register+connect all cross-prpl reaction signals ONCE, early (from initializeLibpurple), before
 // any prpl logs in - so instant-reconnect prpls (whatsmeow) don't race the registration.
 static void registerWebosReactionSignals();
@@ -2358,6 +2363,34 @@ static void im_outbox_id_cb(PurpleAccount* account, const char* serviceMessageId
 }
 
 /*
+ * webOS delivery/read receipts (by-id): a prpl (WhatsApp/Signal) reported that the recipient DELIVERED
+ * or READ the outgoing message whose network id is serviceMessageId. Resolve the owning account and
+ * hand off to IMServiceHandler, which upgrades the Outbox row's deliveryStatus (single/double tick).
+ */
+static void im_receipt_cb(PurpleAccount* account, const char* serviceMessageId, const char* status, void* data)
+{
+	if (account == NULL || serviceMessageId == NULL || *serviceMessageId == '\0' || status == NULL || s_imServiceHandler == NULL)
+		return;
+	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
+	std::string ownerWebos = getWebosUsername(account->username, serviceName, account);
+	s_imServiceHandler->handleReceiptById(serviceName.c_str(), ownerWebos.c_str(), serviceMessageId, status);
+}
+
+/*
+ * webOS delivery/read receipts (watermark): a prpl (Telegram/Facebook/Teams) reported that everything
+ * up to a boundary was delivered/read. scope names the conversation + match field (see ReceiptHandler);
+ * watermark is the numeric boundary. Upgrades every Outbox row at/under it.
+ */
+static void im_receipt_hwm_cb(PurpleAccount* account, const char* scope, const char* watermark, const char* status, void* data)
+{
+	if (account == NULL || scope == NULL || *scope == '\0' || watermark == NULL || *watermark == '\0' || status == NULL || s_imServiceHandler == NULL)
+		return;
+	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
+	std::string ownerWebos = getWebosUsername(account->username, serviceName, account);
+	s_imServiceHandler->handleReceiptWatermark(serviceName.c_str(), ownerWebos.c_str(), scope, watermark, status);
+}
+
+/*
  * webOS reactions (aggregated/REPLACE): a prpl emitted "webos-im-reaction-set" carrying the whole
  * reaction summary for one message (serialized as "count<SP>emoji" records separated by '\n'). Used
  * by prpls that only expose aggregated counts (Telegram). Resolve the owning account and REPLACE the
@@ -4490,6 +4523,25 @@ static void registerWebosReactionSignals()
 			purple_value_new(PURPLE_TYPE_STRING));
 	purple_signal_connect(convHandle, "webos-im-outbox-id", &webosHandle,
 			PURPLE_CALLBACK(im_outbox_id_cb), NULL);
+
+	// delivery/read receipts BY-ID (WhatsApp/Signal): (account, serviceMessageId, status).
+	purple_signal_register(convHandle, "webos-im-receipt",
+			purple_marshal_VOID__POINTER_POINTER_POINTER, NULL, 3,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+	purple_signal_connect(convHandle, "webos-im-receipt", &webosHandle,
+			PURPLE_CALLBACK(im_receipt_cb), NULL);
+
+	// delivery/read receipts WATERMARK (Telegram/Facebook/Teams): (account, scope, watermark, status).
+	purple_signal_register(convHandle, "webos-im-receipt-hwm",
+			purple_marshal_VOID__POINTER_POINTER_POINTER_POINTER, NULL, 4,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+	purple_signal_connect(convHandle, "webos-im-receipt-hwm", &webosHandle,
+			PURPLE_CALLBACK(im_receipt_hwm_cb), NULL);
 
 	// SEND: prpls CONNECT to this to transmit a reaction the user placed (account, targetServiceMessageId,
 	// emoji, peer, removeFlag "1"=remove). Emitted by LibpurpleAdapter::sendReaction; owning prpl handles it.

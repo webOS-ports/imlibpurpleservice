@@ -105,6 +105,11 @@ public:
 	// "webos-im-outbox-id" signal. `text` is the sent body, used only as a correlation hint.
 	virtual bool handleOutboxId(const char* serviceName, const char* username, const char* serviceMessageId,
 				const char* text) = 0;
+	// webOS delivery/read receipts (recipient delivered/read our outgoing message).
+	virtual bool handleReceiptById(const char* serviceName, const char* username,
+				const char* serviceMessageId, const char* status) = 0;
+	virtual bool handleReceiptWatermark(const char* serviceName, const char* username,
+				const char* scope, const char* watermark, const char* status) = 0;
 	virtual bool updateBuddyStatus(const char* accountId, const char* serviceName, const char* username, int availability,
 				const char* customMessage, const char* groupName, const char* buddyAvatarLoc) = 0;
 	// Perf (#2): batched presence for one account - `updates` is an array of { username, availability,

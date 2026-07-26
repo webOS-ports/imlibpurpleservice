@@ -95,6 +95,13 @@ typedef enum {
 // Array of { emoji, sender } objects merged onto the TARGET message by the reaction handler; the
 // Messaging app renders these as inline badges instead of a separate "reacted with X" message.
 #define MOJDB_REACTIONS             _T("reactions")
+// webOS delivery/read receipts: the recipient's delivery state of an OUTGOING message, merged onto the
+// Outbox row by ReceiptHandler when the prpl reports a receipt (WhatsApp/Signal by message id;
+// Telegram/Facebook/Teams by high-water watermark). "delivered" -> single tick, "read" -> double tick.
+// Monotonic: read outranks delivered; never downgraded. The Messaging app renders the tick from it.
+#define MOJDB_DELIVERY_STATUS       _T("deliveryStatus")
+#define MOJDB_DELIVERY_DELIVERED    _T("delivered")
+#define MOJDB_DELIVERY_READ         _T("read")
 
 #define MOJDB_CHAT_TYPE             _T("chatType")     // "groupchat" for MUC messages
 #define MOJDB_CHANNEL_NAME          _T("channelName")  // stable room key (e.g. Discord channel id, Telegram chat-<id>)

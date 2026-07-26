@@ -63,6 +63,11 @@ public:
 			const char* serialized);
 	virtual bool handleOutboxId(const char* serviceName, const char* username, const char* serviceMessageId,
 			const char* text);
+	// webOS delivery/read receipts (recipient delivered/read our outgoing message).
+	virtual bool handleReceiptById(const char* serviceName, const char* username,
+			const char* serviceMessageId, const char* status);
+	virtual bool handleReceiptWatermark(const char* serviceName, const char* username,
+			const char* scope, const char* watermark, const char* status);
 	virtual bool updateBuddyStatus(const char* accountId, const char* serviceName, const char* username, int availability,
 			const char* customMessage, const char* groupName, const char* buddyAvatarLoc);
 	// Perf (#2): batched presence for one account (see IMServiceCallbackInterface / BuddyStatusHandler).

@@ -35,6 +35,7 @@
 #include "IncomingIMHandler.h"
 #include "ReactionHandler.h"
 #include "OutboxIdHandler.h"
+#include "ReceiptHandler.h"
 #include "IMMessage.h"
 #include "OutgoingIMCommandHandler.h"
 #include "OnEnabledHandler.h"
@@ -1257,6 +1258,35 @@ bool IMServiceHandler::handleOutboxId(const char* serviceName, const char* usern
 		MojString error;
 		MojErrToString(err, error);
 		MojLogError(IMServiceApp::s_log, _T("handleOutboxId failed: %d - %s"), err, error.data());
+		return false;
+	}
+	return true;
+}
+
+// webOS delivery/read receipts: a prpl reported that the recipient delivered/read an outgoing message.
+// BY-ID (WhatsApp/Signal) targets the exact serviceMessageId; WATERMARK (Telegram/Facebook/Teams) marks
+// everything up to a boundary. Each spins up a self-retained ReceiptHandler for the async DB work.
+bool IMServiceHandler::handleReceiptById(const char* serviceName, const char* username,
+		const char* serviceMessageId, const char* status)
+{
+	MojRefCountedPtr<ReceiptHandler> h(new ReceiptHandler(m_service, this));
+	MojErr err = h->handleReceiptById(serviceName, username, serviceMessageId, status);
+	if (err) {
+		MojString e; MojErrToString(err, e);
+		MojLogError(IMServiceApp::s_log, _T("handleReceiptById failed: %d - %s"), err, e.data());
+		return false;
+	}
+	return true;
+}
+
+bool IMServiceHandler::handleReceiptWatermark(const char* serviceName, const char* username,
+		const char* scope, const char* watermark, const char* status)
+{
+	MojRefCountedPtr<ReceiptHandler> h(new ReceiptHandler(m_service, this));
+	MojErr err = h->handleReceiptWatermark(serviceName, username, scope, watermark, status);
+	if (err) {
+		MojString e; MojErrToString(err, e);
+		MojLogError(IMServiceApp::s_log, _T("handleReceiptWatermark failed: %d - %s"), err, e.data());
 		return false;
 	}
 	return true;
