@@ -412,6 +412,33 @@ MojErr IMLoginStateHandler::handleConnectionChanged(const MojObject payload)
 		LibpurpleAdapter::deviceConnectionClosed(false, ConnectionState::wifiIpAddress());
 	}
 
+	// webOS: connection is (back) UP. Historically handleConnectionChanged ONLY ever set accounts
+	// OFFLINE (the branches above: no-internet / interface switch); nothing re-drove login when the
+	// network RETURNED. Because the imloginstate db-watch only fires on a RECORD change and nothing
+	// rewrote the record on reconnect, an account dropped by a blip / WiFi roam / sleep-wake sat
+	// state=offline until the user manually toggled their status. Fix: when there is a usable internet
+	// connection, re-fire the watch for every imloginstate record by merging the current interface IP.
+	// handleLoginStateChange -> needsToLogin() then logs the want-online ones back in; needsToLogin()
+	// is availability-gated so intentionally-offline accounts are skipped, and online accounts are a
+	// no-op. Runs LAST so accounts the interface-switch branches just moved offline are re-driven onto
+	// the new interface. The empty query mirrors the "all records" merge used by the no-internet branch.
+	if (ConnectionState::hasInternetConnection())
+	{
+		MojString currentIp = ConnectionState::wifiConnected() ? ConnectionState::wifiIpAddress()
+		                                                       : ConnectionState::wanIpAddress();
+		MojLogInfo(IMServiceApp::s_log, _T("handleConnectionChanged: internet available - re-driving login for offline accounts (ip %s)"), currentIp.data());
+		MojDbQuery query; // intentionally empty query - all records; needsToLogin() filters to offline + want-online
+		query.from(IM_LOGINSTATE_KIND);
+		MojObject mergeProps;
+		mergeProps.putString("ipAddress", currentIp);
+		MojErr merr = m_dbClient.merge(m_ignoreUpdateLoginStateSlot, query, mergeProps);
+		if (merr) {
+			MojString error;
+			MojErrToString(merr, error);
+			MojLogError(IMServiceApp::s_log, _T("handleConnectionChanged: re-drive merge failed: %d - %s"), merr, error.data());
+		}
+	}
+
 	return MojErrNone;
 }
 
@@ -575,8 +602,28 @@ MojErr IMLoginStateHandler::getCredentialsResult(MojObject& payload, MojErr resu
 	else if (!ConnectionState::hasInternetConnection())
 	{
 		MojLogInfo(IMServiceApp::s_log, _T("No internet connection available!"));
-		// No internet so mark this activity complete and reset the watch
-		// which will fire next time there's a stable connection
+		// webOS backstop: the login bailed for lack of internet. Just resetting the watch and trusting
+		// "next stable connection" is not enough - the imloginstate db-watch only fires on a RECORD
+		// change, so if the connection-restored event in handleConnectionChanged is ever missed the
+		// account stays offline until a manual status toggle. Schedule a retry timer that, after a
+		// delay, re-merges state=offline for THIS account, re-firing the watch -> needsToLogin -> a
+		// fresh attempt. If still offline it bails here again and reschedules, polling until the
+		// network returns (no permanent OFFLINE parking; the availability gate keeps intentionally-
+		// offline accounts out).
+		MojString retrySvc = m_workingLoginState.getServiceName();
+		MojString retryUsr = m_workingLoginState.getUsername();
+		if (!retrySvc.empty() && !retryUsr.empty())
+		{
+			MojDbQuery retryQuery;
+			retryQuery.where("serviceName", MojDbQuery::OpEq, retrySvc);
+			retryQuery.where("username", MojDbQuery::OpEq, retryUsr);
+			retryQuery.from(IM_LOGINSTATE_KIND);
+			MojObject retryMerge;
+			retryMerge.putString("state", LOGIN_STATE_OFFLINE);
+			MojRefCountedPtr<IMLoginFailRetryHandler> retryHandler(new IMLoginFailRetryHandler(m_service));
+			retryHandler->startTimerActivity(retrySvc, retryQuery, retryMerge, 20);
+		}
+		// mark this activity complete and reset the watch which will fire next time there's a change
 		completeAndResetWatch();
 	}
 	else
