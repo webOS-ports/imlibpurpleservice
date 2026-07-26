@@ -98,7 +98,7 @@ bool wav_to_opus_voicenote(const char* wavPath, const char* oggPath, float gain)
 	if (gain > 1.0f && !pcm.empty()) {
 		int peak = 1;
 		for (size_t i = 0; i < pcm.size(); i++) { int m = pcm[i] < 0 ? -pcm[i] : pcm[i]; if (m > peak) peak = m; }
-		float g = 29490.0f / (float)peak;   // -> ~90% of int16 full scale
+		float g = 23600.0f / (float)peak;   // -> ~72% of int16 full scale (tuned down; 90% was too hot)
 		if (g > gain) g = gain;
 		if (g > 1.0f) {
 			for (size_t i = 0; i < pcm.size(); i++) {
