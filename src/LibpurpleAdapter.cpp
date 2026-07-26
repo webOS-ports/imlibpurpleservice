@@ -940,6 +940,9 @@ static PurpleStatusPrimitive getPurpleAvailabilityFromPalmAvailability(int palmA
  * Callbacks
  */
 
+// forward decl (defined below): batched presence coalescer, shared with buddy_status_changed_cb.
+static void queuePresenceUpdate(const char* accountId, const char* serviceName, const char* username, int availability, const char* customMessage, const char* groupName);
+
 static void buddy_signed_on_off_cb(PurpleBuddy* buddy, gpointer data)
 {
 //	LSError lserror;
@@ -996,7 +999,35 @@ static void buddy_signed_on_off_cb(PurpleBuddy* buddy, gpointer data)
 	// WhatsApp: report under the +E.164 address so the status keys the same as the contact's ims.value
 	// (otherwise the JID-keyed status never matches the "+<phone>"-keyed contact -> buddy shows offline).
 	std::string const buddyWebosName = getWebosUsername(buddy->name, serviceName);
-	s_imServiceHandler->updateBuddyStatus(accountId.c_str(), serviceName.c_str(), buddyWebosName.c_str(), newAvailabilityValue, customMessage, groupName, buddyAvatarLocation);
+	// Perf (#2/#3): mirror buddy_status_changed_cb. A login/relogin/roam signs EVERY buddy on at once,
+	// so a per-buddy find+merge here was THE buddy-sync bottleneck (hundreds of serial db8 round-trips
+	// ~467ms each). Gate the avatar (skip the contact find when it hasn't changed) and route
+	// presence-only ticks through the batched queuePresenceUpdate (one find + one batched merge/put
+	// per account); only a genuinely changed/first-seen avatar takes the immediate per-buddy path.
+	const char* avatarToForward = buddyAvatarLocation;
+	{
+		std::string avatarKey = accountKey;
+		avatarKey.push_back('\x1f');
+		avatarKey.append(buddy->name ? buddy->name : "");
+		std::string currentAvatar = buddyAvatarLocation ? buddyAvatarLocation : "";
+		std::unordered_map<std::string, std::string>::iterator la = s_lastBuddyAvatar.find(avatarKey);
+		if (la != s_lastBuddyAvatar.end() && la->second == currentAvatar)
+		{
+			avatarToForward = NULL; // unchanged -> skip the contact find/update
+		}
+		else
+		{
+			s_lastBuddyAvatar[avatarKey] = currentAvatar;
+		}
+	}
+	if (avatarToForward != NULL)
+	{
+		s_imServiceHandler->updateBuddyStatus(accountId.c_str(), serviceName.c_str(), buddyWebosName.c_str(), newAvailabilityValue, customMessage, groupName, avatarToForward);
+	}
+	else
+	{
+		queuePresenceUpdate(accountId.c_str(), serviceName.c_str(), buddyWebosName.c_str(), newAvailabilityValue, customMessage, groupName);
+	}
 
 	g_message(
 			"%s says: %s's presence: availability: '%i', custom message: '%s', avatar location: '%s', display name: '%s', group name: '%s'",
