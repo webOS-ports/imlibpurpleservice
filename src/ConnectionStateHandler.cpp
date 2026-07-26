@@ -114,6 +114,7 @@ void ConnectionState::connectHandlerDied()
 
 ConnectionState::ConnectionStateHandler::ConnectionStateHandler(MojService* service, ConnectionState* connState)
 : m_connMgrSubscriptionSlot(this, &ConnectionState::ConnectionStateHandler::connectionManagerResult),
+  m_connMgrDirectSlot(this, &ConnectionState::ConnectionStateHandler::directConnectionStatusResult),
   m_service(service),
   m_connState(connState),
   m_receivedResponse(false)
@@ -150,6 +151,45 @@ ConnectionState::ConnectionStateHandler::ConnectionStateHandler(MojService* serv
 			MojLogError(IMServiceApp::s_log, _T("ConnectionStateHandler send request failed"));
 		}
 	}
+
+	// webOS: ALSO subscribe DIRECTLY to the connection manager. The activitymanager
+	// internet-requirement watch above can go stale after a connectivity blip and never report
+	// recovery (transport stuck at "no internet", nothing logs back in). A direct getStatus
+	// subscription is a reliable live feed: it delivers the current status immediately on subscribe
+	// and on every change thereafter. directConnectionStatusResult wraps it into the same shape
+	// connectionManagerResult parses.
+	MojRefCountedPtr<MojServiceRequest> directReq;
+	if (m_service->createRequest(directReq) == MojErrNone)
+	{
+		MojObject directParams;
+		directParams.put(_T("subscribe"), true);
+		MojErr derr = directReq->send(m_connMgrDirectSlot, "com.palm.connectionmanager", "getStatus", directParams, MojServiceRequest::Unlimited);
+		if (derr)
+		{
+			MojLogError(IMServiceApp::s_log, _T("ConnectionStateHandler: direct connectionmanager getStatus subscribe failed"));
+		}
+	}
+}
+
+/*
+ * Direct com.palm.connectionmanager/getStatus subscription callback. The status fields
+ * (isInternetConnectionAvailable, wifi, wan) are at the TOP level here (no $activity wrapper),
+ * so wrap them into the $activity.requirements.internet shape connectionManagerResult expects
+ * and reuse its parsing unchanged.
+ */
+MojErr ConnectionState::ConnectionStateHandler::directConnectionStatusResult(MojObject& result, MojErr err)
+{
+	if (err == MojErrNone && result.contains(_T("isInternetConnectionAvailable")))
+	{
+		MojObject requirements;
+		requirements.put(_T("internet"), result);
+		MojObject activity;
+		activity.put(_T("requirements"), requirements);
+		MojObject wrapped;
+		wrapped.put(_T("$activity"), activity);
+		return connectionManagerResult(wrapped, MojErrNone);
+	}
+	return MojErrNone;
 }
 
 

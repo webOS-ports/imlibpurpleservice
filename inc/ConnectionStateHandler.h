@@ -39,10 +39,18 @@ public:
 		ConnectionStateHandler(MojService* service, ConnectionState* connState);
 		virtual ~ConnectionStateHandler();
 		MojErr connectionManagerResult(MojObject& result, MojErr err);
+		// webOS: a DIRECT com.palm.connectionmanager/getStatus subscription (reliable live feed).
+		// It wraps the top-level status into the $activity shape and feeds connectionManagerResult.
+		// The activitymanager internet-requirement watch ALONE goes stale after a connectivity blip
+		// and never reports recovery, leaving the transport stuck at "no internet" so nothing logs
+		// back in (the recurring "nothing comes online" bug). The direct subscription always delivers
+		// the current state on subscribe + every change.
+		MojErr directConnectionStatusResult(MojObject& result, MojErr err);
 		bool hasConnData() { return m_receivedResponse; }
 
 	private:
 		MojDbClient::Signal::Slot<ConnectionStateHandler> m_connMgrSubscriptionSlot;
+		MojDbClient::Signal::Slot<ConnectionStateHandler> m_connMgrDirectSlot;
 
 		MojService*	m_service;
 		ConnectionState* m_connState;
