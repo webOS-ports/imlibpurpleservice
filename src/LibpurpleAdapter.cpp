@@ -641,19 +641,42 @@ static std::string getPurpleUsername(std::string const& username, std::string co
 // re-sync, incoming message) MUST translate, or it targets a username no webOS record is keyed on --
 // e.g. requestBuddyResync's imloginstate bump silently matches nothing and the buddy sync never runs.
 // No-op for every other service and for an already-+E.164/foreign form.
-static std::string getWebosUsername(const char* purpleUsername, std::string const& serviceName)
+static std::string getWebosUsername(const char* purpleUsername, std::string const& serviceName, PurpleAccount* account = NULL)
 {
 	std::string u(purpleUsername ? purpleUsername : "");
-	if (serviceName != "type_whatsapp")
-		return u;
-	static const std::string waSuffix = "@s.whatsapp.net";
-	if (u.size() > waSuffix.size() &&
-	    u.compare(u.size() - waSuffix.size(), waSuffix.size(), waSuffix) == 0)
+	if (serviceName == "type_whatsapp")
 	{
-		std::string digits = u.substr(0, u.size() - waSuffix.size());
-		if (!digits.empty() && digits[0] != '+')
-			return "+" + digits;
-		return digits;
+		static const std::string waSuffix = "@s.whatsapp.net";
+		if (u.size() > waSuffix.size() &&
+		    u.compare(u.size() - waSuffix.size(), waSuffix.size(), waSuffix) == 0)
+		{
+			std::string digits = u.substr(0, u.size() - waSuffix.size());
+			if (!digits.empty() && digits[0] != '+')
+				return "+" + digits;
+			return digits;
+		}
+		return u;
+	}
+	// webOS Signal: contacts are keyed by their ACI UUID, which never matches a phone-based person
+	// record, so a Signal buddy/message would not merge with the contact (unlike WhatsApp). presage
+	// stashes the contact's phone as a "phone_number" buddy attribute when Signal shares it; use that as
+	// the webOS ims.value (+E.164) so the Signal identity merges with the same phone contact. presage's
+	// send accepts +E.164 (classify_recipient -> resolve_phone_to_uuid), so the reverse path just passes
+	// it through. Falls back to the UUID when no phone is known (phone-number sharing off).
+	if (serviceName == "type_signal" && account != NULL && isSignalUuid(u.c_str()))
+	{
+		PurpleBuddy* b = purple_find_buddy(account, u.c_str());
+		if (b != NULL)
+		{
+			const char* phone = purple_blist_node_get_string(&b->node, "phone_number");
+			if (phone && *phone)
+			{
+				std::string p(phone);
+				if (p[0] != '+')
+					p = "+" + p;
+				return p;
+			}
+		}
 	}
 	return u;
 }
@@ -999,7 +1022,7 @@ static void buddy_signed_on_off_cb(PurpleBuddy* buddy, gpointer data)
 	// buddy->name is stored in the imbuddyStatus DB kind in the libpurple format - ie. for AIM without the "@aol.com" so that is how we need to search for it
 	// WhatsApp: report under the +E.164 address so the status keys the same as the contact's ims.value
 	// (otherwise the JID-keyed status never matches the "+<phone>"-keyed contact -> buddy shows offline).
-	std::string const buddyWebosName = getWebosUsername(buddy->name, serviceName);
+	std::string const buddyWebosName = getWebosUsername(buddy->name, serviceName, purple_buddy_get_account(buddy));
 	// Perf (#2/#3): mirror buddy_status_changed_cb. A login/relogin/roam signs EVERY buddy on at once,
 	// so a per-buddy find+merge here was THE buddy-sync bottleneck (hundreds of serial db8 round-trips
 	// ~467ms each). Gate the avatar (skip the contact find when it hasn't changed) and route
@@ -1178,7 +1201,7 @@ static void buddy_status_changed_cb(PurpleBuddy* buddy, PurpleStatus* old_status
 	// Report the buddy under its webOS-facing address (+E.164 for WhatsApp) so the imbuddystatus record
 	// is keyed the same as the contact's ims.value; otherwise a JID-keyed status would never match the
 	// "+<phone>"-keyed contact. No-op for @lid/group ids and other services.
-	std::string const buddyWebosName = getWebosUsername(buddy->name, serviceName);
+	std::string const buddyWebosName = getWebosUsername(buddy->name, serviceName, purple_buddy_get_account(buddy));
 	if (avatarToForward != NULL)
 	{
 		s_imServiceHandler->updateBuddyStatus(accountId.c_str(), serviceName.c_str(), buddyWebosName.c_str(), newAvailabilityValue, customMessage, groupName, avatarToForward);
@@ -2018,7 +2041,7 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 			if (sentAccount != NULL)
 			{
 				std::string const& sentService = getServiceNameFromPurpleAccount(sentAccount);
-				std::string ownerWebos = getWebosUsername(sentAccount->username, sentService);
+				std::string ownerWebos = getWebosUsername(sentAccount->username, sentService, sentAccount);
 				// serviceMessageId the prpl stashed on the conv right before this write (its own id).
 				char* svcMsgId = (char*) purple_conversation_get_data(conv, "webos-msg-id");
 				// webOS replies: a carbon of a reply we sent from another client carries the quoted-original
@@ -2033,7 +2056,7 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 					if (peer != NULL && *peer != '\0')
 					{
 						std::string peerStripped = stripResourceFromJabberUsername(peer, sentService);
-						std::string peerWebos = getWebosUsername(peerStripped.c_str(), sentService);
+						std::string peerWebos = getWebosUsername(peerStripped.c_str(), sentService, sentAccount);
 						s_imServiceHandler->incomingIM(sentService.c_str(), ownerWebos.c_str(), peerWebos.c_str(),
 								message, mtime, NULL, NULL, NULL, NULL, false, NULL,
 								(svcMsgId && *svcMsgId) ? svcMsgId : NULL,
@@ -2269,8 +2292,8 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 	// message threads to the same buddy/contact whose ims.value we now write as "+<phone>". The human
 	// from.name was already computed above from the raw JID, and the buddy lookups above used the raw
 	// JID, so only the STORED addresses change here. Held in locals so the c_str()s outlive the call.
-	std::string ownerWebos = getWebosUsername(account->username, serviceName);
-	std::string senderWebos = getWebosUsername(usernameFromStripped.c_str(), serviceName);
+	std::string ownerWebos = getWebosUsername(account->username, serviceName, account);
+	std::string senderWebos = getWebosUsername(usernameFromStripped.c_str(), serviceName, account);
 
 	// webOS reactions: the prpl stashes its own id for THIS message on the conversation right before
 	// serv_got_im (which synchronously drives us here). Read it so incomingIM can persist it as
@@ -2309,8 +2332,8 @@ static void im_reaction_cb(PurpleAccount* account, const char* targetServiceMess
 		return;
 
 	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
-	std::string ownerWebos  = getWebosUsername(account->username, serviceName);
-	std::string senderWebos = (sender != NULL && *sender != '\0') ? getWebosUsername(sender, serviceName) : std::string();
+	std::string ownerWebos  = getWebosUsername(account->username, serviceName, account);
+	std::string senderWebos = (sender != NULL && *sender != '\0') ? getWebosUsername(sender, serviceName, account) : std::string();
 
 	s_imServiceHandler->handleReaction(serviceName.c_str(), ownerWebos.c_str(), targetServiceMessageId,
 			emoji ? emoji : "", senderWebos.c_str());
@@ -3696,7 +3719,7 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 			// the conversation "to") read as "+31638307067" instead of the JID, matching the +E.164 the
 			// incoming-message from.addr now uses. Opaque "@lid"/group ids pass through unchanged. The
 			// display name (waName, above) and phone-merge were already derived from the raw JID.
-			std::string const buddyWebosName = getWebosUsername(buddyToBeAdded->name, serviceName);
+			std::string const buddyWebosName = getWebosUsername(buddyToBeAdded->name, serviceName, purple_buddy_get_account(buddyToBeAdded));
 			buddyObj.putString("username", buddyWebosName.c_str());
 			buddyObj.putString("serviceName", serviceName);
 
