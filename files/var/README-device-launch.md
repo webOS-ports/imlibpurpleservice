@@ -90,10 +90,12 @@ plugin; this is only the db8 side.)
     /var/provision-person-search.sh
     # search-by-service, part 2 (app): from the com.palm.app.contacts checkout
     cp app/patches.js /media/cryptofs/apps/usr/palm/applications/com.palm.app.contacts/app/patches.js
-    # message reactions (serviceMessageId index on the immessage kind):
-    cp etc/palm/db/kinds/com.palm.immessage.libpurple /etc/palm/db/kinds/com.palm.immessage.libpurple
-    cp var/provision-im-reactions.sh /var/ && chmod 755 /var/provision-im-reactions.sh
-    /var/provision-im-reactions.sh
+    # ALL messaging db8 kinds + permissions (reflash reverts them -> -3963 on find(imserver) ->
+    # no servers/channels; also covers the reaction serviceMessageId index). Push the repo copies
+    # of etc/palm/db/{kinds,permissions}/* first, then:
+    cp var/provision-im-db.sh /var/ && chmod 755 /var/provision-im-db.sh
+    /var/provision-im-db.sh
+    # (provision-im-reactions.sh is now subsumed by provision-im-db.sh, but kept for the reaction-only case)
     stop LunaSysMgr; start LunaSysMgr
     sync   # then tellbootie / reboot
 
