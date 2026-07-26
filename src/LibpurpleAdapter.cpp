@@ -2742,7 +2742,20 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 			account = purple_accounts_find(purpleUsername.c_str(), prplProtocolId.c_str());
 			if (!account)
 			{
-				account = Util::createPurpleAccount(purpleUsername.c_str(), prplProtocolId.c_str(), params.config);
+				/* A prpl that can't be resolved (plugin missing / failed g_module_open, or dlclosed for
+				 * lacking g_module_make_resident) makes createPurpleAccount->getProtocolInfo THROW. If we
+				 * let that propagate it hits std::terminate and CRASH-LOOPS the WHOLE transport (every
+				 * account, not just this one). Catch it and fail only THIS account's login. */
+				try
+				{
+					account = Util::createPurpleAccount(purpleUsername.c_str(), prplProtocolId.c_str(), params.config);
+				}
+				catch (const Util::MojoException& e)
+				{
+					MojLogError(IMServiceApp::s_log, _T("LibpurpleAdapter::login: createPurpleAccount threw for prpl '%s' (service %s): %s - failing this account's login only"),
+						prplProtocolId.c_str(), params.serviceName.data(), e.what().c_str());
+					return FAILED;
+				}
 				if (!account)
 				{
 					MojLogError(IMServiceApp::s_log, _T("LibpurpleAdapter::login failed to create new Purple account"));
@@ -4589,7 +4602,18 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::startQRLogin(const char* service
 	s_offlineAccountData.erase(accountKey);
 
 	MojObject emptyConfig;
-	account = Util::createPurpleAccount(purpleUsername.c_str(), prplProtocolId.c_str(), emptyConfig);
+	/* Same guard as login(): an unresolved prpl throws here - catch it so a QR-add of a broken/
+	 * missing plugin fails just this attempt instead of crash-looping the whole transport. */
+	try
+	{
+		account = Util::createPurpleAccount(purpleUsername.c_str(), prplProtocolId.c_str(), emptyConfig);
+	}
+	catch (const Util::MojoException& e)
+	{
+		MojLogError(IMServiceApp::s_log, _T("startQRLogin: createPurpleAccount threw for prpl '%s': %s - failing this login only"),
+			prplProtocolId.c_str(), e.what().c_str());
+		return FAILED;
+	}
 	if (!account)
 	{
 		MojLogError(IMServiceApp::s_log, _T("startQRLogin: failed to create Purple account"));

@@ -30,12 +30,14 @@ namespace Util
             PurplePlugin* prpl = purple_find_prpl(prpl_id);
 
             if (prpl == NULL)
-                throw MojoException("Couldn't find prpl");
+                throw MojoException(std::string("getProtocolInfo: purple_find_prpl returned NULL - prpl NOT registered (plugin missing or failed g_module_open) for '")
+                    + (prpl_id ? prpl_id : "(null)") + "'");
 
             PurplePluginProtocolInfo* result = PURPLE_PLUGIN_PROTOCOL_INFO(prpl);
 
             if (result == NULL)
-                throw MojoException("Couldn't find prpl");
+                throw MojoException(std::string("getProtocolInfo: prpl found but PURPLE_PLUGIN_PROTOCOL_INFO is NULL - plugin dlclosed / not g_module_make_resident'd? for '")
+                    + (prpl_id ? prpl_id : "(null)") + "'");
 
             return result;
         }
