@@ -71,6 +71,7 @@
 //#include <json_utils.h>
 #include "IMServiceApp.h"
 #include "entities.h"       // decode_html_entities_utf8 - decode the app's &#NNNNN; emoji to UTF-8 for sendReaction
+#include "OpusEncoder.h"    // wav_to_opus_voicenote - transcode a recorded WAV to an Ogg/Opus voice note
 
 
 static const guint PURPLE_GLIB_READ_COND  = (G_IO_IN | G_IO_HUP | G_IO_ERR);
@@ -4142,7 +4143,7 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceNa
  * stored as serviceMessageId when it arrived); remove=true removes my `emoji` reaction, else adds it
  * (emoji is always supplied so backends can remove a specific reaction); usernameTo is the peer/chat.
  */
-LibpurpleAdapter::SendResult LibpurpleAdapter::sendReaction(const char* serviceName, const char* username, const char* usernameTo, const char* targetServiceMessageId, const char* emoji, bool remove)
+LibpurpleAdapter::SendResult LibpurpleAdapter::sendReaction(const char* serviceName, const char* username, const char* usernameTo, const char* targetServiceMessageId, const char* emoji, bool remove, const char* targetSender)
 {
 	if (!serviceName || !username || !usernameTo || !targetServiceMessageId || *targetServiceMessageId == '\0')
 	{
@@ -4173,6 +4174,14 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendReaction(const char* serviceN
 		decodedEmoji = (char*) malloc(strlen(emoji) + 1);
 		if (decodedEmoji) { decode_html_entities_utf8(decodedEmoji, emoji); }
 	}
+
+	// webOS reactions (SEND) db8 fallback: stash the reacted-to message's original sender on the account
+	// right before the (synchronous) emit, so a backend that needs it - whatsmeow, to set FromMe /
+	// Participant on BuildReaction - can read it back in its signal handler even when its in-memory
+	// message cache has no entry for the target (transport restart/crash, or a message older than the
+	// cache). Delivered out-of-band (not a new signal param) so the shared 5-arg signal - and the 5
+	// other prpls connected to it - stay untouched. The handler clears it after reading.
+	purple_account_set_string(account, "webos-reaction-target-sender", targetSender ? targetSender : "");
 
 	purple_signal_emit(purple_conversations_get_handle(), "webos-im-send-reaction",
 			account, targetServiceMessageId, decodedEmoji ? decodedEmoji : "", usernameToBuf.c_str(),
@@ -4207,6 +4216,30 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendFile(const char* serviceName,
 	{
 		MojLogError(IMServiceApp::s_log, _T("sendFile: file does not exist or is not a regular file: %s"), filePath);
 		return LibpurpleAdapter::SEND_FAILED;
+	}
+
+	// webOS voice messages: a recorded voice note arrives as a WAV (the native MediaCaptureV3 output;
+	// the file picker is image-only, so a .wav here is always our recorder). Transcode it to Ogg/Opus
+	// so the prpl sends it as a proper voice note (PTT) instead of a raw WAV document - Opus is the
+	// voice-note format for WhatsApp/Telegram/Discord/FB-E2EE. The .ogg is written next to the WAV and
+	// used for the rest of sendFile; `transcoded` must outlive the function so filePath stays valid.
+	std::string transcoded;
+	{
+		size_t plen = strlen(filePath);
+		if (plen > 4 && g_ascii_strcasecmp(filePath + plen - 4, ".wav") == 0)
+		{
+			transcoded.assign(filePath, plen - 4);
+			transcoded += ".ogg";
+			if (wav_to_opus_voicenote(filePath, transcoded.c_str(), 6.0f))
+			{
+				MojLogInfo(IMServiceApp::s_log, _T("sendFile: voice note transcoded %s -> %s"), filePath, transcoded.c_str());
+				filePath = transcoded.c_str();
+			}
+			else
+			{
+				MojLogError(IMServiceApp::s_log, _T("sendFile: voice-note transcode failed for %s; sending as-is"), filePath);
+			}
+		}
 	}
 
 	std::string accountKey = getAccountKey(username, serviceName);
