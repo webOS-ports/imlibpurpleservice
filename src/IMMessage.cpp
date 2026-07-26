@@ -375,6 +375,22 @@ MojErr IMMessage::createDBObject(MojObject& returnObj) {
 		MojErrCheck(err);
 	}
 
+	// webOS replies: persist the quoted-original so the Messaging UI renders an inline quote card
+	// (ConversationItem.buildQuote). Schemaless fields; all empty for non-reply messages, so behaviour
+	// is unchanged when a message isn't a reply. quotedText is the trigger; id/from are optional.
+	if (!quotedText.empty()) {
+		err = returnObj.putString(MOJDB_QUOTED_TEXT, quotedText);
+		MojErrCheck(err);
+		if (!quotedFrom.empty()) {
+			err = returnObj.putString(MOJDB_QUOTED_FROM, quotedFrom);
+			MojErrCheck(err);
+		}
+		if (!quotedMessageId.empty()) {
+			err = returnObj.putString(MOJDB_QUOTED_MSG_ID, quotedMessageId);
+			MojErrCheck(err);
+		}
+	}
+
 	IMServiceHandler::privatelogIMMessage(_T("DB Message object %s:"), returnObj, MOJDB_MSG_TEXT);
 
 	return err;

@@ -86,6 +86,12 @@ typedef enum {
 // later reaction references it (see MOJDB_REACTIONS) to attach itself to this row. Schemaless field;
 // an index (serviceName,username,serviceMessageId) is added to the kind for the reaction lookup.
 #define MOJDB_SERVICE_MSG_ID        _T("serviceMessageId")
+// webOS replies: the quoted-original a reply points at. quotedMessageId == the original message's
+// serviceMessageId (so the UI can look it up); quotedText/quotedFrom are the original's text + sender,
+// stashed by the prpl on the conversation ("webos-quoted-*") and rendered as an inline quote card.
+#define MOJDB_QUOTED_MSG_ID         _T("quotedMessageId")
+#define MOJDB_QUOTED_TEXT           _T("quotedText")
+#define MOJDB_QUOTED_FROM           _T("quotedFrom")
 // Array of { emoji, sender } objects merged onto the TARGET message by the reaction handler; the
 // Messaging app renders these as inline badges instead of a separate "reacted with X" message.
 #define MOJDB_REACTIONS             _T("reactions")
@@ -132,6 +138,10 @@ public:
 
 	// webOS reactions: set the prpl's own id for this message (persisted so a later reaction targets it).
 	MojErr setServiceMessageId(const char* id) { return serviceMessageId.assign(id ? id : ""); }
+	// webOS replies: set the quoted-original this message replies to (id/text/sender).
+	MojErr setQuotedMessageId(const char* id) { return quotedMessageId.assign(id ? id : ""); }
+	MojErr setQuotedText(const char* t) { return quotedText.assign(t ? t : ""); }
+	MojErr setQuotedFrom(const char* f) { return quotedFrom.assign(f ? f : ""); }
 
 private:
 	MojString msgText;
@@ -157,6 +167,9 @@ private:
 	// below (and the MUC db8 properties) are written; all empty/false for ordinary 1:1 IMs.
 	bool isGroupChat;
 	MojString serviceMessageId;  // the prpl's own id for this message (for reactions/replies to target); empty if the prpl didn't supply one
+	MojString quotedMessageId;   // webOS replies: serviceMessageId of the quoted original (empty if not a reply)
+	MojString quotedText;        // webOS replies: text of the quoted original
+	MojString quotedFrom;        // webOS replies: sender display name of the quoted original
 	MojString channelName;   // stable room key (e.g. Discord channel id/name, Telegram chat-<id>)
 	MojString channelDisplayName;   // human room title (Telegram group name); channelName stays the match key
 	MojString serverId;      // parent server id (Discord guild id) - mirrors serverName until M1

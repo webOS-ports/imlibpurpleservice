@@ -1147,7 +1147,8 @@ MojErr IMServiceHandler::IMSendCmd(MojServiceMessage* serviceMsg, const MojObjec
  */
 bool IMServiceHandler::incomingIM(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp,
 		const char* channelName, const char* channelDisplayName, const char* serverId, const char* serverName, bool muted,
-		const char* usernameFromDisplay, const char* serviceMessageId, bool outgoing)
+		const char* usernameFromDisplay, const char* serviceMessageId,
+		const char* quotedMessageId, const char* quotedText, const char* quotedFrom, bool outgoing)
 {
 
 	MojLogTrace(IMServiceApp::s_log);
@@ -1169,6 +1170,14 @@ bool IMServiceHandler::incomingIM(const char* serviceName, const char* username,
 	// webOS reactions: remember the prpl's own id for this message so a later reaction can target it.
 	if (!err && serviceMessageId != NULL && *serviceMessageId != '\0') {
 		err = imMessage->setServiceMessageId(serviceMessageId);
+	}
+
+	// webOS replies: persist the quoted-original this message replies to. quotedText is the trigger
+	// (the UI renders a quote card when it's present); id/from are optional refinements.
+	if (!err && quotedText != NULL && *quotedText != '\0') {
+		err = imMessage->setQuotedText(quotedText);
+		if (!err && quotedFrom != NULL) { err = imMessage->setQuotedFrom(quotedFrom); }
+		if (!err && quotedMessageId != NULL) { err = imMessage->setQuotedMessageId(quotedMessageId); }
 	}
 
 	if (!err) {

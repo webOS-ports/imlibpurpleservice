@@ -2232,14 +2232,24 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 	// serv_got_im (which synchronously drives us here). Read it so incomingIM can persist it as
 	// serviceMessageId, then free + clear it (the prpl g_strdup'd it; this handoff owns the free).
 	char* svcMsgId = (char*) purple_conversation_get_data(conv, "webos-msg-id");
+	// webOS replies: the prpl also stashes the quoted-original (id/text/sender) this message replies to,
+	// the same way it stashes webos-msg-id. Read alongside so incomingIM can persist a proper inline
+	// quote instead of the raw "> "/HTML folded into the body. Freed + cleared below (the prpl g_strdup'd).
+	char* qMsgId = (char*) purple_conversation_get_data(conv, "webos-quoted-id");
+	char* qText  = (char*) purple_conversation_get_data(conv, "webos-quoted-text");
+	char* qFrom  = (char*) purple_conversation_get_data(conv, "webos-quoted-from");
 
 	s_imServiceHandler->incomingIM(serviceName.c_str(), ownerWebos.c_str(), senderWebos.c_str(),
-			message, mtime, channelName, channelDisplayName, serverName, serverName, muted, usernameFromDisplay, svcMsgId);
+			message, mtime, channelName, channelDisplayName, serverName, serverName, muted, usernameFromDisplay, svcMsgId,
+			qMsgId, qText, qFrom);
 
 	if (svcMsgId != NULL) {
 		g_free(svcMsgId);
 		purple_conversation_set_data(conv, "webos-msg-id", NULL);
 	}
+	if (qMsgId != NULL) { g_free(qMsgId); purple_conversation_set_data(conv, "webos-quoted-id", NULL); }
+	if (qText  != NULL) { g_free(qText);  purple_conversation_set_data(conv, "webos-quoted-text", NULL); }
+	if (qFrom  != NULL) { g_free(qFrom);  purple_conversation_set_data(conv, "webos-quoted-from", NULL); }
 }
 
 /*

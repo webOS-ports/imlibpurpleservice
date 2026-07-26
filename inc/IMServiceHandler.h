@@ -55,7 +55,8 @@ public:
 	// messages (Discord channels etc.), NULL for 1:1 IMs.
 	virtual bool incomingIM(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp = 0,
 			const char* channelName = NULL, const char* channelDisplayName = NULL, const char* serverId = NULL, const char* serverName = NULL, bool muted = false,
-			const char* usernameFromDisplay = NULL, const char* serviceMessageId = NULL, bool outgoing = false);
+			const char* usernameFromDisplay = NULL, const char* serviceMessageId = NULL,
+			const char* quotedMessageId = NULL, const char* quotedText = NULL, const char* quotedFrom = NULL, bool outgoing = false);
 	virtual bool handleReaction(const char* serviceName, const char* username, const char* targetServiceMessageId,
 			const char* emoji, const char* sender);
 	virtual bool handleReactionSet(const char* serviceName, const char* username, const char* targetServiceMessageId,
