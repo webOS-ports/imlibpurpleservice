@@ -1989,6 +1989,11 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 				std::string ownerWebos = getWebosUsername(sentAccount->username, sentService);
 				// serviceMessageId the prpl stashed on the conv right before this write (its own id).
 				char* svcMsgId = (char*) purple_conversation_get_data(conv, "webos-msg-id");
+				// webOS replies: a carbon of a reply we sent from another client carries the quoted-original
+				// too. Read it (same stash as the RECV path) so the Outbox row renders the inline quote card.
+				char* qMsgId = (char*) purple_conversation_get_data(conv, "webos-quoted-id");
+				char* qText  = (char*) purple_conversation_get_data(conv, "webos-quoted-text");
+				char* qFrom  = (char*) purple_conversation_get_data(conv, "webos-quoted-from");
 
 				if (purple_conversation_get_type(conv) == PURPLE_CONV_TYPE_IM)
 				{
@@ -1999,7 +2004,9 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 						std::string peerWebos = getWebosUsername(peerStripped.c_str(), sentService);
 						s_imServiceHandler->incomingIM(sentService.c_str(), ownerWebos.c_str(), peerWebos.c_str(),
 								message, mtime, NULL, NULL, NULL, NULL, false, NULL,
-								(svcMsgId && *svcMsgId) ? svcMsgId : NULL, /* outgoing */ true);
+								(svcMsgId && *svcMsgId) ? svcMsgId : NULL,
+								(qMsgId && *qMsgId) ? qMsgId : NULL, (qText && *qText) ? qText : NULL,
+								(qFrom && *qFrom) ? qFrom : NULL, /* outgoing */ true);
 					}
 				}
 				else if (purple_conversation_get_type(conv) == PURPLE_CONV_TYPE_CHAT)
@@ -2033,7 +2040,9 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 						const char* serverName = serverNameStr.empty() ? NULL : serverNameStr.c_str();
 						s_imServiceHandler->incomingIM(sentService.c_str(), ownerWebos.c_str(), ownerWebos.c_str(),
 								message, mtime, channelName, channelDisplayName, serverName, serverName, false, NULL,
-								(svcMsgId && *svcMsgId) ? svcMsgId : NULL, /* outgoing */ true);
+								(svcMsgId && *svcMsgId) ? svcMsgId : NULL,
+								(qMsgId && *qMsgId) ? qMsgId : NULL, (qText && *qText) ? qText : NULL,
+								(qFrom && *qFrom) ? qFrom : NULL, /* outgoing */ true);
 					}
 				}
 
@@ -2042,6 +2051,9 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 					g_free(svcMsgId);
 					purple_conversation_set_data(conv, "webos-msg-id", NULL);
 				}
+				if (qMsgId != NULL) { g_free(qMsgId); purple_conversation_set_data(conv, "webos-quoted-id", NULL); }
+				if (qText  != NULL) { g_free(qText);  purple_conversation_set_data(conv, "webos-quoted-text", NULL); }
+				if (qFrom  != NULL) { g_free(qFrom);  purple_conversation_set_data(conv, "webos-quoted-from", NULL); }
 			}
 		}
 		return;
@@ -3978,7 +3990,7 @@ bool LibpurpleAdapter::openChannel(const char* serviceName, const char* username
 	return joinChannelChat(account, channel) != NULL;
 }
 
-LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceName, const char* username, const char* usernameTo, const char* messageText)
+LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceName, const char* username, const char* usernameTo, const char* messageText, const char* quotedMessageId)
 {
 	if (!serviceName || !username || !usernameTo || !messageText)
 	{
@@ -4042,6 +4054,10 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceNa
 			}
 			if (chatConv != NULL && gc != NULL)
 			{
+				// webOS native reply: stash the reply target on the conv so the prpl chat-send reads it and
+				// sets a real reply_to (cleared by the prpl after use). Mirror of the incoming stash.
+				if (quotedMessageId && *quotedMessageId)
+					purple_conversation_set_data(chatConv, "webos-reply-to", g_strdup(quotedMessageId));
 				char* chatMsg = g_strcompress(messageText);
 				int cerr = serv_chat_send(gc, purple_conv_chat_get_id(purple_conversation_get_chat_data(chatConv)),
 						chatMsg, (PurpleMessageFlags)0);
@@ -4072,6 +4088,10 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceNa
 //					gc = purple_conversation_get_gc(conv);
 //					err = serv_send_im(gc, purple_conversation_get_name(conv), sent, msgflags);
 		// we still don't seem to get an error value back there...returns 1, even for an invalid recipient
+		// webOS native reply: stash the reply target on the conv so tgprpl_send_im reads it and sets a
+		// real reply_to on the tdlib sendMessage (the prpl clears it after use). No-op for non-replies.
+		if (quotedMessageId && *quotedMessageId)
+			purple_conversation_set_data(purpleConversation, "webos-reply-to", g_strdup(quotedMessageId));
 		int err = serv_send_im(purple_conversation_get_gc(purpleConversation), purple_conversation_get_name(purpleConversation), messageTextUnescaped, (PurpleMessageFlags)0);
 		if (err < 0) {
 			retVal = LibpurpleAdapter::SEND_FAILED;

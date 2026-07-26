@@ -77,6 +77,12 @@ MojErr SendOneMessageHandler::doSend(const MojObject imMsg) {
 	err = imMsg.get(MOJDB_FILE_PATH, m_filePath, found);
 	MojErrCheck(err);
 
+	// webOS native reply: optional serviceMessageId of the message this one replies to. Passed to the
+	// prpl so it sets a real reply_to (Telegram: parses the "<chatId>:<messageId>" tail) -> other clients
+	// thread the reply. Absent on non-reply messages.
+	err = imMsg.get(MOJDB_QUOTED_MSG_ID, m_quotedMessageId, found);
+	MojErrCheck(err);
+
 	// userNameTo - use "to" address
 	MojObject addrArray; // array
 	found = imMsg.get(MOJDB_TO, addrArray);
@@ -434,12 +440,14 @@ MojErr SendOneMessageHandler::sendToTransport()
 		retVal = LibpurpleAdapter::sendFile(m_serviceName.data(), m_username.data(), m_usernameTo.data(), m_filePath.data());
 		if (LibpurpleAdapter::SENT == retVal && !m_messageText.empty())
 		{
-			LibpurpleAdapter::sendMessage(m_serviceName.data(), m_username.data(), m_usernameTo.data(), m_messageText.data());
+			LibpurpleAdapter::sendMessage(m_serviceName.data(), m_username.data(), m_usernameTo.data(), m_messageText.data(),
+					m_quotedMessageId.empty() ? NULL : m_quotedMessageId.data());
 		}
 	}
 	else
 	{
-		retVal = LibpurpleAdapter::sendMessage(m_serviceName.data(), m_username.data(), m_usernameTo.data(), m_messageText.data());
+		retVal = LibpurpleAdapter::sendMessage(m_serviceName.data(), m_username.data(), m_usernameTo.data(), m_messageText.data(),
+				m_quotedMessageId.empty() ? NULL : m_quotedMessageId.data());
 	}
 
 	// Now save the status

@@ -88,7 +88,8 @@ public:
 	// `outgoing` = a carbon of a message we sent from another client -> stored as an Outbox row.
 	virtual bool incomingIM(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp = 0,
 				const char* channelName = NULL, const char* channelDisplayName = NULL, const char* serverId = NULL, const char* serverName = NULL, bool muted = false,
-				const char* usernameFromDisplay = NULL, const char* serviceMessageId = NULL, bool outgoing = false) = 0;
+				const char* usernameFromDisplay = NULL, const char* serviceMessageId = NULL,
+				const char* quotedMessageId = NULL, const char* quotedText = NULL, const char* quotedFrom = NULL, bool outgoing = false) = 0;
 	// webOS reactions: `sender` reacted (emoji, or "" to remove) to the message the prpl identifies by
 	// `targetServiceMessageId`. Attaches to that message's `reactions` array (see ReactionHandler)
 	// rather than storing a new message. Cross-prpl: driven by the "webos-im-reaction" signal.
@@ -177,7 +178,7 @@ public:
 	static SendResult addBuddy(const char* serviceName, const char* username, const char* buddyUsername, const char* groupname);
 	static SendResult authorizeBuddy(const char* serviceName, const char* username, const char* buddyUsername);
 	static SendResult declineBuddy(const char* serviceName, const char* username, const char* buddyUsername);
-	static SendResult sendMessage(const char *serviceName, const char *username, const char *usernameTo, const char *messageText);
+	static SendResult sendMessage(const char *serviceName, const char *username, const char *usernameTo, const char *messageText, const char *quotedMessageId = NULL);
 	// webOS reactions (SEND): transmit a reaction the user placed from the device. emoji "" = remove.
 	static SendResult sendReaction(const char *serviceName, const char *username, const char *usernameTo, const char *targetServiceMessageId, const char *emoji, bool remove);
 	// webOS attachment send: transmit a local file (absolute path, must exist and be readable in the
