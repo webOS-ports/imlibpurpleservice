@@ -180,7 +180,10 @@ public:
 	static SendResult declineBuddy(const char* serviceName, const char* username, const char* buddyUsername);
 	static SendResult sendMessage(const char *serviceName, const char *username, const char *usernameTo, const char *messageText, const char *quotedMessageId = NULL);
 	// webOS reactions (SEND): transmit a reaction the user placed from the device. emoji "" = remove.
-	static SendResult sendReaction(const char *serviceName, const char *username, const char *usernameTo, const char *targetServiceMessageId, const char *emoji, bool remove);
+	// targetSender = the reacted-to message's original sender (from the app's db8 row). It is stashed on
+	// the account right before the send-reaction signal so a backend (whatsmeow) can build the reaction
+	// without a live in-memory message-cache entry (survives a transport restart / very old messages).
+	static SendResult sendReaction(const char *serviceName, const char *username, const char *usernameTo, const char *targetServiceMessageId, const char *emoji, bool remove, const char *targetSender = NULL);
 	// webOS attachment send: transmit a local file (absolute path, must exist and be readable in the
 	// transport process) to usernameTo. Mirrors sendMessage's account resolution + channel detection:
 	// a group-channel target routes through serv_chat_send_file, a 1:1 IM through serv_send_file. All

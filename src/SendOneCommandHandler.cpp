@@ -257,15 +257,16 @@ LibpurpleAdapter::SendResult SendOneCommandHandler::sendReaction(const MojObject
 	imCmd.get(MOJDB_PARAMS, params);
 	IMServiceHandler::logMojObjectJsonString(_T("sendReaction params: %s"), params);
 
-	MojString targetId, emoji;
+	MojString targetId, emoji, targetSender;
 	bool found = false;
 	params.get(XPORT_TARGET_MSG_ID, targetId, found);
 	params.get(XPORT_EMOJI, emoji, found);   // the emoji being added or removed (always supplied)
+	params.get(XPORT_TARGET_SENDER, targetSender, found); // the reacted-to message's sender (may be empty)
 	bool remove = false;
 	params.get(XPORT_REMOVE, remove); // true => remove my `emoji` reaction, else add it
 
 	return LibpurpleAdapter::sendReaction(m_serviceName.data(), m_username.data(), m_buddyName.data(),
-			targetId.data(), emoji.data(), remove);
+			targetId.data(), emoji.data(), remove, targetSender.data());
 }
 
 LibpurpleAdapter::SendResult SendOneCommandHandler::blockBuddy(const MojObject imCmd) {

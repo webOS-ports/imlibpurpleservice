@@ -39,6 +39,7 @@
 #define XPORT_TARGET_MSG_ID			_T("targetServiceMessageId")
 #define XPORT_EMOJI					_T("emoji")
 #define XPORT_REMOVE				_T("remove")
+#define XPORT_TARGET_SENDER			_T("targetSender")
 
 class SendOneCommandHandler : public MojSignalHandler
 {
