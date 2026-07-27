@@ -3717,6 +3717,7 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 			// -- never skipped and never shown as the raw "<id>@s.whatsapp.net" / "<id>@lid".
 			bool isWhatsApp = (serviceName != NULL && strcmp(serviceName, "type_whatsapp") == 0);
 			bool isSignal = (serviceName != NULL && strcmp(serviceName, "type_signal") == 0);
+			bool isGometa = (serviceName != NULL && strcmp(serviceName, "type_gometa") == 0);
 			std::string waName;
 			if (isWhatsApp)
 			{
@@ -3741,8 +3742,16 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 			// webOS Telegram port: skip deleted/nameless users. tdlib gives them no name, so the
 			// contact would otherwise show a raw "id<number>". Not reporting them here also makes the
 			// BuddyListConsolidator delete any such contacts left from a previous (pre-filter) sync.
-			else if (isBlankName(resolvedAlias))
+			else if (isBlankName(resolvedAlias) && !isGometa)
 			{
+				// tdlib gives DELETED Telegram users no name -> skip them (they'd show as "id<number>").
+				// But a nameless FACEBOOK (gometa) buddy is NOT deleted -- purple-facebook only sets the
+				// SERVER alias, which lags on reconnect, so the buddy legitimately arrives nameless. Skipping
+				// it drops it from the roster, which then makes BuddyListConsolidator DELETE its contact ->
+				// it comes back unlinked (744870190 no longer merged into the Alan Morford person). So keep
+				// gometa buddies: they fall through with no displayName (formatForDB keeps remoteId+ims; the
+				// merge preserves any existing good name, see hasChanges), and the name fills in when the
+				// server alias syncs.
 				MojLogInfo(IMServiceApp::s_log, _T("getFullBuddyList: skipping nameless buddy %s (deleted user?)"), buddyToBeAdded->name);
 				continue;
 			}

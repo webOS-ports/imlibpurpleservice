@@ -113,7 +113,27 @@ MojErr BuddyListConsolidator::consolidateContacts()
 
 		if (!contactIdsToDelete.empty())
 		{
-			m_dbClient.del(m_contactsDeleteSlot, contactIdsToDelete.arrayBegin(), contactIdsToDelete.arrayEnd());
+			// webOS: DON'T wipe contacts when the buddy roster arrived INCOMPLETE. consolidate() marks
+			// every contact whose buddy is missing from THIS snapshot for deletion, so a partial sync
+			// (roster still loading on reconnect, or buddies dropped by the nameless filter) deletes many
+			// still-valid contacts -- which come back later as FRESH records with no avatar and no person
+			// link (the recurring "avatar vanished / 744870190 not linked to Alan Morford" bug).
+			// Completeness test (count-based, not a magic delete-%): every existing IM contact was created
+			// FROM a buddy, so a COMPLETE roster reports ~as many buddies as we have contacts. Removing a
+			// few buddies remotely legitimately shrinks the roster, so allow a small shortfall (up to 10%);
+			// but if the roster reports FEWER THAN 90% of our contacts, buddies are missing wholesale -> the
+			// snapshot is incomplete (still loading on reconnect / filtered), so skip the delete pass.
+			// Adds/merges still run; a truly-removed buddy beyond the 10% is cleaned up on the next complete
+			// sync (a lingering stale contact is harmless, a wiped avatar/link is not).
+			MojSize reported = m_newBuddyList.size(), have = m_contacts.size();
+			if (reported * 10 < have * 9)
+			{
+				MojLogWarning(IMServiceApp::s_log, _T("consolidateContacts: roster INCOMPLETE (%d buddies < 90%% of %d contacts) -- SKIPPING delete of %d contacts to avoid wiping avatars/person links"), (int) reported, (int) have, (int) contactIdsToDelete.size());
+			}
+			else
+			{
+				m_dbClient.del(m_contactsDeleteSlot, contactIdsToDelete.arrayBegin(), contactIdsToDelete.arrayEnd());
+			}
 		}
 
 		if (!contactsToMerge.empty())
@@ -144,7 +164,17 @@ MojErr BuddyListConsolidator::consolidateBuddyStatus()
 
 		if (!buddyIdsToDelete.empty())
 		{
-			m_tempdbClient.del(m_buddyStatusDeleteSlot, buddyIdsToDelete.arrayBegin(), buddyIdsToDelete.arrayEnd());
+			// webOS: same count-based incomplete-roster guard as consolidateContacts -- a partial snapshot
+			// would otherwise wipe most imbuddystatus rows (they were down to ~2 on-device), losing presence.
+			MojSize reported = m_newBuddyList.size(), have = m_buddyStatus.size();
+			if (reported * 10 < have * 9)
+			{
+				MojLogWarning(IMServiceApp::s_log, _T("consolidateBuddyStatus: roster INCOMPLETE (%d buddies < 90%% of %d rows) -- SKIPPING delete of %d buddy-status rows"), (int) reported, (int) have, (int) buddyIdsToDelete.size());
+			}
+			else
+			{
+				m_tempdbClient.del(m_buddyStatusDeleteSlot, buddyIdsToDelete.arrayBegin(), buddyIdsToDelete.arrayEnd());
+			}
 		}
 
 		if (!buddiesToMerge.empty())
@@ -313,13 +343,13 @@ bool ContactConsolidationHelper::hasChanges(MojObject& oldContact, MojObject& ne
 	MojString oldDisplayName, newAvatar, newDisplayName;
 	oldContact.get("nickname", oldDisplayName, oldFound);
 	newBuddy.get("displayName", newDisplayName, newFound);
-	if (oldDisplayName != newDisplayName)
+	// webOS: only UPDATE the name when this update carries a NON-empty one. An empty newDisplayName means
+	// "this buddy-list update didn't include a name" (e.g. a Facebook buddy whose server alias hasn't
+	// synced yet on reconnect), NOT "the name was cleared". The old code overwrote the good name with ""
+	// here, blanking contacts and helping un-link 744870190 from Alan Morford (same class as the avatar
+	// bug below). Genuine name changes still carry a non-empty value.
+	if (!newDisplayName.empty() && oldDisplayName != newDisplayName)
 	{
-		if (oldDisplayName.length() > 1 && newDisplayName.empty())
-		{
-			// Needs to contain at least empty string to overwrite the existing display name
-			newDisplayName.assign("");
-		}
 		hasChanges = true;
 		diffs.put("displayName", newDisplayName);
 	}
