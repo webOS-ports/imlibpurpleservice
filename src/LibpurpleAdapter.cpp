@@ -2096,6 +2096,10 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 									parentGroupName = groupName;
 							}
 						}
+						// webOS: don't stamp the raw match key/JID as a display name when no human room
+						// title resolved (unaliased WhatsApp group during backfill) -- see the incoming path.
+						if (channelDisplayName != NULL && strcmp(channelDisplayName, channelName) == 0)
+							channelDisplayName = NULL;
 						std::string serverNameStr = deriveServerName(sentAccount, parentGroupName.empty() ? NULL : parentGroupName.c_str(), NULL);
 						const char* serverName = serverNameStr.empty() ? NULL : serverNameStr.c_str();
 						s_imServiceHandler->incomingIM(sentService.c_str(), ownerWebos.c_str(), ownerWebos.c_str(),
@@ -2197,6 +2201,13 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 				        || purple_blist_node_get_bool((PurpleBlistNode*)chat, "archived");
 			}
 		}
+		// webOS: if we couldn't resolve a HUMAN room title, channelDisplayName has fallen back to the
+		// raw match key (for a WhatsApp group that's the "<digits>-<digits>@g.us" JID, before its name
+		// has been fetched during post-connect backfill). Don't stamp that -- leave it NULL so the
+		// ChatThreader keeps the thread's existing (good) name instead of downgrading it to the JID.
+		// (Pairs with the chatthreader JID guard; a later live message re-supplies the real name.)
+		if (channelDisplayName != NULL && channelName != NULL && strcmp(channelDisplayName, channelName) == 0)
+			channelDisplayName = NULL;
 		// Resolve the server identity consistently with enumerateServersChannels: the guild/team (the
 		// part before ": " in the blist group) for Discord/Teams, or the synthetic network server for
 		// flat Telegram (whose blist group is meaningless). Sharing deriveServerName makes a channel's
