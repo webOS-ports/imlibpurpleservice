@@ -83,12 +83,21 @@ MojErr ReceiptHandler::handleReceiptWatermark(const char* serviceName, const cha
 	MojLogInfo(IMServiceApp::s_log, _T("ReceiptHandler: %s watermark %s scope %s (%s)"),
 			m_status.data(), m_watermark.data(), m_scope.data(), m_serviceName.data());
 
-	// (serviceName, username) index -> this account's messages; filter to outbox + scope in findResult.
+	// Query the newest OUTBOX rows (outgoingMsg index: folder,status,localTimestamp), NEWEST-FIRST.
+	// Scoping to outbox is essential on a busy account: a plain (serviceName,username) scan is
+	// dominated by INCOMING group-chat messages, which push our few sent rows past the page limit so
+	// the watermark "matches no outbox rows". Outbox rows are far fewer, so the newest 800 reliably
+	// include the just-sent message. Outbox rows share a sentinel localTimestamp, so desc effectively
+	// orders by insertion/_id (same trick OutboxIdHandler uses). serviceName/username -> findResult.
 	MojDbQuery query;
-	err = query.from(PALM_DB_IMMESSAGE_KIND);                              MojErrCheck(err);
-	err = query.where(MOJDB_SERVICENAME, MojDbQuery::OpEq, m_serviceName); MojErrCheck(err);
-	err = query.where(MOJDB_USERNAME, MojDbQuery::OpEq, m_username);       MojErrCheck(err);
-	query.limit(500);
+	MojString outbox; outbox.assign(IMMessage::folderStrings[Outbox]);
+	MojString sentOk; sentOk.assign(IMMessage::statusStrings[Successful]);
+	err = query.from(PALM_DB_IMMESSAGE_KIND);                     MojErrCheck(err);
+	err = query.where(MOJDB_FOLDER, MojDbQuery::OpEq, outbox);    MojErrCheck(err);
+	err = query.where(MOJDB_STATUS, MojDbQuery::OpEq, sentOk);    MojErrCheck(err);
+	err = query.order(MOJDB_DEVICE_TIMESTAMP);                    MojErrCheck(err);
+	query.desc(true);
+	query.limit(500); // db8's max page size; >500 fails the find with "Invalid argument"
 	err = m_dbClient.find(m_findSlot, query, /* watch */ false);
 	MojErrCheck(err);
 	return MojErrNone;
@@ -149,6 +158,12 @@ MojErr ReceiptHandler::findResult(MojObject& result, MojErr err)
 		MojString folder; bool f = false;
 		row.get(MOJDB_FOLDER, folder, f);
 		if (folder != outbox) continue;
+
+		// the query is scoped to outbox (all services); keep only this account's rows.
+		MojString svc; bool sf = false; row.get(MOJDB_SERVICENAME, svc, sf);
+		if (svc != m_serviceName) continue;
+		MojString usr; bool uf = false; row.get(MOJDB_USERNAME, usr, uf);
+		if (usr != m_username) continue;
 
 		// already at/above target status?
 		MojString existing; bool hasStatus = false;
