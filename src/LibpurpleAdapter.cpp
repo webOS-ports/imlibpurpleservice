@@ -1946,9 +1946,13 @@ static PurpleConversation* joinChannelChat(PurpleAccount* account, const char* c
 	if (gc == NULL)
 		return NULL;
 
-	PurpleConversation* conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, channel, account);
-	if (conv != NULL)
-		return conv;   // already joined
+	// webOS: do NOT early-return when the conversation already exists. Re-invoking serv_join_chat is how a
+	// RE-opened channel backfills messages that arrived while it wasn't open -- discord's join_chat runs its
+	// "?after=<last-seen>" forward catch-up on a re-open. All three group prpls (discord/teams/telegram)
+	// guard join_chat against an existing conversation (find_chat_with_account + !has_left -> present +
+	// return), so re-joining never creates a duplicate conversation. The old early-return here silently
+	// defeated re-open backfill: openChannel is called on every open, but the second open onward returned
+	// before serv_join_chat, so the prpl never got a chance to pull new history.
 
 	// Prefer the blist chat's own components; fall back to constructing them from the key.
 	PurpleChat* chat = findChatByIdComponent(account, channel);
@@ -4084,6 +4088,25 @@ bool LibpurpleAdapter::openChannel(const char* serviceName, const char* username
 			if (getServiceNameFromPurpleAccount(it->second) == serviceName)
 			{
 				account = it->second;
+				break;
+			}
+		}
+	}
+	if (account == NULL)
+	{
+		// webOS: s_onlineAccountData can MISS an account that libpurple auto-restored at startup (or after
+		// a transport respawn) before the transport's login() adopted it -- see the adoption note in
+		// login(). Discord in particular reconnects via status-restore and is absent from the online map
+		// even though its PurpleConnection is live and pushing gateway traffic, so openChannel returned
+		// "no online account" and the channel never joined/backfilled. Fall back to the ACTUAL connected
+		// accounts (purple_connections_get_all) so a re-opened channel still resolves + joins.
+		for (GList* c = purple_connections_get_all(); c != NULL; c = c->next)
+		{
+			PurpleConnection* gc = (PurpleConnection*)c->data;
+			PurpleAccount* a = (gc != NULL) ? purple_connection_get_account(gc) : NULL;
+			if (a != NULL && getServiceNameFromPurpleAccount(a) == serviceName)
+			{
+				account = a;
 				break;
 			}
 		}
