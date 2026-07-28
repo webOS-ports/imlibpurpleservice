@@ -437,7 +437,9 @@ MojErr SendOneMessageHandler::sendToTransport()
 		// a follow-up caption (libpurple's file-transfer API has no caption parameter). The file send
 		// determines the stored status; the caption is best-effort and does not override a SENT status.
 		MojLogInfo(IMServiceApp::s_log, "sending attachment to transport. id: %s, path: %s", m_currentMsgdbId.data(), m_filePath.data());
-		retVal = LibpurpleAdapter::sendFile(m_serviceName.data(), m_username.data(), m_usernameTo.data(), m_filePath.data());
+		// Pass the Outbox row _id so LibpurpleAdapter can downgrade it to "failed" if the file transfer
+		// later fails (the status stored just below is optimistic -- sendFile only INITIATES the xfer).
+		retVal = LibpurpleAdapter::sendFile(m_serviceName.data(), m_username.data(), m_usernameTo.data(), m_filePath.data(), m_currentMsgdbId.data());
 		if (LibpurpleAdapter::SENT == retVal && !m_messageText.empty())
 		{
 			LibpurpleAdapter::sendMessage(m_serviceName.data(), m_username.data(), m_usernameTo.data(), m_messageText.data(),

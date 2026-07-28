@@ -105,6 +105,10 @@ public:
 	// "webos-im-outbox-id" signal. `text` is the sent body, used only as a correlation hint.
 	virtual bool handleOutboxId(const char* serviceName, const char* username, const char* serviceMessageId,
 				const char* text) = 0;
+	// webOS: an OUTGOING attachment's file transfer failed/cancelled AFTER we optimistically stored the
+	// Outbox row as "successful" (sendFile only initiates the xfer). Downgrade that row to "failed" so
+	// the user sees the failure (! icon / dashboard notification) and can resend. dbId = the _id.
+	virtual bool markAttachmentSendFailed(const char* dbId) = 0;
 	// webOS delivery/read receipts (recipient delivered/read our outgoing message).
 	virtual bool handleReceiptById(const char* serviceName, const char* username,
 				const char* serviceMessageId, const char* status) = 0;
@@ -193,7 +197,7 @@ public:
 	// transport process) to usernameTo. Mirrors sendMessage's account resolution + channel detection:
 	// a group-channel target routes through serv_chat_send_file, a 1:1 IM through serv_send_file. All
 	// of this build's prpls treat a non-NULL filename as an already-accepted xfer (no UI dialog).
-	static SendResult sendFile(const char *serviceName, const char *username, const char *usernameTo, const char *filePath);
+	static SendResult sendFile(const char *serviceName, const char *username, const char *usernameTo, const char *filePath, const char *dbId = NULL);
 	static bool queuePresenceUpdates(bool enable);
 	static bool deviceConnectionClosed(bool all, const char* ipAddress);
 	static bool allAccountsOffline();

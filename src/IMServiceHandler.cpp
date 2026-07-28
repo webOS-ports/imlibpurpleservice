@@ -79,6 +79,7 @@ IMServiceHandler::IMServiceHandler(MojService* service)
   m_syncPutServersSlot(this, &IMServiceHandler::syncPutServersResult),
   m_syncFindChannelsSlot(this, &IMServiceHandler::syncFindChannelsResult),
   m_syncPutChannelsSlot(this, &IMServiceHandler::syncPutChannelsResult),
+  m_attachFailMergeSlot(this, &IMServiceHandler::attachFailMergeResult),
   m_syncMergeServersSlot(this, &IMServiceHandler::syncMergeServersResult),
   m_syncMergeChannelsSlot(this, &IMServiceHandler::syncMergeChannelsResult),
   m_syncDelGoneServersSlot(this, &IMServiceHandler::syncDelGoneServersResult),
@@ -1261,6 +1262,35 @@ bool IMServiceHandler::handleOutboxId(const char* serviceName, const char* usern
 		return false;
 	}
 	return true;
+}
+
+// webOS: an outgoing attachment's file transfer failed AFTER we optimistically stored its Outbox row as
+// "successful" (sendFile only INITIATES the xfer). Flip that row to "failed" + a generic error category
+// so the ! icon / failed-message dashboard shows it and the user can resend. Fire-and-forget merge by _id.
+bool IMServiceHandler::markAttachmentSendFailed(const char* dbId)
+{
+	if (dbId == NULL || *dbId == '\0') {
+		return false;
+	}
+	MojLogInfo(IMServiceApp::s_log, _T("markAttachmentSendFailed: id %s"), dbId);
+	MojErr err;
+	MojObject merge;
+	err = merge.putString(MOJDB_ID, dbId);                                              MojErrCheck(err);
+	err = merge.putString(MOJDB_STATUS, IMMessage::statusStrings[Failed]);              MojErrCheck(err);
+	err = merge.putString(MOJDB_ERROR_CATEGORY, _T("SendIMErr_generic_error"));         MojErrCheck(err);
+	err = m_dbClient.merge(m_attachFailMergeSlot, merge);                               MojErrCheck(err);
+	return true;
+}
+
+MojErr IMServiceHandler::attachFailMergeResult(MojObject& payload, MojErr err)
+{
+	if (err) {
+		MojString e; MojErrToString(err, e);
+		MojLogError(IMServiceApp::s_log, _T("attachFailMergeResult: merge failed: %d - %s"), err, e.data());
+	} else {
+		MojLogInfo(IMServiceApp::s_log, _T("attachFailMergeResult: attachment marked failed"));
+	}
+	return MojErrNone;
 }
 
 // webOS delivery/read receipts: a prpl reported that the recipient delivered/read an outgoing message.

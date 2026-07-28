@@ -115,6 +115,13 @@ static std::unordered_map<std::string, PurpleAccount*> s_onlineAccountData;
  * List of accounts that are in the process of logging in
  */
 static std::unordered_map<std::string, PurpleAccount*> s_pendingAccountData;
+/**
+ * webOS attachment-send tracking: local filename (what serv_send_file gets, post-transcode = the xfer's
+ * local_filename) -> the Outbox immessage _id. Populated in sendFile; consumed by the file-send-complete
+ * / file-send-cancel signal handlers so a FAILED transfer downgrades its optimistically-"successful" row
+ * to "failed". Single-threaded (glib main loop drives both), so no lock needed.
+ */
+static std::unordered_map<std::string, std::string> s_pendingAttachmentSends;
 static std::unordered_map<std::string, PurpleAccount*> s_offlineAccountData;
 static std::unordered_map<std::string, guint> s_accountLoginTimers;
 
@@ -1438,6 +1445,41 @@ static void cancelBuddyResync(const std::string& accountKey)
 	}
 }
 
+// webOS: an OUTGOING attachment's file transfer finished. sendFile stored the Outbox row optimistically
+// as "successful" (it only INITIATES the xfer), so on SUCCESS we just drop the pending-tracking entry.
+// (Standard libpurple xfer signals are VOID__POINTER: (xfer, connected-data).)
+static void xfer_send_complete_cb(PurpleXfer* xfer, gpointer data)
+{
+	if (xfer == NULL)
+		return;
+	const char* local = purple_xfer_get_local_filename(xfer);
+	if (local != NULL)
+		s_pendingAttachmentSends.erase(local);
+}
+
+// webOS: an OUTGOING attachment's file transfer FAILED / was cancelled (e.g. the upload HTTP request
+// died). Downgrade its optimistically-"successful" Outbox row to "failed" so the user sees the failure
+// (! icon + failed-message dashboard) and can resend. The row _id is looked up by the xfer's local
+// filename (what we handed serv_send_file / serv_chat_send_file).
+static void xfer_send_cancel_cb(PurpleXfer* xfer, gpointer data)
+{
+	if (xfer == NULL)
+		return;
+	const char* local = purple_xfer_get_local_filename(xfer);
+	if (local == NULL)
+		return;
+	std::unordered_map<std::string, std::string>::iterator it = s_pendingAttachmentSends.find(local);
+	if (it == s_pendingAttachmentSends.end())
+		return;
+	std::string dbId = it->second;
+	s_pendingAttachmentSends.erase(it);
+	const char* who = purple_xfer_get_remote_user(xfer);
+	MojLogError(IMServiceApp::s_log, _T("xfer_send_cancel_cb: attachment transfer to %s failed (xfer status %d); marking id %s failed"),
+			who ? who : "?", (int) purple_xfer_get_status(xfer), dbId.c_str());
+	if (s_imServiceHandler != NULL)
+		s_imServiceHandler->markAttachmentSendFailed(dbId.c_str());
+}
+
 static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 {
 	void* blist_handle = purple_blist_get_handle();
@@ -1571,6 +1613,16 @@ static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 				GINT_TO_POINTER(FALSE));
 		purple_signal_connect(blist_handle, "buddy-privacy-changed", &handle, PURPLE_CALLBACK(buddy_blocked_cb),
 				GINT_TO_POINTER(FALSE));
+
+		// webOS: track OUTGOING attachment transfer completion/failure so a FAILED upload downgrades its
+		// optimistically-"successful" Outbox row to "failed" (see xfer_send_*_cb + markAttachmentSendFailed).
+		// Connecting to a non-existent signal name is a harmless no-op, so cover both the single
+		// "file-send-cancel" and the split -remote/-user cancel forms across libpurple variants.
+		void* xfersHandle = purple_xfers_get_handle();
+		purple_signal_connect(xfersHandle, "file-send-complete", &handle, PURPLE_CALLBACK(xfer_send_complete_cb), NULL);
+		purple_signal_connect(xfersHandle, "file-send-cancel", &handle, PURPLE_CALLBACK(xfer_send_cancel_cb), NULL);
+		purple_signal_connect(xfersHandle, "file-send-cancel-remote", &handle, PURPLE_CALLBACK(xfer_send_cancel_cb), NULL);
+		purple_signal_connect(xfersHandle, "file-send-cancel-user", &handle, PURPLE_CALLBACK(xfer_send_cancel_cb), NULL);
 
 		// testing. Doesn't work: error - "Signal data for sent-im-msg not found". Need to figure out the right handle
 //		purple_signal_connect(purple_connections_get_handle(), "sent-im-msg", &handle, PURPLE_CALLBACK(sent_message_cb),
@@ -4328,7 +4380,7 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendReaction(const char* serviceN
  * needed. filePath must be an absolute path that EXISTS and is READABLE in the transport process
  * (e.g. /media/internal/...); a URL or a path only valid in the app sandbox will fail.
  */
-LibpurpleAdapter::SendResult LibpurpleAdapter::sendFile(const char* serviceName, const char* username, const char* usernameTo, const char* filePath)
+LibpurpleAdapter::SendResult LibpurpleAdapter::sendFile(const char* serviceName, const char* username, const char* usernameTo, const char* filePath, const char* dbId)
 {
 	if (!serviceName || !username || !usernameTo || !filePath || !filePath[0])
 	{
@@ -4441,6 +4493,10 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendFile(const char* serviceName,
 			return LibpurpleAdapter::SEND_FAILED;
 		}
 
+		// webOS: track this transfer by its local filename so a later failure can downgrade the Outbox
+		// row (keyed to xfer->local_filename == filePath). See xfer_send_cancel_cb.
+		if (dbId != NULL && *dbId != '\0')
+			s_pendingAttachmentSends[filePath] = dbId;
 		serv_chat_send_file(gc, chatId, filePath);
 		MojLogInfo(IMServiceApp::s_log, _T("sendFile: initiated chat file transfer to channel %s: %s"), usernameTo, filePath);
 		return retVal;
@@ -4458,6 +4514,9 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendFile(const char* serviceName,
 			return LibpurpleAdapter::SEND_FAILED;
 		}
 	}
+	// webOS: track this transfer by its local filename so a later failure can downgrade the Outbox row.
+	if (dbId != NULL && *dbId != '\0')
+		s_pendingAttachmentSends[filePath] = dbId;
 	serv_send_file(gc, usernameTo, filePath);
 	MojLogInfo(IMServiceApp::s_log, _T("sendFile: initiated file transfer to %s: %s"), usernameTo, filePath);
 

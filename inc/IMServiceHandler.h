@@ -63,6 +63,9 @@ public:
 			const char* serialized);
 	virtual bool handleOutboxId(const char* serviceName, const char* username, const char* serviceMessageId,
 			const char* text);
+	// webOS: downgrade an optimistically-"successful" attachment Outbox row to "failed" when its file
+	// transfer actually failed (see LibpurpleAdapter file-send-cancel handler).
+	virtual bool markAttachmentSendFailed(const char* dbId);
 	// webOS delivery/read receipts (recipient delivered/read our outgoing message).
 	virtual bool handleReceiptById(const char* serviceName, const char* username,
 			const char* serviceMessageId, const char* status);
@@ -172,6 +175,9 @@ private:
     MojErr syncFindChannelsResult(MojObject& payload, MojErr err);
     MojDbClient::Signal::Slot<IMServiceHandler> m_syncPutChannelsSlot;
     MojErr syncPutChannelsResult(MojObject& payload, MojErr err);
+    // webOS: fire-and-forget merge that flips a failed attachment's status to "failed" (result logged only)
+    MojDbClient::Signal::Slot<IMServiceHandler> m_attachFailMergeSlot;
+    MojErr attachFailMergeResult(MojObject& payload, MojErr err);
     // fire-and-forget cleanup (merge changed rows / delete removed rows); results only logged
     MojDbClient::Signal::Slot<IMServiceHandler> m_syncMergeServersSlot;
     MojErr syncMergeServersResult(MojObject& payload, MojErr err);
