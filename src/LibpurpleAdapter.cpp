@@ -2920,6 +2920,15 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 				attachDir = "/media/internal/.im-attachments/whatsapp";
 			else if (svc == "type_signal")
 				attachDir = "/media/internal/.im-attachments/signal";
+			else if (svc == "type_gometa")
+				// Facebook (E2EE) runs on the SAME combined gowhatsapp plugin as WhatsApp, so incoming
+				// media needs the same auto-download template. Without it the template is the empty
+				// default, so gowhatsapp_handle_attachment falls through to download_via_xfer_mechanism
+				// (an interactive purple_xfer that never auto-completes on webOS) instead of
+				// download_to_templated_destination -- FB images/video/docs decrypt + "queue download"
+				// but no file is ever written and nothing renders. (WhatsApp worked only because it was
+				// in this list.)
+				attachDir = "/media/internal/.im-attachments/facebook";
 			if (!attachDir.empty())
 			{
 				purple_build_dir(attachDir.c_str(), 0755);
@@ -2927,7 +2936,7 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 				// stable filenames; re-receiving the same image just overwrites in place.
 				std::string tmpl = attachDir + "/$hash$extension";
 				purple_account_set_string(account, "attachment-path-template", tmpl.c_str());
-				if (svc == "type_whatsapp")
+				if (svc == "type_whatsapp" || svc == "type_gometa")
 					purple_account_set_string(account, "handle-images", "xfer");
 			}
 		}
