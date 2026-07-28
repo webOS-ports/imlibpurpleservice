@@ -1,6 +1,6 @@
 #!/bin/sh
 # Transport launch wrapper. The transport binary's ELF interpreter is patched to the
-# wpe-glibc loader (/media/internal/wpe-glibc/lib/ld-linux.so.3) so purple-signal's
+# wpe-glibc loader (/media/cryptofs/wpe-glibc/lib/ld-linux.so.3) so purple-signal's
 # in-process JVM works (the wpe-252 glibc build that ld-teams.so.3 uses SIGSEGVs libjvm;
 # both are glibc 2.23 but different builds). Put wpe-glibc/lib FIRST so its matching
 # libc/pthread/dl/rt load (loader<->libc are build-coupled). libstdc++ preloaded first so
@@ -14,15 +14,22 @@
 # HTTPS ("Unable to connect to graph.facebook.com: Cancelled" after a ~30s hang). Fix: prepend a
 # dir holding ONLY the matched wpe-252 libcrypto+libssl pair, so OpenSSL loads from there while
 # libc/pthread/dl/rt still fall through to wpe-glibc (coupling preserved). The dir is
-# self-provisioned from wpe-252 below so a re-flash restores it automatically; vfat /media/internal
-# cannot hold symlinks, so real copies (refreshed when the Atlas build changes size).
-LOG=/media/internal/imstdout.log
+# self-provisioned from wpe-252 below so a re-flash restores it automatically; real copies (not
+# symlinks) so it's self-contained and refreshed when the Atlas build changes size.
+# LOG + the transport's private glibc (G) and ssl-override (S) live on /media/cryptofs, NOT
+# /media/internal. /media/internal is the vfat partition exported in USB "drive" mode; the transport
+# mmaps its whole glibc + interpreter from G and mmaps S's libcrypto/libssl, and those mappings pin
+# the partition so storaged can't unmount it ("USB drive Connection failed"). cryptofs is only
+# SUSPENDED (not unmounted) for MSM, so the transport (frozen during the suspend) stops blocking.
+# The binary's ELF interpreter is likewise patched to /media/cryptofs/wpe-glibc/lib/ld-linux.so.3
+# (build.sh --dynamic-linker). See the usb-drive-mode-media-internal-blockers note.
+LOG=/media/cryptofs/imstdout.log
 SZ=$(wc -c < "$LOG" 2>/dev/null || echo 0)
 if [ "$SZ" -gt 31457280 ] 2>/dev/null; then mv -f "$LOG" "$LOG.1" 2>/dev/null; fi
 B=/media/cryptofs/apps/usr/palm/applications/com.palm.app.teams/backend/lib
 W=/media/cryptofs/apps/usr/palm/applications/org.webosports.app.atlas/deviceroot/wpe-252/lib
-G=/media/internal/wpe-glibc
-S=/media/internal/sslfix
+G=/media/cryptofs/wpe-glibc
+S=/media/cryptofs/sslfix
 # Provision/refresh the ssl override dir from the Atlas OpenSSL build (copy if missing or size-changed).
 mkdir -p "$S"
 for L in libcrypto.so.3 libssl.so.3; do
