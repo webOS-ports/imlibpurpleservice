@@ -35,6 +35,7 @@
 #include "IncomingIMHandler.h"
 #include "ReactionHandler.h"
 #include "OutboxIdHandler.h"
+#include "EditHandler.h"
 #include "ReceiptHandler.h"
 #include "IMMessage.h"
 #include "OutgoingIMCommandHandler.h"
@@ -1259,6 +1260,28 @@ bool IMServiceHandler::handleOutboxId(const char* serviceName, const char* usern
 		MojString error;
 		MojErrToString(err, error);
 		MojLogError(IMServiceApp::s_log, _T("handleOutboxId failed: %d - %s"), err, error.data());
+		return false;
+	}
+	return true;
+}
+
+/*
+ * webOS: the sender edited a message they'd previously sent (e.g. WhatsApp ProtocolMessage/EditedMessage).
+ * Spin up an EditHandler to find the stored immessage by serviceMessageId and merge the new text onto it,
+ * so the conversation updates the ORIGINAL bubble in place instead of showing a separate "[EDIT]" message.
+ */
+bool IMServiceHandler::handleMessageEdit(const char* serviceName, const char* username,
+		const char* serviceMessageId, const char* newText)
+{
+	MojLogInfo(IMServiceApp::s_log, _T("handleMessageEdit: service %s id %s"),
+			serviceName ? serviceName : "", serviceMessageId ? serviceMessageId : "");
+
+	MojRefCountedPtr<EditHandler> editHandler(new EditHandler(m_service, this));
+	MojErr err = editHandler->handleEdit(serviceName, username, serviceMessageId, newText);
+	if (err) {
+		MojString error;
+		MojErrToString(err, error);
+		MojLogError(IMServiceApp::s_log, _T("handleMessageEdit failed: %d - %s"), err, error.data());
 		return false;
 	}
 	return true;

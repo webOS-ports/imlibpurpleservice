@@ -176,6 +176,8 @@ static void incoming_message_cb(PurpleConversation *conv, const char *who, const
 static void im_reaction_cb(PurpleAccount* account, const char* targetServiceMessageId, const char* emoji, const char* sender, void* data);
 // webOS: handler for "webos-im-outbox-id" - attaches a network id to the user's own app-sent message row.
 static void im_outbox_id_cb(PurpleAccount* account, const char* serviceMessageId, const char* text, void* data);
+// webOS: handler for "webos-im-edit" - the sender edited a message; update its stored bubble text in place.
+static void im_edit_cb(PurpleAccount* account, const char* serviceMessageId, const char* newText, void* data);
 // webOS delivery/read receipts: a prpl reports the recipient delivered/read our outgoing message.
 // by-id (WhatsApp/Signal): (account, serviceMessageId, status). watermark (Telegram/Facebook/Teams):
 // (account, scope, watermark, status). status is "delivered" or "read".
@@ -2463,6 +2465,22 @@ static void im_receipt_cb(PurpleAccount* account, const char* serviceMessageId, 
 }
 
 /*
+ * webOS message edit: a prpl (WhatsApp) reported that the sender edited a previously-sent message whose
+ * network id is serviceMessageId; newText is the new (already HTML-escaped) body. Resolve the owning
+ * account and hand off to IMServiceHandler, which finds the stored immessage and merges the new text so
+ * the original bubble updates in place (rather than a separate "[EDIT]" message).
+ */
+static void im_edit_cb(PurpleAccount* account, const char* serviceMessageId, const char* newText, void* data)
+{
+	if (account == NULL || serviceMessageId == NULL || *serviceMessageId == '\0' || s_imServiceHandler == NULL)
+		return;
+	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
+	std::string ownerWebos = getWebosUsername(account->username, serviceName, account);
+	s_imServiceHandler->handleMessageEdit(serviceName.c_str(), ownerWebos.c_str(), serviceMessageId,
+			newText ? newText : "");
+}
+
+/*
  * webOS delivery/read receipts (watermark): a prpl (Telegram/Facebook/Teams) reported that everything
  * up to a boundary was delivered/read. scope names the conversation + match field (see ReceiptHandler);
  * watermark is the numeric boundary. Upgrades every Outbox row at/under it.
@@ -4653,6 +4671,16 @@ static void registerWebosReactionSignals()
 			purple_value_new(PURPLE_TYPE_STRING));
 	purple_signal_connect(convHandle, "webos-im-outbox-id", &webosHandle,
 			PURPLE_CALLBACK(im_outbox_id_cb), NULL);
+
+	// message edit-in-place (WhatsApp): a prpl emits (account, serviceMessageId, newText) when the sender
+	// edits a previously-sent message; EditHandler merges the new text onto the stored bubble.
+	purple_signal_register(convHandle, "webos-im-edit",
+			purple_marshal_VOID__POINTER_POINTER_POINTER, NULL, 3,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+	purple_signal_connect(convHandle, "webos-im-edit", &webosHandle,
+			PURPLE_CALLBACK(im_edit_cb), NULL);
 
 	// delivery/read receipts BY-ID (WhatsApp/Signal): (account, serviceMessageId, status).
 	purple_signal_register(convHandle, "webos-im-receipt",

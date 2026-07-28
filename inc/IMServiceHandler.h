@@ -63,6 +63,10 @@ public:
 			const char* serialized);
 	virtual bool handleOutboxId(const char* serviceName, const char* username, const char* serviceMessageId,
 			const char* text);
+	// webOS: the sender edited a message they'd previously sent; update the stored bubble's text in place
+	// (found by serviceMessageId) instead of showing a separate "[EDIT]" message. See EditHandler.
+	virtual bool handleMessageEdit(const char* serviceName, const char* username, const char* serviceMessageId,
+			const char* newText);
 	// webOS: downgrade an optimistically-"successful" attachment Outbox row to "failed" when its file
 	// transfer actually failed (see LibpurpleAdapter file-send-cancel handler).
 	virtual bool markAttachmentSendFailed(const char* dbId);

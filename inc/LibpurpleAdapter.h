@@ -105,6 +105,11 @@ public:
 	// "webos-im-outbox-id" signal. `text` is the sent body, used only as a correlation hint.
 	virtual bool handleOutboxId(const char* serviceName, const char* username, const char* serviceMessageId,
 				const char* text) = 0;
+	// webOS: the sender edited a message they'd previously sent; update the stored bubble's text in place
+	// (found by serviceMessageId) rather than showing a separate "[EDIT]" message. Driven by the
+	// "webos-im-edit" signal. newText is the new body (already HTML-escaped, like a normal incoming body).
+	virtual bool handleMessageEdit(const char* serviceName, const char* username, const char* serviceMessageId,
+				const char* newText) = 0;
 	// webOS: an OUTGOING attachment's file transfer failed/cancelled AFTER we optimistically stored the
 	// Outbox row as "successful" (sendFile only initiates the xfer). Downgrade that row to "failed" so
 	// the user sees the failure (! icon / dashboard notification) and can resend. dbId = the _id.
