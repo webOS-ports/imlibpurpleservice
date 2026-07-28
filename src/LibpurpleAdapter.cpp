@@ -1946,13 +1946,32 @@ static PurpleConversation* joinChannelChat(PurpleAccount* account, const char* c
 	if (gc == NULL)
 		return NULL;
 
-	// webOS: do NOT early-return when the conversation already exists. Re-invoking serv_join_chat is how a
-	// RE-opened channel backfills messages that arrived while it wasn't open -- discord's join_chat runs its
-	// "?after=<last-seen>" forward catch-up on a re-open. All three group prpls (discord/teams/telegram)
-	// guard join_chat against an existing conversation (find_chat_with_account + !has_left -> present +
-	// return), so re-joining never creates a duplicate conversation. The old early-return here silently
-	// defeated re-open backfill: openChannel is called on every open, but the second open onward returned
-	// before serv_join_chat, so the prpl never got a chance to pull new history.
+	// webOS: do NOT permanently early-return when the conversation already exists. Re-invoking
+	// serv_join_chat is how a RE-opened channel backfills messages that arrived while it wasn't open --
+	// discord's join_chat runs its "?after=<last-seen>" forward catch-up on a re-open. All three group
+	// prpls (discord/teams/telegram) guard join_chat against an existing conversation (find_chat_with_account
+	// + !has_left -> present + return), so re-joining never creates a duplicate conversation. The old
+	// unconditional early-return silently defeated re-open backfill.
+	//
+	// BUT it must be THROTTLED: the Messaging app fires openChannel several times in a burst for the same
+	// channel (on conversation focus / list render), and without the early-return each call would
+	// serv_join_chat -> a fresh limit=100 history fetch -> a Discord-API request storm (7x/sec observed),
+	// risking rate-limiting the account. Allow a re-backfill at most once per channel per
+	// REJOIN_THROTTLE_SECS; within that window just return the existing conversation, exactly as the old
+	// early-return did. Live messages arrive via the gateway (MESSAGE_CREATE), not this fetch, so a short
+	// throttle never delays real-time delivery -- it only rate-limits the catch-up fetch.
+	static std::unordered_map<std::string, time_t> s_lastChannelJoin;
+	const time_t REJOIN_THROTTLE_SECS = 15;
+	std::string channelKey(channel);
+	time_t nowT = time(NULL);
+	PurpleConversation* existingConv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, channel, account);
+	if (existingConv != NULL)
+	{
+		std::unordered_map<std::string, time_t>::iterator it = s_lastChannelJoin.find(channelKey);
+		if (it != s_lastChannelJoin.end() && (nowT - it->second) < REJOIN_THROTTLE_SECS)
+			return existingConv;   // backfilled very recently -> don't storm the API
+	}
+	s_lastChannelJoin[channelKey] = nowT;
 
 	// Prefer the blist chat's own components; fall back to constructing them from the key.
 	PurpleChat* chat = findChatByIdComponent(account, channel);
