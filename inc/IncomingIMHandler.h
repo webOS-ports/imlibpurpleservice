@@ -49,6 +49,14 @@ private:
 	MojDbClient::Signal::Slot<IncomingIMHandler> m_IMSaveMessageSlot;
 	MojErr IMSaveMessageResult(MojObject& result, MojErr err);
 
+	// webOS db8-authoritative dedup: query for an existing immessage by serviceMessageId before writing.
+	MojDbClient::Signal::Slot<IncomingIMHandler> m_IMDedupFindSlot;
+	MojErr IMDedupFindResult(MojObject& result, MojErr err);
+	// Shared final write (used both on a dedup miss and when there is no serviceMessageId to dedup on).
+	MojErr putIMMessageToDb();
+	// The db object built in saveNewIMMessage, held across the async dedup find until the write.
+	MojObject m_pendingDbObject;
+
 	// IncomingIMMessage Object that is in process
 	MojRefCountedPtr<IMMessage> m_IMMessage;
 
