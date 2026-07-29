@@ -6,10 +6,16 @@
       "com.palm.imlibpurple",
       "com.palm.telegram.call",
       "com.palm.signal.call",
-      "com.palm.whatsapp.call"
+      "com.palm.whatsapp.call",
+      "com.palm.teams.call"
     ]
   },
   "permissions": [
+    {
+      "service": "com.palm.teams.call",
+      "inbound": ["*"],
+      "outbound": ["*"]
+    },
     {
       "service": "com.palm.telegram.call",
       "inbound": ["*"],
