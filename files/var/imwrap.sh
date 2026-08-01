@@ -26,7 +26,13 @@
 LOG=/media/cryptofs/imstdout.log
 SZ=$(wc -c < "$LOG" 2>/dev/null || echo 0)
 if [ "$SZ" -gt 31457280 ] 2>/dev/null; then mv -f "$LOG" "$LOG.1" 2>/dev/null; fi
-B=/media/cryptofs/apps/usr/palm/applications/com.palm.app.teams/backend/lib
+# libpurple.so + purple-2/ plugins now live at the real /usr/lib(+/purple-2) -- see
+# packaging/README.md "why /usr/lib now". RUNTIME holds only the private, non-stock-colliding
+# runtime deps (libstdc++/libgcrypt/libpng16/libwebp/libopus/... -- third-party link deps unique
+# to specific prpls, kept OUT of /usr/lib so they can't silently replace a system-wide lib version
+# other apps rely on) that used to sit alongside the engine under com.palm.app.teams/backend/lib
+# for no good reason (that app dir never had anything to do with the shared backend).
+RUNTIME=/usr/lib/synergy-runtime
 W=/media/cryptofs/apps/usr/palm/applications/org.webosports.app.atlas/deviceroot/wpe-252/lib
 G=/media/cryptofs/wpe-glibc
 S=/media/cryptofs/sslfix
