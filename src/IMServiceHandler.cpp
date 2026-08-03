@@ -52,6 +52,7 @@ const IMServiceHandler::Method IMServiceHandler::s_methods[] = {
     {_T("onCreate"), (Callback) &IMServiceHandler::onCreate},
     {_T("onDelete"), (Callback) &IMServiceHandler::onDelete},
     {_T("purgeRetainedData"), (Callback) &IMServiceHandler::purgeRetainedData},
+    {_T("sync"), (Callback) &IMServiceHandler::sync},
 	{_T("loginStateChanged"), (Callback) &IMServiceHandler::handleLoginStateChange},
 	{_T("sendIM"), (Callback) &IMServiceHandler::IMSend}, // callback for activity manager
 	{_T("sendCommand"), (Callback) &IMServiceHandler::IMSendCmd}, // callback for activity manager
@@ -299,6 +300,37 @@ MojErr IMServiceHandler::purgeRetainedData(MojServiceMessage* serviceMsg, const 
     MojErr err = m_dbClient.del(m_deleteRetainedDataSlot, q);
     if (err != MojErrNone)
         MojLogError(IMServiceApp::s_log, _T("purgeRetainedData: del(marker) failed: %d"), err);
+
+    serviceMsg->replySuccess();
+    return MojErrNone;
+}
+
+/*
+ * CONTACTS capability "sync" - see declaration comment in IMServiceHandler.h. Contacts here are
+ * normally kept current live (BuddyListConsolidator runs on login and again whenever libpurple's
+ * buddy_added_cb fires), so this is a manual nudge for whatever account the caller names, not a
+ * distinct fetch path of its own.
+ */
+MojErr IMServiceHandler::sync(MojServiceMessage* serviceMsg, const MojObject payload)
+{
+    MojString accountId;
+    MojErr err = payload.getRequired("accountId", accountId);
+    if (err != MojErrNone || accountId.empty()) {
+        MojLogError(IMServiceApp::s_log, _T("IMServiceHandler::sync accountId empty or error %d"), err);
+        serviceMsg->replyError(MojErrInvalidArg);
+        return MojErrInvalidArg;
+    }
+
+    std::string username, serviceName;
+    if (!LibpurpleAdapter::findAccountByWebosId(accountId.data(), &username, &serviceName)) {
+        MojLogError(IMServiceApp::s_log, _T("IMServiceHandler::sync: no live account for accountId=%s"), accountId.data());
+        serviceMsg->replyError(MojErrNotFound);
+        return MojErrNotFound;
+    }
+
+    MojLogInfo(IMServiceApp::s_log, _T("IMServiceHandler::sync: requesting contact re-sync for %s/%s"),
+               serviceName.c_str(), username.c_str());
+    m_loginState->buddyListChanged(serviceName.c_str(), username.c_str());
 
     serviceMsg->replySuccess();
     return MojErrNone;

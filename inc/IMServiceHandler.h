@@ -211,6 +211,12 @@ private:
 	 * on-device data that was kept when the account was removed with keepData, then delete the
 	 * com.palm.imretaineddata marker. Driven by the Accounts app "Delete Account Data" UI. */
 	MojErr purgeRetainedData(MojServiceMessage* serviceMsg, const MojObject payload);
+	/* palm://com.palm.imlibpurple/sync {accountId} - CONTACTS capability's on-demand contact re-sync
+	 * (declared per-account in each account template's CONTACTS capabilityProvider). Resolves
+	 * accountId to the live account's serviceName/username and re-drives the same buddy-list
+	 * re-sync path LibpurpleAdapter's buddy_added_cb already uses (IMLoginState::buddyListChanged),
+	 * rather than a new fetch-and-consolidate implementation. */
+	MojErr sync(MojServiceMessage* serviceMsg, const MojObject payload);
 
 	MojErr handleLoginStateChange(MojServiceMessage* msg, const MojObject payload);
 	MojErr loginForTesting(MojServiceMessage* msg, const MojObject payload);

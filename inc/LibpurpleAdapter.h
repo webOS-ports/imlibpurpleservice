@@ -177,6 +177,9 @@ public:
 	// serviceName ("type_<suffix>") BEFORE it is deleted, so the caller can purge that
 	// account's db8 chat data (which is keyed by username/serviceName, not webOS accountId).
 	static bool deleteAccountByWebosId(const char* accountId, std::string* outUsername = NULL, std::string* outServiceName = NULL);
+	// Same webosAccountId -> account lookup as deleteAccountByWebosId, but read-only (no delete).
+	// Used by the CONTACTS "sync" LS2 method to resolve which account to re-sync contacts for.
+	static bool findAccountByWebosId(const char* accountId, std::string* outUsername = NULL, std::string* outServiceName = NULL);
 	static bool getFullBuddyList(const char* serviceName, const char* username);
 	// webOS Servers/Rooms M3: walk the (in-memory) buddy list for a hierarchical account (Discord),
 	// build the guild->channel roster and hand it to the service handler (syncServersChannels) to

@@ -2756,6 +2756,36 @@ bool LibpurpleAdapter::deleteAccountByWebosId(const char* accountId, std::string
 }
 
 /*
+ * Same webosAccountId lookup as deleteAccountByWebosId above, but read-only. Used by the CONTACTS
+ * "sync" LS2 method (IMServiceHandler::sync) to resolve which live account to re-sync contacts for.
+ */
+bool LibpurpleAdapter::findAccountByWebosId(const char* accountId, std::string* outUsername, std::string* outServiceName)
+{
+	if (accountId == NULL || *accountId == '\0')
+		return false;
+
+	if (!s_libpurpleInitialized)
+	{
+		initializeLibpurple();
+	}
+
+	for (GList* l = purple_accounts_get_all(); l != NULL; l = l->next)
+	{
+		PurpleAccount* account = (PurpleAccount*)l->data;
+		const char* aid = purple_account_get_string(account, "webosAccountId", NULL);
+		if (aid != NULL && strcmp(aid, accountId) == 0)
+		{
+			if (outUsername != NULL && account->username != NULL)
+				outUsername->assign(account->username);
+			if (outServiceName != NULL)
+				outServiceName->assign(getServiceNameFromPrplProtocolId(account->protocol_id));
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
  * Service methods
  */
 LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params, LoginCallbackInterface* loginState)
