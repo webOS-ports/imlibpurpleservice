@@ -1,28 +1,22 @@
 #!/bin/sh
 # Transport launch wrapper. The transport binary's ELF interpreter is patched to the
-# wpe-glibc loader (/media/cryptofs/wpe-glibc/lib/ld-linux.so.3) so purple-signal's
-# in-process JVM works (the wpe-252 glibc build that ld-teams.so.3 uses SIGSEGVs libjvm;
-# both are glibc 2.23 but different builds). Put wpe-glibc/lib FIRST so its matching
-# libc/pthread/dl/rt load (loader<->libc are build-coupled). libstdc++ preloaded first so
-# its operator new wins over libmojocore's weak _Znwj. Self-rotating at 30MB.
+# synergy-glibc loader (/media/cryptofs/synergy-glibc/lib/ld-linux.so.3) so purple-signal's
+# in-process JVM works (a plain stock/ld-teams.so.3 glibc SIGSEGVs libjvm). Put synergy-glibc/lib
+# FIRST so its matching libc/pthread/dl/rt load (loader<->libc are build-coupled). libstdc++
+# preloaded first so its operator new wins over libmojocore's weak _Znwj. Self-rotating at 30MB.
 #
-# SSLFIX: wpe-glibc/lib ships an OLD libcrypto.so.3 (OpenSSL 3.0.16). Because wpe-glibc must be
-# FIRST on LD_LIBRARY_PATH (above), it shadows the newer Atlas OpenSSL in wpe-252/lib, so
-# wpe-252's libssl.so.3 (built against 3.3.0+) fails to load ("version OPENSSL_3.3.0 not found").
-# libpurple then registers NO ssl provider (purple_ssl_is_supported()==FALSE) and purple-facebook
-# -- the ONLY prpl using libpurple's native purple_ssl_* (others bring their own TLS) -- can't do
-# HTTPS ("Unable to connect to graph.facebook.com: Cancelled" after a ~30s hang). Fix: prepend a
-# dir holding ONLY the matched wpe-252 libcrypto+libssl pair, so OpenSSL loads from there while
-# libc/pthread/dl/rt still fall through to wpe-glibc (coupling preserved). The dir is
-# self-provisioned from wpe-252 below so a re-flash restores it automatically; real copies (not
-# symlinks) so it's self-contained and refreshed when the Atlas build changes size.
-# LOG + the transport's private glibc (G) and ssl-override (S) live on /media/cryptofs, NOT
-# /media/internal. /media/internal is the vfat partition exported in USB "drive" mode; the transport
-# mmaps its whole glibc + interpreter from G and mmaps S's libcrypto/libssl, and those mappings pin
-# the partition so storaged can't unmount it ("USB drive Connection failed"). cryptofs is only
-# SUSPENDED (not unmounted) for MSM, so the transport (frozen during the suspend) stops blocking.
-# The binary's ELF interpreter is likewise patched to /media/cryptofs/wpe-glibc/lib/ld-linux.so.3
-# (build.sh --dynamic-linker). See the usb-drive-mode-media-internal-blockers note.
+# synergy-glibc is a specific, frozen glibc 2.23 build (crosstool-NG) -- NOT interchangeable with
+# Atlas's own wpe-252 deviceroot, even though both self-report "glibc 2.23": confirmed live that
+# swapping in a copy of Atlas's current wpe-252/lib as synergy-glibc SIGSEGVs immediately
+# (dmesg: "CRASH! ld-linux.so.3(...) received 11") the moment the kernel tries to use it as the
+# transport's ELF interpreter, despite that exact ld-linux.so.3 running fine standalone as an
+# ordinary program -- Atlas's build is roughly HALF the size of this one (different build/config
+# entirely) and isn't ABI-compatible with the already-built imlibpurpletransport binary. So this
+# dir can't be self-provisioned from anything else already on the device; it must be provisioned
+# once, manually, per device (see README-device-launch.md) -- most simply by tar'ing it off a
+# device that already has a working copy. A device missing it entirely crash-loops the transport
+# forever with "env: can't execute ...: No such file or directory" (confirmed live) -- if that
+# happens, check for this directory first before assuming anything else is broken.
 LOG=/media/cryptofs/imstdout.log
 SZ=$(wc -c < "$LOG" 2>/dev/null || echo 0)
 if [ "$SZ" -gt 31457280 ] 2>/dev/null; then mv -f "$LOG" "$LOG.1" 2>/dev/null; fi
@@ -32,11 +26,38 @@ if [ "$SZ" -gt 31457280 ] 2>/dev/null; then mv -f "$LOG" "$LOG.1" 2>/dev/null; f
 # to specific prpls, kept OUT of /usr/lib so they can't silently replace a system-wide lib version
 # other apps rely on) that used to sit alongside the engine under com.palm.app.teams/backend/lib
 # for no good reason (that app dir never had anything to do with the shared backend).
+#
+# Both /usr/lib/purple-2 and /usr/lib/synergy-runtime are actually BIND-MOUNTED from
+# /media/cryptofs (root is a fixed 559MB partition; connector plugins are large enough -- WhatsApp/
+# Telegram ~29MB each -- that keeping them there fills it, confirmed live: 0 bytes free after
+# installing 4 connectors, one install segfaulted, one left a corrupted ipkg record). Bind mounts
+# don't survive a reboot, so re-establish both here on every launch (postinst does the same setup
+# once at install time so a fresh install works before the first reboot too).
+for _PAIR in "synergy-purple-plugins:/usr/lib/purple-2" "synergy-runtime:/usr/lib/synergy-runtime"; do
+  _CDIR="/media/cryptofs/${_PAIR%%:*}"
+  _MNT="${_PAIR#*:}"
+  mkdir -p "$_CDIR" "$_MNT"
+  mount | grep -q " on $_MNT type" || mount --bind "$_CDIR" "$_MNT"
+done
 RUNTIME=/usr/lib/synergy-runtime
 W=/media/cryptofs/apps/usr/palm/applications/org.webosports.app.atlas/deviceroot/wpe-252/lib
-G=/media/cryptofs/wpe-glibc
+G=/media/cryptofs/synergy-glibc
 S=/media/cryptofs/sslfix
-# Provision/refresh the ssl override dir from the Atlas OpenSSL build (copy if missing or size-changed).
+if [ ! -f "$G/lib/ld-linux.so.3" ]; then
+  echo "$(date -Iseconds 2>/dev/null) FATAL: $G/lib/ld-linux.so.3 missing -- transport cannot start." \
+       "This is a frozen glibc build that must be provisioned once per device; see README-device-launch.md." \
+       >> "$LOG"
+fi
+# SSLFIX: synergy-glibc/lib ships an OLD libcrypto.so.3 (OpenSSL 3.0.16). Because synergy-glibc must
+# be FIRST on LD_LIBRARY_PATH (above), it shadows the newer Atlas OpenSSL in wpe-252/lib, so
+# wpe-252's libssl.so.3 (built against 3.3.0+) fails to load ("version OPENSSL_3.3.0 not found").
+# libpurple then registers NO ssl provider (purple_ssl_is_supported()==FALSE) and purple-facebook
+# -- the ONLY prpl using libpurple's native purple_ssl_* (others bring their own TLS) -- can't do
+# HTTPS ("Unable to connect to graph.facebook.com: Cancelled" after a ~30s hang). Fix: prepend a
+# dir holding ONLY the matched wpe-252 libcrypto+libssl pair, so OpenSSL loads from there while
+# libc/pthread/dl/rt still fall through to synergy-glibc. Self-provisioned from wpe-252 below (a
+# re-flash restores it automatically); real copies (not symlinks) so it's self-contained and
+# refreshed when the Atlas build changes size.
 mkdir -p "$S"
 for L in libcrypto.so.3 libssl.so.3; do
   if [ "$(wc -c < "$S/$L" 2>/dev/null || echo 0)" != "$(wc -c < "$W/$L" 2>/dev/null || echo x)" ]; then
@@ -67,7 +88,15 @@ rm -f /dev/shm/sem.PmLogLib
 # Atlas wpe-252 libasound on LD_LIBRARY_PATH can't find its pulse plugin module ("No such device").
 # The system libasound has /usr/lib/alsa-lib's pulse module + /etc/asound.conf's voip PCMs — the
 # same route the standalone wacallm/Signal engines used. Without this: "audio playback/capture-FAIL".
+#
+# exec /usr/bin/imlibpurpletransport DIRECTLY -- do NOT invoke synergy-glibc's ld-linux.so.3
+# explicitly as the command. LS2 (_LSTransportPidToExe in libluna-service2) identifies the calling
+# process via readlink(/proc/PID/exe), which only resolves to the real target when the KERNEL
+# performs the PT_INTERP hand-off itself; explicitly exec'ing the interpreter makes IT the process's
+# own exe, so ls-hubd logs "No role file for executable: .../ld-linux.so.3" and every LS2 call
+# gets rejected ("Invalid permissions"). (An earlier version of this file explicitly invoked
+# ld-linux.so.3, misdiagnosed as a kernel difference at the time -- it was really just this.)
 exec env \
-  LD_PRELOAD="$B/libstdc++.so.6 $G/lib/librt.so.1 /usr/lib/libasound.so.2" \
-  LD_LIBRARY_PATH="$S:$G/lib:$B:$W:/usr/lib:/lib" \
+  LD_PRELOAD="$RUNTIME/libstdc++.so.6 $G/lib/librt.so.1 /usr/lib/libasound.so.2" \
+  LD_LIBRARY_PATH="$S:$G/lib:$RUNTIME:$W:/usr/lib:/lib" \
   /usr/bin/imlibpurpletransport "$@" >> "$LOG" 2>&1
