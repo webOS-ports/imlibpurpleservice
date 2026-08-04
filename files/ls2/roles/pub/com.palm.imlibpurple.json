@@ -12,6 +12,31 @@
   },
   "permissions": [
     {
+      "service": "com.palm.imlibpurple",
+      "inbound": [
+        "com.palm.imlibpurple",
+        "com.palm.activitymanager",
+        "com.palm.app.messaging",
+        "com.palm.app.accounts",
+        "com.palm.app.discord",
+        "com.palm.app.whatsapp",
+        "com.palm.app.facebookim",
+        "com.palm.app.signal",
+        "com.palm.app.telegram",
+        "org.webosports.app.teams",
+        "com.palm.service.accounts"
+      ],
+      "outbound": [
+        "com.palm.imlibpurple",
+        "com.palm.db",
+        "com.palm.tempdb",
+        "com.palm.activitymanager",
+        "com.palm.connectionmanager",
+        "com.palm.display",
+        "com.palm.service.accounts"
+      ]
+    },
+    {
       "service": "com.palm.teams.call",
       "inbound": ["*"],
       "outbound": ["*"]
