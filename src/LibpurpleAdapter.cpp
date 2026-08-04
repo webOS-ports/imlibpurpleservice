@@ -1957,6 +1957,20 @@ static bool isWhatsAppNewsletter(const char* name)
 	return len > slen && strcmp(name + len - slen, suffix) == 0;
 }
 
+// webOS WhatsApp Status: true if `name` is the synthetic "<phone>@broadcast" JID handle_message.go
+// tags a contact's status update with (types.BroadcastServer) instead of the sender's real JID, so
+// it can be routed into the Servers tab (its own "Status Updates" channel per sender) rather than
+// showing up as an ordinary 1:1 chat.
+static bool isWhatsAppStatus(const char* name)
+{
+	if (name == NULL)
+		return false;
+	size_t len = strlen(name);
+	static const char* suffix = "@broadcast";
+	size_t slen = strlen(suffix);
+	return len > slen && strcmp(name + len - slen, suffix) == 0;
+}
+
 static std::string deriveServerName(PurpleAccount* account, const char* groupName, std::string* outCategory)
 {
 	if (outCategory)
@@ -2323,6 +2337,23 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 			{
 				const char* alias = purple_buddy_get_alias(nlBuddy);
 				if (alias != NULL && *alias != '\0' && !isWhatsAppNewsletter(alias))
+					channelDisplayName = alias;
+			}
+		}
+		// webOS WhatsApp Status: a contact's status update arrives (see handle_message.go) tagged
+		// with a synthetic "<phone>@broadcast" peer JID instead of masquerading as an ordinary 1:1
+		// message from that contact. Route it into its own channel (one per sender) under a
+		// "Status Updates" server, exactly like a followed Channel, instead of showing up as a
+		// random new chat.
+		else if (isWhatsAppStatus(imName))
+		{
+			channelName = imName;
+			serverNameStr = "Status Updates";
+			PurpleBuddy* stBuddy = purple_find_buddy(account, imName);
+			if (stBuddy != NULL)
+			{
+				const char* alias = purple_buddy_get_alias(stBuddy);
+				if (alias != NULL && *alias != '\0' && !isWhatsAppStatus(alias))
 					channelDisplayName = alias;
 			}
 		}
