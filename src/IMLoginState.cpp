@@ -1037,6 +1037,28 @@ MojErr IMLoginStateHandler::resyncBumpResult(MojObject& result, MojErr err)
 // So whichever of the 3 returns last will continue the buddy list processing
 MojErr IMLoginStateHandler::getBuddyLists(const MojString& serviceName, const MojString& username, const MojString& accountId)
 {
+	// webOS: m_buddyListConsolidator (and m_queryForContactsSlot/m_queryForBuddyStatusSlot below) are
+	// single, reused members of this handler instance, not scoped per-account. processLoginStates()
+	// loops over EVERY account's changed imloginstate record in one db-watch callback, and this
+	// function's own contacts/buddystatus queries are ASYNC (return immediately, complete later via
+	// queryForContactsResult/queryForBuddyStatusResult). If getBuddyLists() runs again for a
+	// DIFFERENT (or the same) account before an already-in-flight one's queries return, the
+	// reassignment below silently swaps out the consolidator instance those pending callbacks will
+	// fire against - so account A's contacts/buddystatus land on account B's freshly-fetched buddy
+	// list. Confirmed live: this produced "adding buddy=<uuid> to delete list" for every existing
+	// Signal contact (none matched the wrong account's buddy map, since the map keys came from a
+	// different account entirely) and "This new buddy has no buddy name" for the replacement
+	// inserts - two accounts (Signal + Telegram, both resyncing within the same ~20s window) were
+	// clobbering each other's in-flight sync. Defer instead of clobbering: complete the watch as
+	// usual so it can fire again, and let the existing debounced/timeout resync machinery
+	// (buddyResyncTimeoutCallback etc.) retry this account shortly once the current one clears.
+	if (m_buddyListConsolidator != NULL)
+	{
+		MojLogWarning(IMServiceApp::s_log, _T("getBuddyLists: a buddy-list sync is already in flight - deferring %s/%s to the next retry instead of clobbering it"), serviceName.data(), username.data());
+		completeAndResetWatch();
+		return MojErrNone;
+	}
+
 	m_buddyListConsolidator = new BuddyListConsolidator(m_service, accountId);
 
 	// Get a full list of buddies. The result is asynchronously returned via the buddyListResult() callback

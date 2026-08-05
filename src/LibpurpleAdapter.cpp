@@ -57,6 +57,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <cstdio>
 #include <unordered_map>
 #include <vector>
 #include <set>
@@ -2742,6 +2743,72 @@ static void initializeLibpurple()
  */
 
 /*
+ * webOS: purple_account_set_string(account, "webosAccountId", ...) alone is NOT a reliable way to
+ * make this stamp survive a transport restart. libpurple's own accounts.xml persistence for it is
+ * DEBOUNCED internally (a timer, not immediate) - there's no public purple_accounts_sync()/
+ * schedule_save() in this libpurple build to force it (checked messaging/libpurple/include/
+ * libpurple/account.h: schedule_save is a UI-ops callback we don't implement, not something we can
+ * call). Confirmed live: a transport restart shortly after adopting a QR-paired account (see the
+ * three purple_account_set_string(..., "webosAccountId", ...) call sites in login()) lost the
+ * unsaved stamp - deleteAccountByWebosId then found no matching PurpleAccount at all on the
+ * subsequent remove, silently skipping BOTH the live account teardown (accounts.xml/buddy list/
+ * stored token) AND the db8 chat/contact purge, and leaving the underlying prpl session file
+ * (e.g. presage's <phone>.db3, keyed by username not accountId) in place to confuse the next
+ * re-add with stale session state - exactly the "still not logging in properly after remove +
+ * re-add" symptom this was built to fix. Write our own tiny, synchronous mapping file the instant
+ * we stamp the account, independent of libpurple's save timing, as a reliable fallback source of
+ * truth for accountId -> username/serviceName.
+ */
+static std::string webosIdMapDir()
+{
+	return std::string(purple_user_dir()) + "/webos-account-ids";
+}
+
+static std::string webosIdMapPath(const char* accountId)
+{
+	return webosIdMapDir() + "/" + accountId;
+}
+
+// stampWebosAccountId <account> <accountId> <serviceName>
+// Call this instead of a bare purple_account_set_string(account, "webosAccountId", accountId) at
+// every adoption site - keeps the XML tag (fast path, used when the save DID land) and the
+// fallback file (survives even if it didn't) in sync.
+static void stampWebosAccountId(PurpleAccount* account, const char* accountId, const char* serviceName)
+{
+	if (account == NULL || accountId == NULL || *accountId == '\0')
+		return;
+	purple_account_set_string(account, "webosAccountId", accountId);
+	g_mkdir_with_parents(webosIdMapDir().c_str(), 0700);
+	FILE* f = fopen(webosIdMapPath(accountId).c_str(), "w");
+	if (f != NULL)
+	{
+		fprintf(f, "%s\n%s\n", account->username ? account->username : "", serviceName ? serviceName : "");
+		fclose(f);
+	}
+}
+
+// Reads back a stampWebosAccountId() fallback file. Returns false (and clears both out params) if
+// no file exists.
+static bool readWebosIdMap(const char* accountId, std::string* outUsername, std::string* outServiceName)
+{
+	FILE* f = fopen(webosIdMapPath(accountId).c_str(), "r");
+	if (f == NULL)
+		return false;
+	char userBuf[256] = {0}, svcBuf[256] = {0};
+	char* r1 = fgets(userBuf, sizeof(userBuf), f);
+	char* r2 = fgets(svcBuf, sizeof(svcBuf), f);
+	fclose(f);
+	if (r1 == NULL || r2 == NULL)
+		return false;
+	size_t n;
+	if ((n = strlen(userBuf)) > 0 && userBuf[n - 1] == '\n') userBuf[n - 1] = '\0';
+	if ((n = strlen(svcBuf)) > 0 && svcBuf[n - 1] == '\n') svcBuf[n - 1] = '\0';
+	if (outUsername != NULL) outUsername->assign(userBuf);
+	if (outServiceName != NULL) outServiceName->assign(svcBuf);
+	return true;
+}
+
+/*
  * webOS Teams port: called from IMServiceHandler::onDelete when a webOS account is
  * removed. Finds the persisted PurpleAccount tagged with this webOS accountId and
  * deletes it, so accounts.xml, the buddy list (blist.xml) and the stored OAuth
@@ -2779,9 +2846,39 @@ bool LibpurpleAdapter::deleteAccountByWebosId(const char* accountId, std::string
 			}
 			MojLogInfo(IMServiceApp::s_log, _T("LibpurpleAdapter::deleteAccountByWebosId removing persisted account for %s"), accountId);
 			purple_accounts_delete(account);
+			unlink(webosIdMapPath(accountId).c_str());
 			return true;
 		}
 	}
+
+	// webOS: no PurpleAccount carries this tag (either never adopted, or - confirmed live - the
+	// accounts.xml save that would have persisted the stamp hadn't landed before a transport
+	// restart lost it). Fall back to our own immediately-written mapping file so the caller can
+	// still resolve username/serviceName to purge db8 data. If that also resolves a LIVE
+	// PurpleAccount by username+serviceName (untagged, but otherwise the same account), delete it
+	// too - the whole point is not to leave a stale session (accounts.xml entry + prpl-specific
+	// session file, e.g. presage's <phone>.db3) behind to confuse a fresh re-add.
+	std::string fbUsername, fbServiceName;
+	if (readWebosIdMap(accountId, &fbUsername, &fbServiceName))
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("LibpurpleAdapter::deleteAccountByWebosId: no live-tagged account for %s, resolved via fallback map (username=%s serviceName=%s)"),
+			accountId, fbUsername.c_str(), fbServiceName.c_str());
+		if (outUsername != NULL) *outUsername = fbUsername;
+		if (outServiceName != NULL) *outServiceName = fbServiceName;
+		if (!fbUsername.empty() && !fbServiceName.empty())
+		{
+			std::string protocolId = getPrplProtocolIdFromServiceName(fbServiceName);
+			PurpleAccount* untaggedAccount = purple_accounts_find(fbUsername.c_str(), protocolId.c_str());
+			if (untaggedAccount != NULL)
+			{
+				MojLogInfo(IMServiceApp::s_log, _T("LibpurpleAdapter::deleteAccountByWebosId: found the matching untagged PurpleAccount for %s via fallback map - removing it too"), accountId);
+				purple_accounts_delete(untaggedAccount);
+			}
+		}
+		unlink(webosIdMapPath(accountId).c_str());
+		return true;
+	}
+
 	MojLogInfo(IMServiceApp::s_log, _T("LibpurpleAdapter::deleteAccountByWebosId no persisted account for %s"), accountId);
 	return false;
 }
@@ -2887,7 +2984,7 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 			const char* existingWebosId = purple_account_get_string(alreadyActiveAccount, "webosAccountId", NULL);
 			if ((existingWebosId == NULL || *existingWebosId == '\0') && !params.accountId.empty())
 			{
-				purple_account_set_string(alreadyActiveAccount, "webosAccountId", params.accountId.data());
+				stampWebosAccountId(alreadyActiveAccount, params.accountId.data(), params.serviceName.data());
 				if (alreadyActiveAccount->ui_data == NULL)
 				{
 					AccountMetaData* amd = new AccountMetaData;
@@ -3051,9 +3148,10 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 
 			/* Record the webOS accountId as a persisted account setting so onDelete
 			 * can find and remove exactly this account later (accounts.xml survives
-			 * restarts; the in-memory ui_data does not). */
+			 * restarts; the in-memory ui_data does not - see stampWebosAccountId's
+			 * comment for why the XML tag alone isn't reliable either). */
 			if (!params.accountId.empty())
-				purple_account_set_string(account, "webosAccountId", params.accountId.data());
+				stampWebosAccountId(account, params.accountId.data(), params.serviceName.data());
 		}
 
 		// webOS receive attachments: make image-capable prpls auto-download incoming files to a
@@ -3136,7 +3234,7 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 			account->ui_data = (void*)amd;
 		}
 		if (!params.accountId.empty())
-			purple_account_set_string(account, "webosAccountId", params.accountId.data());
+			stampWebosAccountId(account, params.accountId.data(), params.serviceName.data());
 		s_onlineAccountData[accountKey] = account;
 		s_pendingAccountData.erase(accountKey);
 		s_ipAddressesBoundTo[accountKey] = params.localIpAddress.data();
