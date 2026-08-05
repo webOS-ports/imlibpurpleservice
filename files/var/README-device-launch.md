@@ -33,6 +33,50 @@ The original on-demand LS2 service (`com.palm.imlibpurple.service`, `Exec=/var/i
 Palm-Pre/1.5`) is left in place untouched. With the upstart daemon owning the bus name, the hub
 routes method calls to the resident instance instead of launching (and later reaping) its own.
 
+## Dual-instance launch race (found + fixed 2026-08-05)
+
+The assumption in the paragraph above — that owning the bus name stops the hub from launching its
+own instance — is **wrong**, and was never actually true. Confirmed live: killing the resident
+transport and doing *nothing else* (no LS2 calls at all) still produces two fully independent
+`imlibpurpletransport` processes seconds later — one via upstart's respawn (`imdaemon.sh`), one via
+`ls-hubd`'s own on-demand activation (parent PID = the hub's own PID). Each is a separate OS
+process with its own independent `g_service`/`g_sa` globals, and each attempts its own full
+Teams/Telegram/Signal/WhatsApp login. Whichever one loses a given service name's
+`LSRegisterPalmService` call can still be fully logged in with a healthy session, but can never
+receive LS2 calls for that name — the connector looks "REGISTERED" in its own log and is
+permanently unreachable. This was misdiagnosed for a long time as assorted flakiness (calls not
+connecting, dial silently vanishing, hours of total log silence) before being traced to this.
+
+Two compounding bugs, both fixed:
+
+1. **The four per-connector `.call` services bypassed the wrapper entirely.**
+   `com.palm.teams.call.service` / `com.palm.telegram.call.service` /
+   `com.palm.signal.call.service` / `com.palm.whatsapp.call.service` (in each connector's own
+   `calling/dbus-1/system-services/`) all had `Exec=/usr/bin/imlibpurpletransport` — the RAW
+   binary, skipping `imwrap.sh` entirely. That means any on-demand activation triggered by an LS2
+   call to `palm://com.palm.<x>.call/...` got none of imwrap.sh's setup: no PmLog semaphore
+   self-heal (a transport killed mid-init leaves `/dev/shm/sem.PmLogLib` locked, and the next one
+   to hit it *blocks forever* on its first PmLog call — alive per `ps`, zero log output, never
+   responds to LS2, exactly the "hours of silence" symptom), no SSLFIX, no stdout redirect to
+   `imstdout.log` (so this instance's own diagnostics went nowhere anyone was looking). Fixed: all
+   four now use the same `Exec=/var/imwrap.sh -c …` line as `com.palm.imlibpurple.service`.
+2. **No singleton guard.** Even with both paths going through the wrapper, nothing stopped two
+   concurrent launches. Added a POSIX `mkdir`-based lock (`/var/run/imlibpurpletransport.lock`,
+   `mkdir` is atomic so this is race-safe without `flock`, which isn't reliably available here) near
+   the top of `imwrap.sh`, before any of the expensive setup work. A losing launcher checks whether
+   the PID recorded in the lock is still alive (`kill -0`) and exits immediately if so; if the
+   recorded PID is dead (the common case after a `kill -9`, which can't be trapped for cleanup —
+   and this script's own trailing `exec` means a shell `EXIT` trap would never fire anyway since
+   `exec` replaces the process image rather than ending the shell) it reclaims the lock and
+   proceeds. Verified live: a duplicate launch attempt now logs `imwrap.sh: already running as pid
+   X, not starting a second instance` and does not spawn; only one process tree exists after a kill.
+
+**Symptom checklist if this regresses** (e.g. after a from-scratch reinstall that doesn't carry the
+fixed `.service` files): `ps -ef | grep imlibpurpletransport` shows two process trees with
+different parent PIDs (one PPID 1, one PPID = `ls-hubd`'s PID); `grep 'LSRegisterPalmService FAIL'
+imstdout.log` / `teams-call.log` (etc.) shows a registration collision; a connector's call service
+answers `callStateQuery` but never delivers `dial`/`answer` to the plugin's own log.
+
 ## Contacts search-by-service (two parts)
 
 Lets the native Contacts search box find contacts by IM **service** — typing
@@ -84,6 +128,12 @@ plugin; this is only the db8 side.)
     mount -o remount,rw /
     cp var/imwrap.sh var/imdaemon.sh /var/ && chmod 755 /var/imwrap.sh /var/imdaemon.sh
     cp etc/event.d/imtransport /etc/event.d/
+    # per-connector call services MUST route through imwrap.sh too (see "Dual-instance launch
+    # race" above) - each connector's own calling/dbus-1/system-services/com.palm.<x>.call.service:
+    cp .../calling/dbus-1/system-services/com.palm.teams.call.service /usr/share/dbus-1/system-services/
+    cp .../calling/dbus-1/system-services/com.palm.telegram.call.service /usr/share/dbus-1/system-services/
+    cp .../calling/dbus-1/system-services/com.palm.signal.call.service /usr/share/dbus-1/system-services/
+    cp .../calling/dbus-1/system-services/com.palm.whatsapp.call.service /usr/share/dbus-1/system-services/
     # search-by-service, part 1 (index):
     cp etc/palm/db/kinds/com.palm.person /etc/palm/db/kinds/com.palm.person
     cp var/provision-person-search.sh /var/ && chmod 755 /var/provision-person-search.sh
@@ -104,3 +154,11 @@ plugin; this is only the db8 side.)
     status imtransport            # -> "imtransport (start) running, process <pid>"
     # over an idle period the pid must NOT change and imstdout.log must show no repeated
     # "imlibpurpletransport stopping" (idle-reap) events.
+    ps -ef | grep imlibpurpletransport   # exactly ONE process tree (one PPID-1 parent + its own
+                                          # worker children) - two different parent PIDs means the
+                                          # dual-instance race is back (check the four .call
+                                          # services still route through imwrap.sh, not the raw
+                                          # binary directly).
+    killall -9 imlibpurpletransport; sleep 3; ps -ef | grep imlibpurpletransport
+    # -> exactly one fresh tree; grep imstdout.log for "already running as pid" to confirm the
+    # singleton lock caught and rejected any second launch attempt.

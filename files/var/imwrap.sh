@@ -20,6 +20,32 @@
 LOG=/media/cryptofs/imstdout.log
 SZ=$(wc -c < "$LOG" 2>/dev/null || echo 0)
 if [ "$SZ" -gt 31457280 ] 2>/dev/null; then mv -f "$LOG" "$LOG.1" 2>/dev/null; fi
+
+# SINGLETON LOCK: com.palm.imlibpurple's own .service AND every per-connector com.palm.<x>.call
+# .service both point Exec here, and ls-hubd's on-demand activation races the upstart-managed
+# resident daemon (imdaemon.sh) independently -- confirmed live: killing the transport and doing
+# NOTHING else (no LS2 calls at all) still produces two fully independent imlibpurpletransport
+# processes seconds later, each with its own g_service/g_sa and its own full Teams/Telegram/etc
+# login. Whichever one loses a given connector's LSRegisterPalmService call can't receive LS2
+# calls for it even though it may have its own valid, separately-logged-in session -- explains a
+# night of "REGISTERED but never responds to dial", not any single connector's own code.
+# mkdir is atomic on POSIX (unlike a plain file test+create) so this is race-safe without flock,
+# which isn't reliably available here. PID-liveness check (not a trap-based cleanup) handles a
+# stale lock from a kill -9'd previous instance -- SIGKILL can't be trapped, and this script's own
+# `exec` at the bottom means a shell EXIT trap would never fire anyway (exec replaces the process
+# image, it doesn't end the shell).
+LOCKDIR=/var/run/imlibpurpletransport.lock
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  OLDPID=$(cat "$LOCKDIR/pid" 2>/dev/null)
+  if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
+    echo "$(date -Iseconds 2>/dev/null) imwrap.sh: already running as pid $OLDPID, not starting a second instance" >> "$LOG"
+    exit 0
+  fi
+  echo "$(date -Iseconds 2>/dev/null) imwrap.sh: stale lock (pid $OLDPID gone), reclaiming" >> "$LOG"
+  rm -rf "$LOCKDIR"
+  mkdir "$LOCKDIR" 2>/dev/null || exit 0   # lost a race against another launcher - let IT run
+fi
+echo $$ > "$LOCKDIR/pid"   # $$ stays correct after exec below: exec keeps the same PID
 # libpurple.so + purple-2/ plugins now live at the real /usr/lib(+/purple-2) -- see
 # packaging/README.md "why /usr/lib now". RUNTIME holds only the private, non-stock-colliding
 # runtime deps (libstdc++/libgcrypt/libpng16/libwebp/libopus/... -- third-party link deps unique
