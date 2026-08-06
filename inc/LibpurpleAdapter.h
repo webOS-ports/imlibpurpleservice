@@ -110,6 +110,11 @@ public:
 	// "webos-im-edit" signal. newText is the new body (already HTML-escaped, like a normal incoming body).
 	virtual bool handleMessageEdit(const char* serviceName, const char* username, const char* serviceMessageId,
 				const char* newText) = 0;
+	// webOS: the sender deleted a message they'd previously sent "for everyone"; replace the stored
+	// bubble's text with a placeholder in place (found by serviceMessageId). Driven by the
+	// "webos-im-delete" signal.
+	virtual bool handleMessageDelete(const char* serviceName, const char* username,
+				const char* serviceMessageId) = 0;
 	// webOS: an OUTGOING attachment's file transfer failed/cancelled AFTER we optimistically stored the
 	// Outbox row as "successful" (sendFile only initiates the xfer). Downgrade that row to "failed" so
 	// the user sees the failure (! icon / dashboard notification) and can resend. dbId = the _id.
@@ -201,6 +206,11 @@ public:
 	// the account right before the send-reaction signal so a backend (whatsmeow) can build the reaction
 	// without a live in-memory message-cache entry (survives a transport restart / very old messages).
 	static SendResult sendReaction(const char *serviceName, const char *username, const char *usernameTo, const char *targetServiceMessageId, const char *emoji, bool remove, const char *targetSender = NULL);
+	// senderJid = the poll creation message's original sender (from the app's db8 row), stashed on the
+	// account right before the send-poll-vote signal - same db8-fallback pattern as sendReaction's
+	// targetSender, so whatsmeow can build+encrypt the vote without a live in-memory message-cache
+	// entry (survives a transport restart, or a poll older than the cache).
+	static SendResult sendPollVote(const char *serviceName, const char *username, const char *usernameTo, const char *pollMessageId, const char *optionNamesJoined, const char *senderJid = NULL);
 	// webOS attachment send: transmit a local file (absolute path, must exist and be readable in the
 	// transport process) to usernameTo. Mirrors sendMessage's account resolution + channel detection:
 	// a group-channel target routes through serv_chat_send_file, a 1:1 IM through serv_send_file. All

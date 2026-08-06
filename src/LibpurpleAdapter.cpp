@@ -179,6 +179,9 @@ static void im_reaction_cb(PurpleAccount* account, const char* targetServiceMess
 static void im_outbox_id_cb(PurpleAccount* account, const char* serviceMessageId, const char* text, void* data);
 // webOS: handler for "webos-im-edit" - the sender edited a message; update its stored bubble text in place.
 static void im_edit_cb(PurpleAccount* account, const char* serviceMessageId, const char* newText, void* data);
+// webOS: handler for "webos-im-delete" - the sender deleted a message "for everyone"; replace its
+// stored bubble text with a placeholder in place.
+static void im_delete_cb(PurpleAccount* account, const char* serviceMessageId, void* data);
 // webOS delivery/read receipts: a prpl reports the recipient delivered/read our outgoing message.
 // by-id (WhatsApp/Signal): (account, serviceMessageId, status). watermark (Telegram/Facebook/Teams):
 // (account, scope, watermark, status). status is "delivered" or "read".
@@ -1640,6 +1643,13 @@ static void account_signed_off_cb(PurpleConnection* gc, gpointer loginState)
 	g_return_if_fail(account != NULL);
 
 	std::string const& accountKey = getAccountKeyFromPurpleAccount(account);
+
+	// See logout()'s comment: erase s_AccountIdsData here, once libpurple confirms this account has
+	// actually finished disconnecting, instead of eagerly at the logout() call site - closes the
+	// race window where buddy_status_changed_cb (etc.) would fire against a still-live buddy list
+	// after the mapping was already gone.
+	s_AccountIdsData.erase(accountKey);
+
 	if (s_onlineAccountData.count(accountKey))
 	{
 		MojLogInfo(IMServiceApp::s_log, _T("account_signed_off_cb: removing account from onlineAccountData hash table. accountKey %s"), accountKey.c_str());
@@ -2513,6 +2523,21 @@ static void im_edit_cb(PurpleAccount* account, const char* serviceMessageId, con
 }
 
 /*
+ * webOS "delete for everyone": a prpl (WhatsApp) reported that the sender revoked a previously-sent
+ * message whose network id is serviceMessageId. Resolve the owning account and hand off to
+ * IMServiceHandler, which finds the stored immessage and replaces its text with a placeholder in
+ * place (the same find-by-serviceMessageId + merge mechanism as im_edit_cb above).
+ */
+static void im_delete_cb(PurpleAccount* account, const char* serviceMessageId, void* data)
+{
+	if (account == NULL || serviceMessageId == NULL || *serviceMessageId == '\0' || s_imServiceHandler == NULL)
+		return;
+	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
+	std::string ownerWebos = getWebosUsername(account->username, serviceName, account);
+	s_imServiceHandler->handleMessageDelete(serviceName.c_str(), ownerWebos.c_str(), serviceMessageId);
+}
+
+/*
  * webOS delivery/read receipts (watermark): a prpl (Telegram/Facebook/Teams) reported that everything
  * up to a boundary was delivered/read. scope names the conversation + match field (see ReceiptHandler);
  * watermark is the numeric boundary. Upgrades every Outbox row at/under it.
@@ -3321,9 +3346,20 @@ bool LibpurpleAdapter::logout(const char* serviceName, const char* username, Log
 
 	std::string const& accountKey = getAccountKey(username, serviceName);
 
-	// Remove the accountId since a logout could be from the user removing the account
-	s_AccountIdsData.erase(accountKey);
-
+	// s_AccountIdsData is intentionally NOT erased here. purple_account_disconnect() below is
+	// async - libpurple keeps delivering signals (buddy-status-changed, etc.) against the still-
+	// live PurpleAccount/buddy list for a bit after this call returns, and erasing the mapping
+	// eagerly opened a window where every one of those in-flight signals hit
+	// "accountId not found in table" (buddy_status_changed_cb et al). Harmless individually, but
+	// under a mass simultaneous relogin (many accounts disconnecting/reconnecting at once) this
+	// produced a huge burst of them - real, evidenced case CAPTURED 2026-08-05: a Signal account's
+	// full ~59-buddy presence re-sync landed mid-teardown-race and logged 50+ of these in under a
+	// second, coinciding with a transport crash-loop and the device hard-rebooting shortly after.
+	// account_signed_off_cb() (this file) now does the erase once libpurple confirms the account
+	// has actually finished disconnecting, closing the window instead of pre-opening it. A logout()
+	// on an already-disconnected/never-connected account (success=FALSE below) leaves the mapping
+	// in place, which is harmless - there's no live PurpleAccount left to emit signals from, and a
+	// future login() for the same key overwrites the entry rather than requiring a prior erase.
 	PurpleAccount* accountTologoutFrom = 0;
 
 	if (s_onlineAccountData.count(accountKey))
@@ -4548,6 +4584,47 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendReaction(const char* serviceN
 }
 
 /*
+ * webOS polls (SEND): vote on a poll the user received. Mirrors sendReaction's account resolution.
+ * optionNamesJoined is the FULL current selection, "\x1f"-separated ("" clears the vote). Resolve
+ * the owning account and emit "webos-im-send-poll-vote" so the owning prpl (WhatsApp) transmits it.
+ */
+LibpurpleAdapter::SendResult LibpurpleAdapter::sendPollVote(const char* serviceName, const char* username, const char* usernameTo, const char* pollMessageId, const char* optionNamesJoined, const char* senderJid)
+{
+	if (!serviceName || !username || !usernameTo || !pollMessageId || *pollMessageId == '\0')
+	{
+		MojLogError(IMServiceApp::s_log, _T("sendPollVote: Invalid parameter."));
+		return LibpurpleAdapter::INVALID_PARAMS;
+	}
+
+	std::string accountKey = getAccountKey(username, serviceName);
+	std::string const usernameToBuf = getPurpleUsername(usernameTo, serviceName);
+
+	PurpleAccount* account = NULL;
+	if (s_onlineAccountData.count(accountKey))
+		account = s_onlineAccountData[accountKey];
+
+	if (account == NULL)
+	{
+		MojLogError(IMServiceApp::s_log, _T("sendPollVote: account not logged in. service %s"), serviceName);
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	}
+
+	MojLogInfo(IMServiceApp::s_log, _T("sendPollVote: poll %s options '%s' (%s)"),
+			pollMessageId, optionNamesJoined ? optionNamesJoined : "", serviceName);
+
+	// db8 fallback (same pattern as sendReaction's targetSender): stash the poll's original sender on
+	// the account right before the (synchronous) emit, so whatsmeow can build+encrypt the vote even
+	// when its in-memory message cache has no entry for the poll (transport restart / very old poll).
+	// Delivered out-of-band, not a new signal param, so the shared 4-arg signal stays untouched.
+	purple_account_set_string(account, "webos-pollvote-sender", senderJid ? senderJid : "");
+
+	purple_signal_emit(purple_conversations_get_handle(), "webos-im-send-poll-vote",
+			account, usernameToBuf.c_str(), pollMessageId, optionNamesJoined ? optionNamesJoined : "");
+
+	return LibpurpleAdapter::SENT;
+}
+
+/*
  * webOS attachment send. Mirrors sendMessage's account resolution + channel detection, but instead of
  * serv_send_im / serv_chat_send it hands the local file to libpurple's file-transfer path:
  *   - group channel target -> serv_chat_send_file(gc, chatId, path)  (gated by chat_can_receive_file)
@@ -4841,6 +4918,15 @@ static void registerWebosReactionSignals()
 	purple_signal_connect(convHandle, "webos-im-edit", &webosHandle,
 			PURPLE_CALLBACK(im_edit_cb), NULL);
 
+	// "delete for everyone" (WhatsApp): a prpl emits (account, serviceMessageId) when the sender
+	// revokes a previously-sent message; DeleteHandler replaces the stored bubble's text in place.
+	purple_signal_register(convHandle, "webos-im-delete",
+			purple_marshal_VOID__POINTER_POINTER, NULL, 2,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING));
+	purple_signal_connect(convHandle, "webos-im-delete", &webosHandle,
+			PURPLE_CALLBACK(im_delete_cb), NULL);
+
 	// delivery/read receipts BY-ID (WhatsApp/Signal): (account, serviceMessageId, status).
 	purple_signal_register(convHandle, "webos-im-receipt",
 			purple_marshal_VOID__POINTER_POINTER_POINTER, NULL, 3,
@@ -4869,7 +4955,18 @@ static void registerWebosReactionSignals()
 			purple_value_new(PURPLE_TYPE_STRING),
 			purple_value_new(PURPLE_TYPE_STRING),
 			purple_value_new(PURPLE_TYPE_STRING));
-	MojLogInfo(IMServiceApp::s_log, _T("registered webos-im-reaction + webos-im-reaction-set + webos-im-outbox-id + webos-im-send-reaction signals (early)"));
+
+	// SEND: prpls CONNECT to this to transmit a poll vote (account, peer, pollMessageId,
+	// optionNamesJoined - "\x1f"-separated, "" = clear vote). Emitted by LibpurpleAdapter::sendPollVote;
+	// only WhatsApp connects (gometa/Facebook has no polls).
+	purple_signal_register(convHandle, "webos-im-send-poll-vote",
+			purple_marshal_VOID__POINTER_POINTER_POINTER_POINTER, NULL, 4,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+
+	MojLogInfo(IMServiceApp::s_log, _T("registered webos-im-reaction + webos-im-reaction-set + webos-im-outbox-id + webos-im-send-reaction + webos-im-send-poll-vote signals (early)"));
 }
 
 void LibpurpleAdapter::assignIMLoginState(LoginCallbackInterface* loginState)

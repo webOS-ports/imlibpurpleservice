@@ -36,6 +36,7 @@
 #include "ReactionHandler.h"
 #include "OutboxIdHandler.h"
 #include "EditHandler.h"
+#include "DeleteHandler.h"
 #include "ReceiptHandler.h"
 #include "IMMessage.h"
 #include "OutgoingIMCommandHandler.h"
@@ -1314,6 +1315,29 @@ bool IMServiceHandler::handleMessageEdit(const char* serviceName, const char* us
 		MojString error;
 		MojErrToString(err, error);
 		MojLogError(IMServiceApp::s_log, _T("handleMessageEdit failed: %d - %s"), err, error.data());
+		return false;
+	}
+	return true;
+}
+
+/*
+ * webOS: the sender deleted a message they'd previously sent "for everyone" (e.g. WhatsApp
+ * ProtocolMessage/REVOKE). Spin up a DeleteHandler to find the stored immessage by serviceMessageId
+ * and replace its text with a placeholder, so the conversation shows "This message was deleted." in
+ * place instead of leaving the original content visible forever.
+ */
+bool IMServiceHandler::handleMessageDelete(const char* serviceName, const char* username,
+		const char* serviceMessageId)
+{
+	MojLogInfo(IMServiceApp::s_log, _T("handleMessageDelete: service %s id %s"),
+			serviceName ? serviceName : "", serviceMessageId ? serviceMessageId : "");
+
+	MojRefCountedPtr<DeleteHandler> deleteHandler(new DeleteHandler(m_service, this));
+	MojErr err = deleteHandler->handleDelete(serviceName, username, serviceMessageId);
+	if (err) {
+		MojString error;
+		MojErrToString(err, error);
+		MojLogError(IMServiceApp::s_log, _T("handleMessageDelete failed: %d - %s"), err, error.data());
 		return false;
 	}
 	return true;

@@ -134,6 +134,9 @@ MojErr SendOneCommandHandler::doSend(const MojObject imCmd) {
 	else if (0 == command.compare(_T("sendReaction"))) {
 		retVal = sendReaction(imCmd);
 	}
+	else if (0 == command.compare(_T("sendPollVote"))) {
+		retVal = sendPollVote(imCmd);
+	}
 	else if (0 == command.compare(_T("receivedBuddyInvite"))) {
 		retVal = receivedBuddyInvite(imCmd);
 	}
@@ -180,11 +183,12 @@ MojErr SendOneCommandHandler::doSend(const MojObject imCmd) {
 		m_outgoingIMHandler->messageFinished();
 
 	}
-	else if (0 == command.compare(_T("sendReaction"))) {
-		// sendReaction completes SYNCHRONOUSLY (unlike the buddy verbs, which call messageFinished from
-		// their own async DB callbacks). Without this, messageFinished() is never reached on success, so
-		// the OutgoingIMHandler queue never advances and completeActivityManagerActivity(restart) never
-		// re-arms the pending-command watch - only ONE command would ever process per transport lifetime.
+	else if (0 == command.compare(_T("sendReaction")) || 0 == command.compare(_T("sendPollVote"))) {
+		// sendReaction/sendPollVote complete SYNCHRONOUSLY (unlike the buddy verbs, which call
+		// messageFinished from their own async DB callbacks). Without this, messageFinished() is never
+		// reached on success, so the OutgoingIMHandler queue never advances and
+		// completeActivityManagerActivity(restart) never re-arms the pending-command watch - only ONE
+		// command would ever process per transport lifetime.
 		m_outgoingIMHandler->messageFinished();
 	}
 
@@ -267,6 +271,26 @@ LibpurpleAdapter::SendResult SendOneCommandHandler::sendReaction(const MojObject
 
 	return LibpurpleAdapter::sendReaction(m_serviceName.data(), m_username.data(), m_buddyName.data(),
 			targetId.data(), emoji.data(), remove, targetSender.data());
+}
+
+/*
+ * webOS polls (SEND): transmit a vote the user placed from the device. params carry the poll's
+ * serviceMessageId and the FULL current selection ("\x1f"-separated option names; "" clears the
+ * vote). m_username = our account, m_buddyName = the conversation peer (set in doSend).
+ */
+LibpurpleAdapter::SendResult SendOneCommandHandler::sendPollVote(const MojObject imCmd) {
+	MojObject params;
+	imCmd.get(MOJDB_PARAMS, params);
+	IMServiceHandler::logMojObjectJsonString(_T("sendPollVote params: %s"), params);
+
+	MojString pollMessageId, optionNames, senderJid;
+	bool found = false;
+	params.get(XPORT_POLL_MSG_ID, pollMessageId, found);
+	params.get(XPORT_POLL_OPTIONS, optionNames, found);
+	params.get(XPORT_POLL_SENDER, senderJid, found);
+
+	return LibpurpleAdapter::sendPollVote(m_serviceName.data(), m_username.data(), m_buddyName.data(),
+			pollMessageId.data(), optionNames.data(), senderJid.data());
 }
 
 LibpurpleAdapter::SendResult SendOneCommandHandler::blockBuddy(const MojObject imCmd) {
