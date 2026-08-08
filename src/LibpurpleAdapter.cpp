@@ -4815,8 +4815,6 @@ bool LibpurpleAdapter::deviceConnectionClosed(bool all, const char* ipAddress)
 
 		if (all == true || (accountBoundToIpAddress != "" && ipAddress == accountBoundToIpAddress))
 		{
-			bool accountWasLoggedIn = FALSE;
-
 			PurpleAccount* account;
 
 			if (s_onlineAccountData.count(accountKey) == 0)
@@ -4834,7 +4832,6 @@ bool LibpurpleAdapter::deviceConnectionClosed(bool all, const char* ipAddress)
 			else
 			{
 				account = s_onlineAccountData[accountKey];
-				accountWasLoggedIn = TRUE;
 				MojLogInfo(IMServiceApp::s_log, _T("Logging out"));
 			}
 
