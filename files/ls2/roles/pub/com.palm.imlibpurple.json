@@ -23,7 +23,7 @@
         "com.palm.app.facebookim",
         "com.palm.app.signal",
         "com.palm.app.telegram",
-        "org.webosports.app.teams",
+        "com.palm.app.teams",
         "com.palm.service.accounts"
       ],
       "outbound": [
