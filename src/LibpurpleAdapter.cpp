@@ -2640,6 +2640,13 @@ gboolean connectTimeoutCallback(gpointer data)
 		MojLogWarning(IMServiceApp::s_log,
 				_T("WARNING: got to connectTimeoutCallback without an account in the pending list. Must have abandoned login earlier."));
 		noRetry = false;
+		// deviceConnectionClosed parks the PurpleAccount in s_offlineAccountData rather than
+		// destroying it (it is kept for reuse on the next login), so recover it from there.
+		// Without this, account stays NULL all the way down to the loginResult call below, which
+		// dereferences account->username -- a NULL deref that took the whole transport down
+		// whenever a connect timeout fired for a login WiFi had already caused us to abandon.
+		if (s_offlineAccountData.count(accountKey))
+			account = s_offlineAccountData[accountKey];
 	}
 	else {
 		account = s_pendingAccountData[accountKey];
@@ -2681,7 +2688,10 @@ gboolean connectTimeoutCallback(gpointer data)
 		// TODO - should noRetry be false here in other cases?
 		// Can't really tell - we will get here if the proper sa security certificate is not installed, which is a permanent failure.
 		// libpurple just does not reliably call the login failed callback in all cases...this is not the same as a connection timeout.
-		s_loginState->loginResult(serviceName.c_str(), getWebosUsername(account->username, serviceName).c_str(), LoginCallbackInterface::LOGIN_TIMEOUT, false, ERROR_NETWORK_ERROR, noRetry);
+		// account can still be NULL here if the abandoned login left nothing in s_offlineAccountData
+		// either; getServiceNameFromPurpleAccount and getWebosUsername both handle that (empty
+		// string), so loginResult still runs and resets the db8 watch instead of crashing.
+		s_loginState->loginResult(serviceName.c_str(), getWebosUsername(account ? account->username : NULL, serviceName).c_str(), LoginCallbackInterface::LOGIN_TIMEOUT, false, ERROR_NETWORK_ERROR, noRetry);
 	}
 	else
 	{

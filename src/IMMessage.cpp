@@ -169,11 +169,12 @@ MojErr IMMessage::initFromCallback(const char* serviceName, const char* username
 
 	err = msgText.assign(emojiSafeMessage);
 	free(emojiSafeMessage);
-	MojErrCheck(err);
-	// cleanup
+	// cleanup -- must come BEFORE the MojErrCheck: that macro returns on failure, and doing it
+	// first leaked all three buffers on every failed assign (this is the per-incoming-message path).
 	if (recoveredMessage) free(recoveredMessage);
 	free(unescapedMessage);
 	free(sanitizedMessage);
+	MojErrCheck(err);
 
 	// remove blanks and convert to lowercase
 	// for AOL, this is screen name with no "@aol.com"...
