@@ -5314,11 +5314,11 @@ bool LibpurpleAdapter::allAccountsOffline()
 			return true;
 		}
 		else {
-			MojLogInfo(IMServiceApp::s_log, _T("allAccountsOffline - %d accounts still pending"), s_pendingAccountData.size());
+			MojLogInfo(IMServiceApp::s_log, _T("allAccountsOffline - %zu accounts still pending"), s_pendingAccountData.size());
 		}
 	}
 	else {
-		MojLogInfo(IMServiceApp::s_log, _T("allAccountsOffline - %d accounts still online"), s_onlineAccountData.size());
+		MojLogInfo(IMServiceApp::s_log, _T("allAccountsOffline - %zu accounts still online"), s_onlineAccountData.size());
 	}
 
 	return false;
