@@ -3788,40 +3788,6 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::declineBuddy(const char* serviceN
 	return SENT;
 }
 
-// webOS Telegram port: reduce a display name to plain printable ASCII (0x20-0x7E), collapsing runs of
-// whitespace and trimming. Old webOS (enyo, no emoji/CJK/Thai fonts) renders anything else as tofu
-// boxes, and astral-plane chars (emoji) can break the messaging JS. May return empty if the input had
-// no ASCII content. Non-ASCII bytes are dropped without emitting a space, so "a<emoji>b" -> "ab" while
-// "a <emoji> b" -> "a b".
-static std::string reduceToAscii(const char* in)
-{
-	std::string out;
-	if (in == NULL)
-		return out;
-	bool prevSpace = false;
-	for (const unsigned char* p = (const unsigned char*)in; *p; ++p)
-	{
-		unsigned char c = *p;
-		if (c < 0x20 || c > 0x7E)
-			continue; // drop non-printable / non-ASCII
-		bool isSpace = (c == ' ' || c == '\t');
-		if (isSpace)
-		{
-			if (!out.empty() && !prevSpace)
-				out.push_back(' ');
-			prevSpace = true;
-		}
-		else
-		{
-			out.push_back((char)c);
-			prevSpace = false;
-		}
-	}
-	while (!out.empty() && out[out.size() - 1] == ' ')
-		out.erase(out.size() - 1);
-	return out;
-}
-
 // webOS Telegram port: drop astral-plane characters (Unicode > U+FFFF: emoji, flags, rare CJK-ext) from
 // a display name, keeping ALL Basic-Multilingual-Plane text - Latin, Cyrillic, Greek, Thai, CJK, BMP
 // symbols - which the webOS WebKit renders fine via the fallback-font slots. WebKit's font fallback is
