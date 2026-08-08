@@ -24,7 +24,14 @@
         "com.palm.app.signal",
         "com.palm.app.telegram",
         "com.palm.app.teams",
-        "com.palm.service.accounts"
+        "com.palm.service.accounts",
+        "com.palm.app.gometa",
+        "com.palm.app.googlechat",
+        "com.palm.app.phone",
+        "org.webosports.app.messaging",
+        "com.palm.db",
+        "com.palm.tempdb",
+        "com.palm.display"
       ],
       "outbound": [
         "com.palm.imlibpurple",
@@ -33,7 +40,15 @@
         "com.palm.activitymanager",
         "com.palm.connectionmanager",
         "com.palm.display",
-        "com.palm.service.accounts"
+        "com.palm.service.accounts",
+        "com.palm.telegram.call",
+        "com.palm.signal.call",
+        "com.palm.whatsapp.call",
+        "com.palm.teams.call",
+        "com.palm.audio",
+        "com.palm.mediad",
+        "com.palm.mediad.*",
+        "com.palm.applicationManager"
       ]
     },
     {

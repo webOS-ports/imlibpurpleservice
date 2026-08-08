@@ -43,25 +43,9 @@ if(IMLIBPURPLE_LEGACY_DB8)
     webos_add_compiler_flags(ALL "-DIMLIBPURPLE_LEGACY_DB8")
 endif()
 
-file(GLOB SOURCES
-    src/OnEnabledHandler.cpp
-    src/IMLoginState.cpp
-    src/LibpurpleAdapter.cpp
-    src/BuddyStatusHandler.cpp
-    src/IMServiceHandler.cpp
-    src/SendOneMessageHandler.cpp
-    src/DisplayController.cpp
-    src/OutgoingIMHandler.cpp
-    src/BuddyListConsolidator.cpp
-    src/IMServiceApp.cpp
-    src/ConnectionStateHandler.cpp
-    src/IMMessage.cpp
-    src/sanitize.cpp
-    src/entities.cpp
-    src/SendOneCommandHandler.cpp
-    src/OutgoingIMCommandHandler.cpp
-    src/IncomingIMHandler.cpp
-    src/Util.cpp)
+# Build every translation unit under src/. The device build (build.sh) globs the
+# same way, so a new handler only has to be dropped in src/ to land in both.
+file(GLOB SOURCES src/*.cpp)
 
 include_directories(${CMAKE_SOURCE_DIR}/inc)
 

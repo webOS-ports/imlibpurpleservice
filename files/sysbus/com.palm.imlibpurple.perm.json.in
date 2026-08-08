@@ -1,9 +1,58 @@
 {
     "com.palm.imlibpurple": [
         "imlibpurple-service.operation",
+        "imlibpurple-call.operation",
         "accountsservice.management",
         "luna-sysmgr.operation",
         "database.operation",
-        "activity.operation"
+        "tempdatabase.operation",
+        "activity.operation",
+        "activity.query",
+        "activity.wakeup",
+        "networkconnection.query",
+        "application.operation",
+        "application.launcher",
+        "audio.operation",
+        "audio.query",
+        "media.operation",
+        "media.query",
+        "time.query"
+    ],
+
+    "com.palm.telegram.call": [
+        "imlibpurple-service.operation",
+        "imlibpurple-call.operation",
+        "audio.operation",
+        "audio.query",
+        "media.operation",
+        "media.query"
+    ],
+
+    "com.palm.signal.call": [
+        "imlibpurple-service.operation",
+        "imlibpurple-call.operation",
+        "audio.operation",
+        "audio.query",
+        "media.operation",
+        "media.query"
+    ],
+
+    "com.palm.teams.call": [
+        "imlibpurple-service.operation",
+        "imlibpurple-call.operation",
+        "audio.operation",
+        "audio.query",
+        "media.operation",
+        "media.query"
+    ],
+
+    "com.palm.whatsapp.call": [
+        "imlibpurple-service.operation",
+        "imlibpurple-call.operation",
+        "imlibpurple-call.debug",
+        "audio.operation",
+        "audio.query",
+        "media.operation",
+        "media.query"
     ]
 }

@@ -2,7 +2,13 @@
     "exeName":"@WEBOS_INSTALL_SBINDIR@/imlibpurpleservice",
     "trustLevel" : "oem",
     "type":"regular",
-    "allowedNames":["com.palm.imlibpurple"],
+    "allowedNames":[
+        "com.palm.imlibpurple",
+        "com.palm.telegram.call",
+        "com.palm.signal.call",
+        "com.palm.whatsapp.call",
+        "com.palm.teams.call"
+    ],
     "permissions":[
         {
             "service":"com.palm.imlibpurple",
@@ -11,19 +17,136 @@
                 "com.palm.activitymanager",
                 "com.palm.app.messaging",
                 "org.webosports.app.messaging",
+                "com.palm.app.accounts",
+                "org.webosports.app.accounts",
+                "com.palm.app.phone",
+                "org.webosports.app.phone",
+                "com.palm.app.discord",
+                "com.palm.app.gometa",
+                "com.palm.app.facebookim",
+                "com.palm.app.googlechat",
+                "com.palm.app.signal",
+                "com.palm.app.teams",
+                "com.palm.app.telegram",
+                "com.palm.app.whatsapp",
                 "com.palm.display",
                 "com.palm.db",
                 "com.palm.tempdb",
-                "com.palm.service.accounts"
+                "com.palm.service.accounts",
+                "com.webos.lunasend-*"
             ],
             "outbound":[
                 "com.palm.imlibpurple",
+                "com.palm.telegram.call",
+                "com.palm.signal.call",
+                "com.palm.whatsapp.call",
+                "com.palm.teams.call",
                 "com.palm.db",
                 "com.palm.tempdb",
                 "com.palm.activitymanager",
                 "com.palm.connectionmanager",
+                "com.webos.service.connectionmanager",
                 "com.palm.display",
-                "com.palm.service.accounts"
+                "com.palm.service.accounts",
+                "com.palm.applicationManager",
+                "com.webos.applicationManager",
+                "com.palm.audio",
+                "com.webos.audio",
+                "com.webos.service.audio",
+                "com.palm.mediad",
+                "com.palm.mediad.*"
+            ]
+        },
+        {
+            "service":"com.palm.telegram.call",
+            "inbound":[
+                "com.palm.imlibpurple",
+                "com.palm.app.phone",
+                "org.webosports.app.phone",
+                "com.palm.app.messaging",
+                "org.webosports.app.messaging",
+                "com.palm.app.telegram",
+                "com.palm.systemmanager",
+                "com.palm.luna",
+                "com.webos.lunasend-*"
+            ],
+            "outbound":[
+                "com.palm.imlibpurple",
+                "com.palm.audio",
+                "com.webos.audio",
+                "com.webos.service.audio",
+                "com.palm.mediad",
+                "com.palm.mediad.*",
+                "com.palm.display"
+            ]
+        },
+        {
+            "service":"com.palm.signal.call",
+            "inbound":[
+                "com.palm.imlibpurple",
+                "com.palm.app.phone",
+                "org.webosports.app.phone",
+                "com.palm.app.messaging",
+                "org.webosports.app.messaging",
+                "com.palm.app.signal",
+                "com.palm.systemmanager",
+                "com.palm.luna",
+                "com.webos.lunasend-*"
+            ],
+            "outbound":[
+                "com.palm.imlibpurple",
+                "com.palm.audio",
+                "com.webos.audio",
+                "com.webos.service.audio",
+                "com.palm.mediad",
+                "com.palm.mediad.*",
+                "com.palm.display"
+            ]
+        },
+        {
+            "service":"com.palm.teams.call",
+            "inbound":[
+                "com.palm.imlibpurple",
+                "com.palm.app.phone",
+                "org.webosports.app.phone",
+                "com.palm.app.messaging",
+                "org.webosports.app.messaging",
+                "com.palm.app.teams",
+                "com.palm.systemmanager",
+                "com.palm.luna",
+                "com.webos.lunasend-*"
+            ],
+            "outbound":[
+                "com.palm.imlibpurple",
+                "com.palm.audio",
+                "com.webos.audio",
+                "com.webos.service.audio",
+                "com.palm.mediad",
+                "com.palm.mediad.*",
+                "com.palm.display"
+            ]
+        },
+        {
+            "service":"com.palm.whatsapp.call",
+            "inbound":[
+                "com.palm.imlibpurple",
+                "com.palm.app.phone",
+                "org.webosports.app.phone",
+                "com.palm.app.messaging",
+                "org.webosports.app.messaging",
+                "com.palm.app.whatsapp",
+                "com.palm.systemmanager",
+                "com.palm.luna",
+                "com.webos.lunasend-*"
+            ],
+            "outbound":[
+                "com.palm.imlibpurple",
+                "com.palm.audio",
+                "com.webos.audio",
+                "com.webos.service.audio",
+                "com.palm.mediad",
+                "com.palm.mediad.*",
+                "com.palm.display"
             ]
         }
     ]
