@@ -90,14 +90,18 @@ names, `organization.name`, `nickname`, `searchTerms`, `ims.value` and
 (`type_telegram`, `type_whatsapp`, …). Two changes, both required (verified on a
 topaz device):
 
-1. **Index patch** — `etc/palm/db/kinds/com.palm.person` here is the stock kind
-   copied verbatim with `{"name": "ims.type", "tokenize": "all"}` added to the
-   searchProperty include list, and the index **renamed**
-   (`favorite_searchProperty_sortKey` → `favorite_searchPropertySvc_sortKey`)
-   because db8 only rebuilds an index whose name changed. `var/provision-person-search.sh`
-   registers it as the owning service and forces the reindex (no migration — the
-   `ims.type` values already exist on every person, so all existing contacts are
-   covered immediately).
+1. **Index patch** — lives in the app-services repo, which owns the kind:
+   `com.palm.service.contacts.linker/db/kinds/com.palm.person` adds
+   `{"name": "ims.type", "tokenize": "all"}` to the searchProperty include list and
+   **renames** the index (`favorite_searchProperty_sortKey` →
+   `favorite_searchPropertySvc_sortKey`) because db8 only rebuilds an index whose
+   name changed. `var/provision-person-search.sh` registers it as the owning service
+   and forces the reindex (no migration — the `ims.type` values already exist on every
+   person, so all existing contacts are covered immediately).
+
+   It used to be carried here too, but shipping the same `/etc/palm/db/kinds/com.palm.person`
+   from two packages makes opkg refuse the install outright, and this copy was based on an
+   older kind that was missing the `relevance` schema and its four indexes.
 2. **App patch** — `com.palm.app.contacts/app/patches.js` rewrites a typed service
    name (`telegram`) to the stored token (`type_telegram`) before the query. This is
    necessary because db8's tokenizer keeps the `type_` prefix as one token, so a
@@ -134,8 +138,8 @@ plugin; this is only the db8 side.)
     cp .../calling/dbus-1/system-services/com.palm.telegram.call.service /usr/share/dbus-1/system-services/
     cp .../calling/dbus-1/system-services/com.palm.signal.call.service /usr/share/dbus-1/system-services/
     cp .../calling/dbus-1/system-services/com.palm.whatsapp.call.service /usr/share/dbus-1/system-services/
-    # search-by-service, part 1 (index):
-    cp etc/palm/db/kinds/com.palm.person /etc/palm/db/kinds/com.palm.person
+    # search-by-service, part 1 (index): the kind comes from the app-services checkout
+    cp .../com.palm.service.contacts.linker/db/kinds/com.palm.person /etc/palm/db/kinds/com.palm.person
     cp var/provision-person-search.sh /var/ && chmod 755 /var/provision-person-search.sh
     /var/provision-person-search.sh
     # search-by-service, part 2 (app): from the com.palm.app.contacts checkout

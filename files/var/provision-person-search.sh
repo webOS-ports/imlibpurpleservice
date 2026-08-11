@@ -5,8 +5,9 @@
 #
 # The Contacts search box runs one db8 full-text query (`?`) against the `searchProperty`
 # multi-index on com.palm.person:1. Stock, that index does NOT tokenize `ims.type`, which is
-# where the service lives ("type_telegram", "type_whatsapp", ...). This registers a patched
-# kind whose search index also tokenizes `ims.type`.
+# where the service lives ("type_telegram", "type_whatsapp", ...). This registers the patched
+# kind whose search index also tokenizes `ims.type`; the kind itself ships from app-services
+# (com.palm.service.contacts.linker/db/kinds/com.palm.person), which owns it.
 #
 # Verified on device (topaz):
 #   - db8's tokenizer keeps the "type_" prefix as ONE token, so a bare "telegram" never matches
