@@ -80,6 +80,12 @@ private:
 	
 	// message properties
 	MojString m_messageText;
+	// webOS attachment send: absolute local path of a file to send with this message (immessage
+	// "filePath"). Empty for ordinary text-only messages. When set, sendToTransport routes through
+	// LibpurpleAdapter::sendFile (and still sends m_messageText as a follow-up caption if present).
+	MojString m_filePath;
+	// webOS native reply: serviceMessageId of the message being replied to (empty if not a reply).
+	MojString m_quotedMessageId;
 	MojString m_username;
 	MojString m_usernameTo;
 	MojString m_serviceName;

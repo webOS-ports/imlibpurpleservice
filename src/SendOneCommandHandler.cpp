@@ -131,6 +131,12 @@ MojErr SendOneCommandHandler::doSend(const MojObject imCmd) {
 	else if (0 == command.compare(_T("sendBuddyInvite"))) {
 		retVal = inviteBuddy(imCmd);
 	}
+	else if (0 == command.compare(_T("sendReaction"))) {
+		retVal = sendReaction(imCmd);
+	}
+	else if (0 == command.compare(_T("sendPollVote"))) {
+		retVal = sendPollVote(imCmd);
+	}
 	else if (0 == command.compare(_T("receivedBuddyInvite"))) {
 		retVal = receivedBuddyInvite(imCmd);
 	}
@@ -160,7 +166,7 @@ MojErr SendOneCommandHandler::doSend(const MojObject imCmd) {
 		// delete command so we don't keep processing it
 		// put id in an array
 		MojObject idsToDelete;  // array
-		err = idsToDelete.push(m_currentCmdDbId);
+		idsToDelete.push(m_currentCmdDbId);
 
 		// luna://com.palm.db/del '{"ids":[2]}'
 		IMServiceHandler::logMojObjectJsonString(_T("deleting imcommand: %s"), idsToDelete);
@@ -176,6 +182,14 @@ MojErr SendOneCommandHandler::doSend(const MojObject imCmd) {
 		MojLogError(IMServiceApp::s_log, _T("doSend: command failed"));
 		m_outgoingIMHandler->messageFinished();
 
+	}
+	else if (0 == command.compare(_T("sendReaction")) || 0 == command.compare(_T("sendPollVote"))) {
+		// sendReaction/sendPollVote complete SYNCHRONOUSLY (unlike the buddy verbs, which call
+		// messageFinished from their own async DB callbacks). Without this, messageFinished() is never
+		// reached on success, so the OutgoingIMHandler queue never advances and
+		// completeActivityManagerActivity(restart) never re-arms the pending-command watch - only ONE
+		// command would ever process per transport lifetime.
+		m_outgoingIMHandler->messageFinished();
 	}
 
 	return MojErrNone;
@@ -237,16 +251,56 @@ MojErr SendOneCommandHandler::imSaveCommandResult(MojObject& result, MojErr save
      }
  * }
  */
-LibpurpleAdapter::SendResult SendOneCommandHandler::blockBuddy(const MojObject imCmd) {
+/*
+ * webOS reactions (SEND): transmit a reaction the user placed from the device. params carry the
+ * target message's serviceMessageId and the emoji ("" = remove). m_username = our account, m_buddyName
+ * = the conversation peer (set in doSend).
+ */
+LibpurpleAdapter::SendResult SendOneCommandHandler::sendReaction(const MojObject imCmd) {
+	MojObject params;
+	imCmd.get(MOJDB_PARAMS, params);
+	IMServiceHandler::logMojObjectJsonString(_T("sendReaction params: %s"), params);
 
+	MojString targetId, emoji, targetSender;
 	bool found = false;
+	params.get(XPORT_TARGET_MSG_ID, targetId, found);
+	params.get(XPORT_EMOJI, emoji, found);   // the emoji being added or removed (always supplied)
+	params.get(XPORT_TARGET_SENDER, targetSender, found); // the reacted-to message's sender (may be empty)
+	bool remove = false;
+	params.get(XPORT_REMOVE, remove); // true => remove my `emoji` reaction, else add it
+
+	return LibpurpleAdapter::sendReaction(m_serviceName.data(), m_username.data(), m_buddyName.data(),
+			targetId.data(), emoji.data(), remove, targetSender.data());
+}
+
+/*
+ * webOS polls (SEND): transmit a vote the user placed from the device. params carry the poll's
+ * serviceMessageId and the FULL current selection ("\x1f"-separated option names; "" clears the
+ * vote). m_username = our account, m_buddyName = the conversation peer (set in doSend).
+ */
+LibpurpleAdapter::SendResult SendOneCommandHandler::sendPollVote(const MojObject imCmd) {
+	MojObject params;
+	imCmd.get(MOJDB_PARAMS, params);
+	IMServiceHandler::logMojObjectJsonString(_T("sendPollVote params: %s"), params);
+
+	MojString pollMessageId, optionNames, senderJid;
+	bool found = false;
+	params.get(XPORT_POLL_MSG_ID, pollMessageId, found);
+	params.get(XPORT_POLL_OPTIONS, optionNames, found);
+	params.get(XPORT_POLL_SENDER, senderJid, found);
+
+	return LibpurpleAdapter::sendPollVote(m_serviceName.data(), m_username.data(), m_buddyName.data(),
+			pollMessageId.data(), optionNames.data(), senderJid.data());
+}
+
+LibpurpleAdapter::SendResult SendOneCommandHandler::blockBuddy(const MojObject imCmd) {
 
 	// params
 	MojObject params;
-	found = imCmd.get(MOJDB_PARAMS, params);
+	imCmd.get(MOJDB_PARAMS, params);
 	IMServiceHandler::logMojObjectJsonString(_T("command params: %s"),params);
 	bool block = true;
-	found = params.get(XPORT_BLOCK, block);
+	params.get(XPORT_BLOCK, block);
 
 	MojLogInfo (IMServiceApp::s_log, "sending blockBuddy command to transport. id: %s, serviceName: %s, username: %s, buddyUsername: %s, block: %d",
 			m_currentCmdDbId.data(), m_serviceName.data(), m_username.data(), m_buddyName.data(), block);
@@ -372,7 +426,7 @@ LibpurpleAdapter::SendResult SendOneCommandHandler::receivedBuddyInvite(const Mo
 	found = imCmd.get(MOJDB_PARAMS, params);
 	IMServiceHandler::logMojObjectJsonString(_T("command params: %s"),params);
 	if (found) {
-		found = params.get(XPORT_ACCEPT, accept);
+		params.get(XPORT_ACCEPT, accept);
 	}
 
 	MojLogInfo (IMServiceApp::s_log, "sending receiveBuddyInvite to transport. id: %s, serviceName: %s, username: %s, buddyName: %s",

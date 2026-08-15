@@ -1,0 +1,168 @@
+# Transport device launch chain
+
+These files are hand-installed on the TouchPad (they are not produced by `build.sh`, which only
+builds `/usr/bin/imlibpurpletransport`). They are vendored here so a reflash can restore them.
+
+## The chain
+
+1. **`/etc/event.d/imtransport`** — upstart job. Starts on `ls-hubd_private-ready`, `respawn`s,
+   and execs `/var/imdaemon.sh`. This is the keep-alive: it holds the transport resident so the
+   luna hub cannot idle-reap it (see the job's own comment for the full rationale).
+2. **`/var/imdaemon.sh`** — launcher. Execs `imwrap.sh` with the same args as the LS2 `.service`.
+3. **`/var/imwrap.sh`** — the LD_PRELOAD / LD_LIBRARY_PATH wrapper that loads the transport under
+   the wpe-glibc loader (required for purple-signal's in-process JVM). Also self-rotates the log,
+   and self-provisions the OpenSSL override (see below).
+
+## OpenSSL override (SSLFIX) — required for Facebook
+
+purple-facebook is the only prpl that uses libpurple's *native* `purple_ssl_*` layer (the others
+bring their own TLS). That layer needs an ssl provider plugin (`ssl-openssl.so`) to load at startup.
+wpe-glibc/lib ships an OLD `libcrypto.so.3` (OpenSSL 3.0.16) and, because wpe-glibc must be first on
+`LD_LIBRARY_PATH`, it shadows the newer Atlas OpenSSL in `wpe-252/lib` — so `libssl.so.3` (needs
+`OPENSSL_3.3.0`) fails to load, no ssl provider registers, and Facebook logins hang then "Cancelled".
+
+`imwrap.sh` fixes this by prepending `/media/internal/sslfix` (holding ONLY the matched wpe-252
+`libcrypto.so.3` + `libssl.so.3`) to `LD_LIBRARY_PATH`, so OpenSSL resolves from there while
+libc/pthread/dl/rt still come from wpe-glibc. It **self-provisions** that dir from `wpe-252/lib` on
+every launch (copies if missing or size-changed), so a reflash restores it automatically — the only
+dependency is that the Atlas app (`org.webosports.app.atlas/.../wpe-252/lib`) with OpenSSL >= 3.3.0
+is installed. If Atlas is absent, the copy is skipped and Facebook falls back to broken (all other
+services unaffected).
+
+The original on-demand LS2 service (`com.palm.imlibpurple.service`, `Exec=/var/imwrap.sh -c … PalmPre
+Palm-Pre/1.5`) is left in place untouched. With the upstart daemon owning the bus name, the hub
+routes method calls to the resident instance instead of launching (and later reaping) its own.
+
+## Dual-instance launch race (found + fixed 2026-08-05)
+
+The assumption in the paragraph above — that owning the bus name stops the hub from launching its
+own instance — is **wrong**, and was never actually true. Confirmed live: killing the resident
+transport and doing *nothing else* (no LS2 calls at all) still produces two fully independent
+`imlibpurpletransport` processes seconds later — one via upstart's respawn (`imdaemon.sh`), one via
+`ls-hubd`'s own on-demand activation (parent PID = the hub's own PID). Each is a separate OS
+process with its own independent `g_service`/`g_sa` globals, and each attempts its own full
+Teams/Telegram/Signal/WhatsApp login. Whichever one loses a given service name's
+`LSRegisterPalmService` call can still be fully logged in with a healthy session, but can never
+receive LS2 calls for that name — the connector looks "REGISTERED" in its own log and is
+permanently unreachable. This was misdiagnosed for a long time as assorted flakiness (calls not
+connecting, dial silently vanishing, hours of total log silence) before being traced to this.
+
+Two compounding bugs, both fixed:
+
+1. **The four per-connector `.call` services bypassed the wrapper entirely.**
+   `com.palm.teams.call.service` / `com.palm.telegram.call.service` /
+   `com.palm.signal.call.service` / `com.palm.whatsapp.call.service` (in each connector's own
+   `calling/dbus-1/system-services/`) all had `Exec=/usr/bin/imlibpurpletransport` — the RAW
+   binary, skipping `imwrap.sh` entirely. That means any on-demand activation triggered by an LS2
+   call to `palm://com.palm.<x>.call/...` got none of imwrap.sh's setup: no PmLog semaphore
+   self-heal (a transport killed mid-init leaves `/dev/shm/sem.PmLogLib` locked, and the next one
+   to hit it *blocks forever* on its first PmLog call — alive per `ps`, zero log output, never
+   responds to LS2, exactly the "hours of silence" symptom), no SSLFIX, no stdout redirect to
+   `imstdout.log` (so this instance's own diagnostics went nowhere anyone was looking). Fixed: all
+   four now use the same `Exec=/var/imwrap.sh -c …` line as `com.palm.imlibpurple.service`.
+2. **No singleton guard.** Even with both paths going through the wrapper, nothing stopped two
+   concurrent launches. Added a POSIX `mkdir`-based lock (`/var/run/imlibpurpletransport.lock`,
+   `mkdir` is atomic so this is race-safe without `flock`, which isn't reliably available here) near
+   the top of `imwrap.sh`, before any of the expensive setup work. A losing launcher checks whether
+   the PID recorded in the lock is still alive (`kill -0`) and exits immediately if so; if the
+   recorded PID is dead (the common case after a `kill -9`, which can't be trapped for cleanup —
+   and this script's own trailing `exec` means a shell `EXIT` trap would never fire anyway since
+   `exec` replaces the process image rather than ending the shell) it reclaims the lock and
+   proceeds. Verified live: a duplicate launch attempt now logs `imwrap.sh: already running as pid
+   X, not starting a second instance` and does not spawn; only one process tree exists after a kill.
+
+**Symptom checklist if this regresses** (e.g. after a from-scratch reinstall that doesn't carry the
+fixed `.service` files): `ps -ef | grep imlibpurpletransport` shows two process trees with
+different parent PIDs (one PPID 1, one PPID = `ls-hubd`'s PID); `grep 'LSRegisterPalmService FAIL'
+imstdout.log` / `teams-call.log` (etc.) shows a registration collision; a connector's call service
+answers `callStateQuery` but never delivers `dial`/`answer` to the plugin's own log.
+
+## Contacts search-by-service (two parts)
+
+Lets the native Contacts search box find contacts by IM **service** — typing
+"telegram", "whatsapp", "facebook", "signal", … surfaces those contacts — not just
+by name/handle/email.
+
+The Contacts search field runs one db8 full-text query (`?`) against the
+`searchProperty` multi-index on `com.palm.person:1`. Stock, that index tokenizes
+names, `organization.name`, `nickname`, `searchTerms`, `ims.value` and
+`emails.value` — but **not** `ims.type`, where the service token lives
+(`type_telegram`, `type_whatsapp`, …). Two changes, both required (verified on a
+topaz device):
+
+1. **Index patch** — lives in the app-services repo, which owns the kind:
+   `com.palm.service.contacts.linker/db/kinds/com.palm.person` adds
+   `{"name": "ims.type", "tokenize": "all"}` to the searchProperty include list and
+   **renames** the index (`favorite_searchProperty_sortKey` →
+   `favorite_searchPropertySvc_sortKey`) because db8 only rebuilds an index whose
+   name changed. `var/provision-person-search.sh` registers it as the owning service
+   and forces the reindex (no migration — the `ims.type` values already exist on every
+   person, so all existing contacts are covered immediately).
+
+   It used to be carried here too, but shipping the same `/etc/palm/db/kinds/com.palm.person`
+   from two packages makes opkg refuse the install outright, and this copy was based on an
+   older kind that was missing the `relevance` schema and its four indexes.
+2. **App patch** — `com.palm.app.contacts/app/patches.js` rewrites a typed service
+   name (`telegram`) to the stored token (`type_telegram`) before the query. This is
+   necessary because db8's tokenizer keeps the `type_` prefix as one token, so a
+   bare service word never matches the raw `ims.type` value on its own.
+
+Two dead ends ruled out on device: the `"all"` tokenizer does **not** split the
+`type_` prefix (so the index patch alone can't match a plain word), and the contacts
+linker builds `person.searchTerms` from names only — it ignores a contact's own
+`searchTerms` field (so seeding searchTerms on the buddy contact does nothing).
+
+Reflash reverts both to stock — re-run the Install below.
+
+## Message reactions (serviceMessageId index)
+
+Inline reaction badges need the transport to find a reaction's target message by its network id.
+`ReactionHandler` queries `com.palm.immessage.libpurple:1` where
+`serviceName == && username == && serviceMessageId ==`, which requires the compound
+`serviceMessageId` index. That index ships in `etc/palm/db/kinds/com.palm.immessage.libpurple` here,
+but db8 does **not** add a new index to an already-registered kind from a file update alone — an
+explicit `putKind` (as the owning service, with `-i -f`) is required, or every reaction find fails
+`db: no index for query` (-3965) and no badge ever attaches. `var/provision-im-reactions.sh` does
+that registration. Reflash reverts the on-device kind to the stock (index-less) copy — re-run the
+Install below. (The prpl-side hooks — id-stash + the `webos-im-reaction` signal emit — ship in each
+plugin; this is only the db8 side.)
+
+## Install
+
+    mount -o remount,rw /
+    cp var/imwrap.sh var/imdaemon.sh /var/ && chmod 755 /var/imwrap.sh /var/imdaemon.sh
+    cp etc/event.d/imtransport /etc/event.d/
+    # per-connector call services MUST route through imwrap.sh too (see "Dual-instance launch
+    # race" above) - each connector's own calling/dbus-1/system-services/com.palm.<x>.call.service:
+    cp .../calling/dbus-1/system-services/com.palm.teams.call.service /usr/share/dbus-1/system-services/
+    cp .../calling/dbus-1/system-services/com.palm.telegram.call.service /usr/share/dbus-1/system-services/
+    cp .../calling/dbus-1/system-services/com.palm.signal.call.service /usr/share/dbus-1/system-services/
+    cp .../calling/dbus-1/system-services/com.palm.whatsapp.call.service /usr/share/dbus-1/system-services/
+    # search-by-service, part 1 (index): the kind comes from the app-services checkout
+    cp .../com.palm.service.contacts.linker/db/kinds/com.palm.person /etc/palm/db/kinds/com.palm.person
+    cp var/provision-person-search.sh /var/ && chmod 755 /var/provision-person-search.sh
+    /var/provision-person-search.sh
+    # search-by-service, part 2 (app): from the com.palm.app.contacts checkout
+    cp app/patches.js /media/cryptofs/apps/usr/palm/applications/com.palm.app.contacts/app/patches.js
+    # ALL messaging db8 kinds + permissions (reflash reverts them -> -3963 on find(imserver) ->
+    # no servers/channels; also covers the reaction serviceMessageId index). Push the repo copies
+    # of etc/palm/db/{kinds,permissions}/* first, then:
+    cp var/provision-im-db.sh /var/ && chmod 755 /var/provision-im-db.sh
+    /var/provision-im-db.sh
+    # (provision-im-reactions.sh is now subsumed by provision-im-db.sh, but kept for the reaction-only case)
+    stop LunaSysMgr; start LunaSysMgr
+    sync   # then tellbootie / reboot
+
+## Verify
+
+    status imtransport            # -> "imtransport (start) running, process <pid>"
+    # over an idle period the pid must NOT change and imstdout.log must show no repeated
+    # "imlibpurpletransport stopping" (idle-reap) events.
+    ps -ef | grep imlibpurpletransport   # exactly ONE process tree (one PPID-1 parent + its own
+                                          # worker children) - two different parent PIDs means the
+                                          # dual-instance race is back (check the four .call
+                                          # services still route through imwrap.sh, not the raw
+                                          # binary directly).
+    killall -9 imlibpurpletransport; sleep 3; ps -ef | grep imlibpurpletransport
+    # -> exactly one fresh tree; grep imstdout.log for "already running as pid" to confirm the
+    # singleton lock caught and rejected any second launch attempt.

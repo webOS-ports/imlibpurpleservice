@@ -27,6 +27,7 @@
 #define INCOMINGIMMESSAGE_H_
 
 #include "core/MojObject.h"
+#include <time.h>
 
 // Status is used to describe if the message is pending, has a failure or was successfully sent/received.
 // Default is successful. When messages are moved to the outbox, we change the status to pending. The transports
@@ -70,6 +71,44 @@ typedef enum {
 #define MOJDB_ERROR_CODE	        _T("errorCode")
 #define MOJDB_ERROR_CATEGORY	    _T("errorCategory")
 
+// webOS attachment send: absolute local path of a file to send with this outgoing message
+// (e.g. /media/internal/...). Written by the Messaging app when the user attaches a file; absent
+// on ordinary text-only messages. The transport reads it in SendOneMessageHandler and routes the
+// send through LibpurpleAdapter::sendFile (serv_send_file / serv_chat_send_file). db8 is schemaless
+// so this needs no immessage kind change.
+#define MOJDB_FILE_PATH             _T("filePath")
+
+// webOS Servers/Rooms: multi-user-chat (MUC) properties. Only written for group-chat messages
+// (Discord channels, IRC channels, ...); absent on 1:1 IMs. db8 is schemaless so these need no
+// kind change; query indexes are added in Milestone 1.
+// webOS reactions (cross-prpl): the prpl's own stable id for THIS message, stashed by the prpl on
+// the conversation ("webos-msg-id") right before serv_got_im and read in incoming_message_cb. A
+// later reaction references it (see MOJDB_REACTIONS) to attach itself to this row. Schemaless field;
+// an index (serviceName,username,serviceMessageId) is added to the kind for the reaction lookup.
+#define MOJDB_SERVICE_MSG_ID        _T("serviceMessageId")
+// webOS replies: the quoted-original a reply points at. quotedMessageId == the original message's
+// serviceMessageId (so the UI can look it up); quotedText/quotedFrom are the original's text + sender,
+// stashed by the prpl on the conversation ("webos-quoted-*") and rendered as an inline quote card.
+#define MOJDB_QUOTED_MSG_ID         _T("quotedMessageId")
+#define MOJDB_QUOTED_TEXT           _T("quotedText")
+#define MOJDB_QUOTED_FROM           _T("quotedFrom")
+// Array of { emoji, sender } objects merged onto the TARGET message by the reaction handler; the
+// Messaging app renders these as inline badges instead of a separate "reacted with X" message.
+#define MOJDB_REACTIONS             _T("reactions")
+// webOS delivery/read receipts: the recipient's delivery state of an OUTGOING message, merged onto the
+// Outbox row by ReceiptHandler when the prpl reports a receipt (WhatsApp/Signal by message id;
+// Telegram/Facebook/Teams by high-water watermark). "delivered" -> single tick, "read" -> double tick.
+// Monotonic: read outranks delivered; never downgraded. The Messaging app renders the tick from it.
+#define MOJDB_DELIVERY_STATUS       _T("deliveryStatus")
+#define MOJDB_DELIVERY_DELIVERED    _T("delivered")
+#define MOJDB_DELIVERY_READ         _T("read")
+
+#define MOJDB_CHAT_TYPE             _T("chatType")     // "groupchat" for MUC messages
+#define MOJDB_CHANNEL_NAME          _T("channelName")  // stable room key (e.g. Discord channel id, Telegram chat-<id>)
+#define MOJDB_CHANNEL_DISPLAY_NAME  _T("channelDisplayName")  // human room title (e.g. Telegram group title)
+#define MOJDB_SERVER_ID             _T("serverId")     // parent server id (e.g. Discord guild id)
+#define MOJDB_SERVER_NAME           _T("serverName")   // parent server display name (guild/network)
+
 // libpurple transport property names
 #define XPORT_SERVICE_TYPE          _T("serviceName") // gmail, aol etc
 #define XPORT_FROM_ADDRESS 			_T("usernameFrom")
@@ -93,13 +132,28 @@ public:
 	IMMessage();
 	virtual ~IMMessage();
 
-	MojErr initFromCallback(const char* serviceName, const char* username, const char* usernameFrom, const char* message);
+	// webOS Servers/Rooms: channelName/serverId/serverName describe a multi-user-chat (MUC)
+	// message's room + parent server; NULL for ordinary 1:1 IMs.
+	// `outgoing` = this is a carbon of a message WE sent from another client (Telegram/Signal/WhatsApp
+	// phone app etc.). Then from = self (username), to = the peer (usernameFrom) and folder = Outbox,
+	// so it shows on the sent side of the thread. Default false = an ordinary received (inbox) message.
+	MojErr initFromCallback(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp = 0,
+			const char* channelName = NULL, const char* channelDisplayName = NULL, const char* serverId = NULL, const char* serverName = NULL, bool muted = false,
+			const char* usernameFromDisplay = NULL, bool outgoing = false);
 	MojErr createDBObject(MojObject& returnObject);
 	MojErr unformatFromAddress(const MojString formattedScreenName, MojString& unformattedName);
+
+	// webOS reactions: set the prpl's own id for this message (persisted so a later reaction targets it).
+	MojErr setServiceMessageId(const char* id) { return serviceMessageId.assign(id ? id : ""); }
+	// webOS replies: set the quoted-original this message replies to (id/text/sender).
+	MojErr setQuotedMessageId(const char* id) { return quotedMessageId.assign(id ? id : ""); }
+	MojErr setQuotedText(const char* t) { return quotedText.assign(t ? t : ""); }
+	MojErr setQuotedFrom(const char* f) { return quotedFrom.assign(f ? f : ""); }
 
 private:
 	MojString msgText;
 	MojString fromAddress;
+	MojString fromDisplayName;  // encoded sender name for display when it contains astral emoji (see sanitize.h); empty otherwise. Never used as a match key.
 	MojString toAddress;
 
 	// only meaningful for incoming messages - this is the time the message was received on the device.
@@ -115,6 +169,23 @@ private:
 
 	// gmail, aol etc
     MojString msgType;
+
+	// webOS Servers/Rooms: multi-user-chat (MUC) metadata. isGroupChat gates whether the fields
+	// below (and the MUC db8 properties) are written; all empty/false for ordinary 1:1 IMs.
+	bool isGroupChat;
+	MojString serviceMessageId;  // the prpl's own id for this message (for reactions/replies to target); empty if the prpl didn't supply one
+	MojString quotedMessageId;   // webOS replies: serviceMessageId of the quoted original (empty if not a reply)
+	MojString quotedText;        // webOS replies: text of the quoted original
+	MojString quotedFrom;        // webOS replies: sender display name of the quoted original
+	MojString channelName;   // stable room key (e.g. Discord channel id/name, Telegram chat-<id>)
+	MojString channelDisplayName;   // human room title (Telegram group name); channelName stays the match key
+	MojString serverId;      // parent server id (Discord guild id) - mirrors serverName until M1
+	MojString serverName;    // parent server display name (Discord guild / IRC network)
+
+	// muted: the conversation is muted on the server side (e.g. a muted Telegram chat). When true
+	// the message is stored with flags.noNotification so the Messaging app suppresses the banner
+	// (the message still appears/counts as unread, matching native Telegram behaviour).
+	bool muted;
 
 };
 

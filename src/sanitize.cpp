@@ -35,6 +35,35 @@ char *unsanitizeHtml(char *input) {
 	return result;
 }
 
+// See sanitize.h for the rationale. Walks the UTF-8 string and rewrites any code point
+// above U+FFFF as a decimal numeric HTML entity so it survives the device's JS runtimes,
+// which mangle 4-byte UTF-8 to U+FFFD. Invalid bytes are passed through untouched.
+char *encodeAstralEntities(const char *input) {
+	if (!input)
+		return g_strdup("");
+
+	GString *out = g_string_sized_new(strlen(input) + 16);
+	const char *p = input;
+	while (*p) {
+		gunichar cp = g_utf8_get_char_validated(p, -1);
+		if (cp == (gunichar) -1 || cp == (gunichar) -2) {
+			// invalid / incomplete UTF-8 - keep the raw byte and advance one
+			g_string_append_c(out, *p);
+			p++;
+			continue;
+		}
+		const char *next = g_utf8_next_char(p);
+		if (cp > 0xFFFF) {
+			g_string_append_printf(out, "&#%u;", (unsigned) cp);
+		} else {
+			g_string_append_len(out, p, next - p);
+		}
+		p = next;
+	}
+	// free the GString wrapper but hand back the char* buffer (caller frees with free())
+	return g_string_free(out, FALSE);
+}
+
 char *sanitizeHtml(const char *input, char **except, bool remove)
 {
 	TidyBuffer output = {0};
@@ -112,6 +141,12 @@ char *sanitizeHtml(const char *input, char **except, bool remove)
 		}
 		g_free(tag);
 		tag_end = strchr(tag_end, '>');
+		if (!tag_end) {
+			// malformed markup: '<' with no closing '>'. Copy the remainder verbatim and stop
+			// rather than doing pointer arithmetic on a NULL tag_end (crash / huge alloc).
+			g_strlcpy(result_end, tag_start, message_size - (tag_start-message_start));
+			break;
+		}
 		tag = g_strndup(tag_start, tag_end - tag_start);
 
 		if (is_allowed) {

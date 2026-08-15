@@ -57,25 +57,54 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <cstdio>
 #include <unordered_map>
 #include <vector>
+#include <set>
 
 #include "Util.h"
 #include "LibpurpleAdapter.h"
 #include "PalmImCommon.h"
+#include "AuthChannel.h"
 
 //#include <cjson/json.h>
 //#include <lunaservice.h>
 //#include <json_utils.h>
 #include "IMServiceApp.h"
+#include "entities.h"       // decode_html_entities_utf8 - decode the app's &#NNNNN; emoji to UTF-8 for sendReaction
+#include "OpusEncoder.h"    // wav_to_opus_voicenote - transcode a recorded WAV to an Ogg/Opus voice note
 
 
 static const guint PURPLE_GLIB_READ_COND  = (G_IO_IN | G_IO_HUP | G_IO_ERR);
 static const guint PURPLE_GLIB_WRITE_COND = (G_IO_OUT | G_IO_HUP | G_IO_ERR | G_IO_NVAL);
 static const guint CONNECT_TIMEOUT_SECONDS = 45;
+/* Discord's QR / remote-auth login waits for the user to scan the code and approve
+ * sign-in on a second device (their phone), which routinely takes well over 45s. If
+ * the normal connect timeout fires during that window it disconnects the account and
+ * kills the in-flight ticket->token exchange HTTP request ("no json node"), so the
+ * login silently fails and loops back to a fresh QR. Give interactive QR logins a much
+ * longer grace period. */
+static const guint QR_CONNECT_TIMEOUT_SECONDS = 300;
 
 static LoginCallbackInterface* s_loginState = NULL;
 static IMServiceCallbackInterface* s_imServiceHandler = NULL;
+// Interactive-login (Discord QR) channel + the set of account keys whose current
+// login is a disposable QR-preview (create-after-confirm). Preview logins route
+// their connect callbacks to the AuthChannel, NOT to the webOS login-state machine.
+static AuthChannel* s_authChannel = NULL;
+static std::set<std::string> s_qrPreviewKeys;
+
+// Pending Discord remote-auth captcha requests. The prpl raised purple_request_fields
+// with read-only sitekey/rqdata/rqtoken + an editable "captcha_key" field and an OK
+// callback. We hold the request keyed by account so submitCaptcha() can fill captcha_key
+// with the UI-solved token and invoke the callback (which re-POSTs remote-auth/login).
+typedef void (*PurpleRequestFieldsCbT)(void*, PurpleRequestFields*);
+struct PendingCaptcha {
+	PurpleRequestFields*   fields;
+	PurpleRequestFieldsCbT okCb;
+	void*                  userData;
+};
+static std::unordered_map<std::string, PendingCaptcha> s_pendingCaptcha;
 
 std::hash<std::string> hash;
 
@@ -87,6 +116,13 @@ static std::unordered_map<std::string, PurpleAccount*> s_onlineAccountData;
  * List of accounts that are in the process of logging in
  */
 static std::unordered_map<std::string, PurpleAccount*> s_pendingAccountData;
+/**
+ * webOS attachment-send tracking: local filename (what serv_send_file gets, post-transcode = the xfer's
+ * local_filename) -> the Outbox immessage _id. Populated in sendFile; consumed by the file-send-complete
+ * / file-send-cancel signal handlers so a FAILED transfer downgrades its optimistically-"successful" row
+ * to "failed". Single-threaded (glib main loop drives both), so no lock needed.
+ */
+static std::unordered_map<std::string, std::string> s_pendingAttachmentSends;
 static std::unordered_map<std::string, PurpleAccount*> s_offlineAccountData;
 static std::unordered_map<std::string, guint> s_accountLoginTimers;
 
@@ -94,6 +130,9 @@ static std::unordered_map<std::string, guint> s_accountLoginTimers;
 static std::unordered_map<std::string, std::string> s_connectionTypeData;
 
 static std::unordered_map<std::string, std::string> s_AccountIdsData;
+// Perf (#3): last-seen avatar path per "accountKey\x1fbuddyName", so a presence tick with an
+// unchanged avatar skips the per-buddy com.palm.contact find in updateBuddyStatus.
+static std::unordered_map<std::string, std::string> s_lastBuddyAvatar;
 
 /*
  * list of pending authorization requests
@@ -134,6 +173,29 @@ struct AccountMetaData
 };
 
 static void incoming_message_cb(PurpleConversation *conv, const char *who, const char *alias, const char *message,	PurpleMessageFlags flags, time_t mtime);
+// webOS reactions: handler for the "webos-im-reaction" signal a prpl emits; routes to the DB reaction merge.
+static void im_reaction_cb(PurpleAccount* account, const char* targetServiceMessageId, const char* emoji, const char* sender, void* data);
+// webOS: handler for "webos-im-outbox-id" - attaches a network id to the user's own app-sent message row.
+static void im_outbox_id_cb(PurpleAccount* account, const char* serviceMessageId, const char* text, void* data);
+// webOS: handler for "webos-im-edit" - the sender edited a message; update its stored bubble text in place.
+static void im_edit_cb(PurpleAccount* account, const char* serviceMessageId, const char* newText, void* data);
+// webOS: handler for "webos-im-delete" - the sender deleted a message "for everyone"; replace its
+// stored bubble text with a placeholder in place.
+static void im_delete_cb(PurpleAccount* account, const char* serviceMessageId, void* data);
+// webOS delivery/read receipts: a prpl reports the recipient delivered/read our outgoing message.
+// by-id (WhatsApp/Signal): (account, serviceMessageId, status). watermark (Telegram/Facebook/Teams):
+// (account, scope, watermark, status). status is "delivered" or "read".
+static void im_receipt_cb(PurpleAccount* account, const char* serviceMessageId, const char* status, void* data);
+static void im_receipt_hwm_cb(PurpleAccount* account, const char* scope, const char* watermark, const char* status, void* data);
+// webOS: register+connect all cross-prpl reaction signals ONCE, early (from initializeLibpurple), before
+// any prpl logs in - so instant-reconnect prpls (whatsmeow) don't race the registration.
+static void registerWebosReactionSignals();
+static void im_reaction_set_cb(PurpleAccount* account, const char* targetServiceMessageId, const char* serialized, const char* unused, void* data);
+static std::string getServiceNameFromPurpleAccount(PurpleAccount* account);
+// human-friendly WhatsApp display name (push-name, else "+<phone>"); defined lower, used in incoming_message_cb
+static std::string whatsAppDisplayName(const char* alias, const char* username);
+// true if s is a bare Signal ACI UUID (8-4-4-4-12 hex); defined lower, used in incoming_message_cb
+static bool isSignalUuid(const char* s);
 static void adapterUIInit(void);
 static GHashTable* getClientInfo(void);
 static gboolean adapterInvokeIO(GIOChannel *source, GIOCondition condition, gpointer data);
@@ -239,6 +301,140 @@ static PurpleConversationUiOps adapterConversationUIOps  =
 	NULL, NULL
 };
 
+/* webOS: Discord's remote-auth (QR) login raises the QR through purple_request_fields
+ * (an image field "qr_image" + a string "qr_string"). The stock transport installed no
+ * request ui-ops, so the prpl fell back to dumping the QR into a chat conversation.
+ * Install a request_fields op that forwards the QR image to the AuthChannel, which
+ * surfaces it to the accounts auth UI for inline QR sign-in. Only request_fields is set;
+ * request_input is deliberately left NULL so Telegram's login-code / 2FA capture keeps
+ * its existing sendMessage-routing path untouched. */
+static void* adapter_request_fields(const char *title, const char *primary, const char *secondary,
+        PurpleRequestFields *fields, const char *ok_text, GCallback ok_cb,
+        const char *cancel_text, GCallback cancel_cb, PurpleAccount *account,
+        const char *who, PurpleConversation *conv, void *user_data)
+{
+	// Resolve the account: Discord passes account=NULL, who=username. Fall back to a
+	// pending account whose username matches `who`.
+	PurpleAccount* acct = account;
+	if (acct == NULL && who != NULL)
+	{
+		for (std::unordered_map<std::string, PurpleAccount*>::iterator it = s_pendingAccountData.begin();
+		     it != s_pendingAccountData.end(); ++it)
+		{
+			PurpleAccount* a = it->second;
+			if (a && a->username && strcmp(a->username, who) == 0) { acct = a; break; }
+		}
+	}
+	if (acct == NULL || acct->ui_data == NULL)
+	{
+		MojLogError(IMServiceApp::s_log, _T("adapter_request_fields: could not resolve account (who=%s)"), who ? who : "");
+		return NULL;
+	}
+
+	const guchar* imgData = NULL;
+	gsize imgLen = 0;
+	const char* qrString = NULL;
+	// WhatsApp (purple-gowhatsapp) offers device-linking as a QR image AND an 8-char
+	// pairing code in the same request; it names the QR-payload string "qr_data" (Discord
+	// uses "qr_string") and the code "pairing_code". Surface the pairing code as urlString
+	// (it's the more reliable path on a small screen), falling back to the QR payload.
+	const char* pairingCode = NULL;
+	// Captcha fields (Discord remote-auth hCaptcha). Presence of captcha_sitekey marks
+	// this request as a captcha challenge rather than the QR image.
+	const char* capService = NULL;
+	const char* capSitekey = NULL;
+	const char* capRqData = NULL;
+	const char* capRqToken = NULL;
+
+	GList* groups = purple_request_fields_get_groups(fields);
+	for (; groups != NULL; groups = groups->next)
+	{
+		PurpleRequestFieldGroup* group = (PurpleRequestFieldGroup*)groups->data;
+		GList* flds = purple_request_field_group_get_fields(group);
+		for (; flds != NULL; flds = flds->next)
+		{
+			PurpleRequestField* f = (PurpleRequestField*)flds->data;
+			const char* id = purple_request_field_get_id(f);
+			PurpleRequestFieldType t = purple_request_field_get_type(f);
+			if (t == PURPLE_REQUEST_FIELD_IMAGE && id && strcmp(id, "qr_image") == 0)
+			{
+				imgData = (const guchar*)purple_request_field_image_get_buffer(f);
+				imgLen = purple_request_field_image_get_size(f);
+			}
+			else if (t == PURPLE_REQUEST_FIELD_STRING && id &&
+			         (strcmp(id, "qr_string") == 0 || strcmp(id, "qr_data") == 0))
+			{
+				qrString = purple_request_field_string_get_value(f);
+			}
+			else if (t == PURPLE_REQUEST_FIELD_STRING && id && strcmp(id, "pairing_code") == 0)
+			{
+				pairingCode = purple_request_field_string_get_value(f);
+			}
+			else if (t == PURPLE_REQUEST_FIELD_STRING && id && strcmp(id, "captcha_sitekey") == 0)
+				capSitekey = purple_request_field_string_get_value(f);
+			else if (t == PURPLE_REQUEST_FIELD_STRING && id && strcmp(id, "captcha_service") == 0)
+				capService = purple_request_field_string_get_value(f);
+			else if (t == PURPLE_REQUEST_FIELD_STRING && id && strcmp(id, "captcha_rqdata") == 0)
+				capRqData = purple_request_field_string_get_value(f);
+			else if (t == PURPLE_REQUEST_FIELD_STRING && id && strcmp(id, "captcha_rqtoken") == 0)
+				capRqToken = purple_request_field_string_get_value(f);
+		}
+	}
+
+	std::string const& serviceName = getServiceNameFromPurpleAccount(acct);
+	// acct->ui_data (checked non-NULL above) is our AccountMetaData carrying the account key.
+	std::string const  accountKey  = ((AccountMetaData*)acct->ui_data)->account_key;
+
+	// Captcha challenge: hold the request (fields + ok_cb + user_data) so submitCaptcha
+	// can complete it once the UI solves the hCaptcha, then surface it to the UI.
+	if (capSitekey != NULL)
+	{
+		PendingCaptcha pc;
+		pc.fields   = fields;
+		pc.okCb     = (PurpleRequestFieldsCbT)ok_cb;
+		pc.userData = user_data;
+		s_pendingCaptcha[accountKey] = pc;
+
+		MojLogInfo(IMServiceApp::s_log, _T("adapter_request_fields: CAPTCHA for service=%s user=%s (sitekey=%s)"),
+		           serviceName.c_str(), acct->username ? acct->username : "", capSitekey);
+
+		if (s_authChannel)
+			s_authChannel->publishCaptchaChallenge(serviceName.c_str(), acct->username,
+			                                       capService, capSitekey, capRqData, capRqToken);
+
+		// Return a non-NULL handle so the prpl treats the request as accepted. We keep
+		// ownership of `fields` and free it in submitCaptcha after invoking the callback.
+		return (void*)fields;
+	}
+
+	// Prefer the pairing code as the surfaced urlString when the prpl provided one
+	// (WhatsApp); otherwise the raw QR payload (Discord's qr_string / gowhatsapp's qr_data).
+	const char* urlString = (pairingCode && *pairingCode) ? pairingCode : qrString;
+
+	MojLogInfo(IMServiceApp::s_log, _T("adapter_request_fields: QR for service=%s user=%s (%u img bytes, pairing=%s)"),
+	           serviceName.c_str(), acct->username ? acct->username : "", (unsigned)imgLen,
+	           (pairingCode && *pairingCode) ? "yes" : "no");
+
+	if (s_authChannel)
+		s_authChannel->publishQRChallenge(serviceName.c_str(), acct->username, imgData, imgLen, "image/png", urlString);
+
+	return NULL;   // no ui handle to track
+}
+
+static PurpleRequestUiOps adapterRequestUIOps =
+{
+	NULL,                    // request_input  (left NULL: Telegram keeps its sendMessage path)
+	NULL,                    // request_choice
+	NULL,                    // request_action
+	adapter_request_fields,  // request_fields (Discord QR)
+	NULL,                    // request_file
+	NULL,                    // close_request
+	NULL,                    // request_folder
+	NULL,                    // request_action_with_icon
+	NULL,                    // _purple_reserved1
+	NULL                     // _purple_reserved2
+};
+
 // useful for debugging
 static void authRequest_log_func(gpointer key, gpointer value, gpointer ud)
 {
@@ -256,6 +452,8 @@ void adapterUIInit(void)
 {
 	purple_conversations_set_ui_ops(&adapterConversationUIOps);
 	purple_accounts_set_ui_ops(&adapterAccountUIOps);
+	// Surface interactive-login challenges (Discord QR) to the accounts UI instead of chat.
+	purple_request_set_ui_ops(&adapterRequestUIOps);
 }
 
 void destroyNotify(gpointer dataToFree)
@@ -330,8 +528,57 @@ static std::string stripResourceFromJabberUsername(std::string const& username, 
  */
 static std::string getPrplProtocolIdFromServiceName(std::string const& serviceName)
 {
+	// webOS Teams port: purple-teams (EionRobb) registers its OWN upstream protocol id, which the
+	// generic "prpl-" + <type> transform below cannot derive from the "type_teams" service name. Prefer
+	// the plugin's NATIVE personal-build id ("prpl-eionrobb-msteams-personal") so the plugin can be
+	// built STOCK from upstream with no webOS-specific id patch (-DTEAMS_PERSONAL_PLUGIN_ID); fall back
+	// to the legacy "prpl-teams-personal" that older webOS builds forced, so either plugin build works.
+	// The service name "type_teams" (baked into db8 kinds / capability ids) stays decoupled either way.
+	if (serviceName == "type_teams")
+	{
+		if (purple_find_prpl("prpl-eionrobb-msteams-personal") != NULL)
+			return "prpl-eionrobb-msteams-personal";
+		return "prpl-teams-personal";
+	}
+	// Signal maps to hoehermann/purple-presage (prpl-hehoe-presage) — the native Rust
+	// backend (no JVM). This replaces the old JVM-based purple-signal (prpl-hehoe-signal),
+	// which ran but was too slow (interpreter-only OpenJDK Zero) for Signal's provisioning
+	// handshake. libpresage.so is a single cross-built armv7 .so (presage + libsignal-rs +
+	// SQLCipher, rustls/ring TLS); see messaging/signal/build-presage.sh.
+	if (serviceName == "type_signal")
+	{
+		return "prpl-hehoe-presage";
+	}
+	// hoehermann/purple-gowhatsapp (whatsmeow branch) registers as "prpl-hehoe-whatsmeow";
+	// keep the db8/capability service name "type_whatsapp" decoupled from the plugin id.
+	if (serviceName == "type_whatsapp")
+	{
+		return "prpl-hehoe-whatsmeow";
+	}
 	std::string prplProtocolIdToReturn = "prpl-" + serviceName.substr(strlen("type_"), std::string::npos);
 	return prplProtocolIdToReturn;
+}
+
+// Inverse of getPrplProtocolIdFromServiceName(): map a loaded prpl's protocol_id back to the
+// webOS db8/capability service name ("type_..."). MUST mirror the special-cases above, or an
+// account whose plugin id does not follow the generic "prpl-<type>" pattern gets registered under
+// the wrong service key. That breaks the auto-login path (account_logged_in_cb repairs ui_data from
+// the account itself): the account comes online under e.g. "type_hehoe-whatsmeow" while the webOS
+// login() for "type_whatsapp" can't find/adopt it, so its connect timer never disarms and
+// connectTimeoutCallback force-disconnects the healthy session (WhatsApp/Signal never go online).
+static std::string getServiceNameFromPrplProtocolId(const char* prplProtocolId)
+{
+	std::string prpl = prplProtocolId ? prplProtocolId : "";
+	// Accept BOTH the native upstream id and the legacy webOS-forced id (see the forward map above).
+	if (prpl == "prpl-teams-personal" || prpl == "prpl-eionrobb-msteams-personal")
+		return "type_teams";
+	if (prpl == "prpl-hehoe-presage")
+		return "type_signal";
+	if (prpl == "prpl-hehoe-whatsmeow")
+		return "type_whatsapp";
+	if (prpl.compare(0, strlen("prpl-"), "prpl-") == 0)
+		return "type_" + prpl.substr(strlen("prpl-"));
+	return prpl;
 }
 
 static const char* getMojoFriendlyErrorCode(PurpleConnectionError type)
@@ -363,7 +610,93 @@ static const char* getMojoFriendlyErrorCode(PurpleConnectionError type)
 
 static std::string getAccountKey(std::string const& username, std::string const& serviceName)
 {
-	return username + "_" + serviceName;
+	// WhatsApp identity arrives in three interchangeable forms: the +E.164 the webOS account layer
+	// now stores for display ("+31652044684"), whatsmeow's device-ID JID ("31652044684@s.whatsapp.net")
+	// that the prpl renames the account to once pairing completes, and (older paths) the bare digits.
+	// Normalize all three to the bare digits so a WhatsApp account maps to ONE stable transport key --
+	// otherwise sendMessage, preview adoption, and post-restart auto-login would key the same account
+	// differently and "lose" the logged-in session.
+	std::string key = username;
+	static const std::string waSuffix = "@s.whatsapp.net";
+	if (key.size() > waSuffix.size() &&
+	    key.compare(key.size() - waSuffix.size(), waSuffix.size(), waSuffix) == 0)
+		key.erase(key.size() - waSuffix.size());
+	// Strip the display '+' only for WhatsApp: Signal/Telegram usernames are legitimately +E.164 and
+	// must keep it (their key must stay distinct from any bare-digit form).
+	if (serviceName == "type_whatsapp" && !key.empty() && key[0] == '+')
+		key.erase(0, 1);
+	return key + "_" + serviceName;
+}
+
+// Map a webOS-side WhatsApp username (+E.164 for display, or bare digits) to the JID whatsmeow
+// requires ("<digits>@s.whatsapp.net"): gowhatsapp compares the purple account username against its
+// device ID and errors ("username does not match the main device's ID") on anything else. Idempotent
+// when already a JID; a no-op for every other service (their username reaches the prpl verbatim).
+static std::string getPurpleUsername(std::string const& username, std::string const& serviceName)
+{
+	if (serviceName != "type_whatsapp")
+		return username;
+	// Anything already carrying an '@' is a real whatsmeow id -- the phone JID
+	// ("<digits>@s.whatsapp.net"), an opaque linked id ("<id>@lid"), or a group ("<id>@g.us") -- and
+	// must pass through untouched. Only the display +E.164 form ("+31638307067") or bare digits, which
+	// have no '@', get mapped to the device-JID the prpl needs. This makes the helper safe for buddy
+	// addresses (which can be @lid/@g.us), not just the account's own phone username.
+	if (username.find('@') != std::string::npos)
+		return username;
+	std::string digits;
+	for (std::string::size_type i = 0; i < username.size(); ++i)
+		if (username[i] >= '0' && username[i] <= '9')
+			digits += username[i];
+	if (digits.empty())
+		return username;
+	return digits + "@s.whatsapp.net";
+}
+
+// Inverse of getPurpleUsername: map a prpl account's username BACK to the webOS-side username the
+// account layer keys everything on. For WhatsApp the purple account is the device JID
+// ("31652044684@s.whatsapp.net") but the webOS account + imloginstate + immessage records use +E.164
+// ("+31652044684"). Any callback that reports an account owner to the webOS layer (login state, buddy
+// re-sync, incoming message) MUST translate, or it targets a username no webOS record is keyed on --
+// e.g. requestBuddyResync's imloginstate bump silently matches nothing and the buddy sync never runs.
+// No-op for every other service and for an already-+E.164/foreign form.
+static std::string getWebosUsername(const char* purpleUsername, std::string const& serviceName, PurpleAccount* account = NULL)
+{
+	std::string u(purpleUsername ? purpleUsername : "");
+	if (serviceName == "type_whatsapp")
+	{
+		static const std::string waSuffix = "@s.whatsapp.net";
+		if (u.size() > waSuffix.size() &&
+		    u.compare(u.size() - waSuffix.size(), waSuffix.size(), waSuffix) == 0)
+		{
+			std::string digits = u.substr(0, u.size() - waSuffix.size());
+			if (!digits.empty() && digits[0] != '+')
+				return "+" + digits;
+			return digits;
+		}
+		return u;
+	}
+	// webOS Signal: contacts are keyed by their ACI UUID, which never matches a phone-based person
+	// record, so a Signal buddy/message would not merge with the contact (unlike WhatsApp). presage
+	// stashes the contact's phone as a "phone_number" buddy attribute when Signal shares it; use that as
+	// the webOS ims.value (+E.164) so the Signal identity merges with the same phone contact. presage's
+	// send accepts +E.164 (classify_recipient -> resolve_phone_to_uuid), so the reverse path just passes
+	// it through. Falls back to the UUID when no phone is known (phone-number sharing off).
+	if (serviceName == "type_signal" && account != NULL && isSignalUuid(u.c_str()))
+	{
+		PurpleBuddy* b = purple_find_buddy(account, u.c_str());
+		if (b != NULL)
+		{
+			const char* phone = purple_blist_node_get_string(&b->node, "phone_number");
+			if (phone && *phone)
+			{
+				std::string p(phone);
+				if (p[0] != '+')
+					p = "+" + p;
+				return p;
+			}
+		}
+	}
+	return u;
 }
 
 static char* getAuthRequestKey(const char* username, const char* serviceName, const char* remoteUsername)
@@ -401,16 +734,25 @@ static std::string const& getAccountKeyFromPurpleAccount(PurpleAccount* account)
 	return ((AccountMetaData*)account->ui_data)->account_key;
 }
 
-static std::string const& getServiceNameFromPurpleAccount(PurpleAccount* account)
+static std::string getServiceNameFromPurpleAccount(PurpleAccount* account)
 {
-    static const std::string empty = "";
-	if (!account || !account->ui_data)
+	if (account == NULL)
 	{
-		MojLogError(IMServiceApp::s_log, _T("getAccountKeyFromPurpleAccount called with empty account"));
-		return empty;
+		MojLogError(IMServiceApp::s_log, _T("getServiceNameFromPurpleAccount called with NULL account"));
+		return "";
 	}
-
-	return ((AccountMetaData*)account->ui_data)->servicename;
+	// Prefer the servicename stashed in ui_data at login/adoption.
+	if (account->ui_data)
+		return ((AccountMetaData*)account->ui_data)->servicename;
+	// ui_data isn't set yet when libpurple auto-logged the account in before the transport tracked it
+	// (see the adoption note in login()). Derive the service from the prpl protocol id so callbacks
+	// (incoming messages, buddy status) still resolve it -- otherwise an empty serviceName makes the
+	// WhatsApp +E.164 translation (and other per-service logic) silently no-op and the JID leaks through.
+	const char* prpl = account->protocol_id;
+	if (prpl != NULL && *prpl != '\0')
+		return getServiceNameFromPrplProtocolId(prpl);
+	MojLogError(IMServiceApp::s_log, _T("getServiceNameFromPurpleAccount: account has neither ui_data nor protocol_id"));
+	return "";
 }
 
 /**
@@ -640,6 +982,9 @@ static PurpleStatusPrimitive getPurpleAvailabilityFromPalmAvailability(int palmA
  * Callbacks
  */
 
+// forward decl (defined below): batched presence coalescer, shared with buddy_status_changed_cb.
+static void queuePresenceUpdate(const char* accountId, const char* serviceName, const char* username, int availability, const char* customMessage, const char* groupName);
+
 static void buddy_signed_on_off_cb(PurpleBuddy* buddy, gpointer data)
 {
 //	LSError lserror;
@@ -693,7 +1038,38 @@ static void buddy_signed_on_off_cb(PurpleBuddy* buddy, gpointer data)
 
 	// call into the imlibpurpletransport
 	// buddy->name is stored in the imbuddyStatus DB kind in the libpurple format - ie. for AIM without the "@aol.com" so that is how we need to search for it
-	s_imServiceHandler->updateBuddyStatus(accountId.c_str(), serviceName.c_str(), buddy->name, newAvailabilityValue, customMessage, groupName, buddyAvatarLocation);
+	// WhatsApp: report under the +E.164 address so the status keys the same as the contact's ims.value
+	// (otherwise the JID-keyed status never matches the "+<phone>"-keyed contact -> buddy shows offline).
+	std::string const buddyWebosName = getWebosUsername(buddy->name, serviceName, purple_buddy_get_account(buddy));
+	// Perf (#2/#3): mirror buddy_status_changed_cb. A login/relogin/roam signs EVERY buddy on at once,
+	// so a per-buddy find+merge here was THE buddy-sync bottleneck (hundreds of serial db8 round-trips
+	// ~467ms each). Gate the avatar (skip the contact find when it hasn't changed) and route
+	// presence-only ticks through the batched queuePresenceUpdate (one find + one batched merge/put
+	// per account); only a genuinely changed/first-seen avatar takes the immediate per-buddy path.
+	const char* avatarToForward = buddyAvatarLocation;
+	{
+		std::string avatarKey = accountKey;
+		avatarKey.push_back('\x1f');
+		avatarKey.append(buddy->name ? buddy->name : "");
+		std::string currentAvatar = buddyAvatarLocation ? buddyAvatarLocation : "";
+		std::unordered_map<std::string, std::string>::iterator la = s_lastBuddyAvatar.find(avatarKey);
+		if (la != s_lastBuddyAvatar.end() && la->second == currentAvatar)
+		{
+			avatarToForward = NULL; // unchanged -> skip the contact find/update
+		}
+		else
+		{
+			s_lastBuddyAvatar[avatarKey] = currentAvatar;
+		}
+	}
+	if (avatarToForward != NULL)
+	{
+		s_imServiceHandler->updateBuddyStatus(accountId.c_str(), serviceName.c_str(), buddyWebosName.c_str(), newAvailabilityValue, customMessage, groupName, avatarToForward);
+	}
+	else
+	{
+		queuePresenceUpdate(accountId.c_str(), serviceName.c_str(), buddyWebosName.c_str(), newAvailabilityValue, customMessage, groupName);
+	}
 
 	g_message(
 			"%s says: %s's presence: availability: '%i', custom message: '%s', avatar location: '%s', display name: '%s', group name: '%s'",
@@ -703,6 +1079,65 @@ static void buddy_signed_on_off_cb(PurpleBuddy* buddy, gpointer data)
 	{
 		g_free(buddyAvatarLocation);
 	}
+}
+
+// ---- Perf (#2): coalesce per-buddy presence ticks and flush them as ONE batched db8 write. -------
+// libpurple emits buddy-status-changed one buddy at a time; during a login/contact-sync burst that
+// meant a find+merge round-trip PER buddy (measured ~467ms/op under load). We buffer presence-only
+// ticks per account and, after a short quiet window, hand the whole set to updateBuddyStatusBatch,
+// which does a single find + one batched merge/put (~14ms/op amortized).
+struct PendingPresence
+{
+	std::string serviceName;
+	int availability;
+	std::string customMessage;
+	std::string groupName;
+};
+static std::unordered_map<std::string, std::unordered_map<std::string, PendingPresence> > s_pendingPresence; // accountId -> username -> latest
+static guint s_presenceFlushTimer = 0;
+#define PRESENCE_FLUSH_DEBOUNCE_SECONDS 3
+
+static gboolean presenceFlushCallback(gpointer /*data*/)
+{
+	s_presenceFlushTimer = 0;
+	if (s_imServiceHandler == NULL)
+	{
+		s_pendingPresence.clear();
+		return FALSE;
+	}
+	for (std::unordered_map<std::string, std::unordered_map<std::string, PendingPresence> >::iterator ai = s_pendingPresence.begin(); ai != s_pendingPresence.end(); ++ai)
+	{
+		if (ai->second.empty())
+			continue;
+		std::string serviceName = ai->second.begin()->second.serviceName;
+		MojObject updates; // array of { username, availability, status, group }
+		for (std::unordered_map<std::string, PendingPresence>::iterator ui = ai->second.begin(); ui != ai->second.end(); ++ui)
+		{
+			MojObject o;
+			o.putString(_T("username"), ui->first.c_str());
+			o.putInt(_T("availability"), ui->second.availability);
+			o.putString(_T("status"), ui->second.customMessage.c_str());
+			o.putString(_T("group"), ui->second.groupName.c_str());
+			updates.push(o);
+		}
+		s_imServiceHandler->updateBuddyStatusBatch(ai->first.c_str(), serviceName.c_str(), updates);
+	}
+	s_pendingPresence.clear();
+	return FALSE; // one-shot
+}
+
+static void queuePresenceUpdate(const char* accountId, const char* serviceName, const char* username, int availability, const char* customMessage, const char* groupName)
+{
+	if (accountId == NULL || username == NULL)
+		return;
+	PendingPresence& p = s_pendingPresence[accountId][username]; // keep only the LATEST tick per buddy
+	p.serviceName = serviceName ? serviceName : "";
+	p.availability = availability;
+	p.customMessage = customMessage ? customMessage : "";
+	p.groupName = groupName ? groupName : "";
+	if (s_presenceFlushTimer != 0)
+		purple_timeout_remove(s_presenceFlushTimer);
+	s_presenceFlushTimer = purple_timeout_add_seconds(PRESENCE_FLUSH_DEBOUNCE_SECONDS, presenceFlushCallback, NULL);
 }
 
 static void buddy_status_changed_cb(PurpleBuddy* buddy, PurpleStatus* old_status, PurpleStatus* new_status,
@@ -753,9 +1188,46 @@ static void buddy_status_changed_cb(PurpleBuddy* buddy, PurpleStatus* old_status
 		groupName = "";
 	}
 
+	// Perf (#3): this fires on every presence tick (online/idle/away), but a buddy's avatar almost
+	// never changes between ticks. Forwarding the (unchanged) avatar path made updateBuddyStatus do
+	// a wasted com.palm.contact find PER presence change for every avatar'd buddy - a big chunk of
+	// the db8 churn during a login/contact-sync burst. Track the last path per buddy and only forward
+	// the avatar when it actually changed (or is first seen); avatar-only updates still come through
+	// here via buddy_avatar_changed_cb, which will see a differing path and forward it.
+	const char* avatarToForward = buddyAvatarLocation;
+	{
+		std::string avatarKey = accountKey;
+		avatarKey.push_back('\x1f');
+		avatarKey.append(buddy->name ? buddy->name : "");
+		std::string currentAvatar = buddyAvatarLocation ? buddyAvatarLocation : "";
+		std::unordered_map<std::string, std::string>::iterator la = s_lastBuddyAvatar.find(avatarKey);
+		if (la != s_lastBuddyAvatar.end() && la->second == currentAvatar)
+		{
+			avatarToForward = NULL; // unchanged -> skip the contact find/update in updateBuddyStatus
+		}
+		else
+		{
+			s_lastBuddyAvatar[avatarKey] = currentAvatar;
+		}
+	}
+
 	// call into the imlibpurpletransport
 	// buddy->name is stored in the imbuddyStatus DB kind in the libpurple format - ie. for AIM without the "@aol.com" so that is how we need to search for it
-	s_imServiceHandler->updateBuddyStatus(accountId.c_str(), serviceName.c_str(), buddy->name, newAvailabilityValue, customMessage, groupName, buddyAvatarLocation);
+	// Perf (#2): presence-only ticks are coalesced + flushed as a batch. Only avatar-changed ticks
+	// (avatarToForward != NULL, gated by #3) take the immediate per-buddy path, which also does the
+	// contact avatar update - those are rare, so per-buddy is fine for them.
+	// Report the buddy under its webOS-facing address (+E.164 for WhatsApp) so the imbuddystatus record
+	// is keyed the same as the contact's ims.value; otherwise a JID-keyed status would never match the
+	// "+<phone>"-keyed contact. No-op for @lid/group ids and other services.
+	std::string const buddyWebosName = getWebosUsername(buddy->name, serviceName, purple_buddy_get_account(buddy));
+	if (avatarToForward != NULL)
+	{
+		s_imServiceHandler->updateBuddyStatus(accountId.c_str(), serviceName.c_str(), buddyWebosName.c_str(), newAvailabilityValue, customMessage, groupName, avatarToForward);
+	}
+	else
+	{
+		queuePresenceUpdate(accountId.c_str(), serviceName.c_str(), buddyWebosName.c_str(), newAvailabilityValue, customMessage, groupName);
+	}
 
 	g_message(
 			"%s says: %s's presence: availability: '%i', custom message: '%s', avatar location: '%s', display name: '%s', group name: '%s'",
@@ -796,10 +1268,222 @@ static void buddy_blocked_cb(PurpleBuddy* buddy)
  * Called both after we add a buddy to our list and when we accept a remote users' invitation to add us to their list
  * buddy is the new buddy
  */
+/*
+ * webOS Telegram port: coalesce a burst of buddy-added signals into a single buddy-list re-sync.
+ * The login-time buddy snapshot (getFullBuddyList) runs once, right after login. Protocols like
+ * tdlib-purple load their chat/contact list asynchronously AFTER login, so those buddies arrive
+ * via buddy-added past the snapshot and used to be dropped (buddy_added_cb was a no-op, and the
+ * incremental buddyListResult(fullList=false) path does nothing). We debounce the burst and ask
+ * the login-state layer to re-run the full sync so these become db8 contacts.
+ */
+#define BUDDY_RESYNC_DEBOUNCE_SECONDS 8
+// webOS: hard cap on how often a single account's post-change buddy re-sync may ACTUALLY fire.
+// The async prpls (tdlib/whatsmeow/presage) load their contact+chat lists in waves spread over
+// minutes; the 8s debounce only coalesces a *continuous* burst, so each wave >8s apart used to
+// fire its own re-sync. Each re-sync bumps imloginstate -> handleLoginStateChange -> getBuddyLists
+// AND re-runs enumerateServersChannels (a delete+recreate of imchannel rows) -- a churn storm that
+// broke imchannel.chatThreadId links and regenerated duplicate chatthreads (e.g. multiple PinePhone
+// Telegram rooms). Coalesce the waves: at most one re-sync per account per this interval. The
+// debounce still delivers a prompt final sync once the list settles (nothing fired for a while).
+#define BUDDY_RESYNC_MIN_INTERVAL_SECONDS 45
+
+struct BuddyResyncCtx
+{
+	std::string serviceName;
+	std::string username;
+	std::string accountKey;
+	guint timerId;
+};
+static std::unordered_map<std::string, BuddyResyncCtx*> s_buddyResyncCtx;
+// wall-clock time a re-sync last actually FIRED per account, for the min-interval rate limit above.
+static std::unordered_map<std::string, time_t> s_lastResyncFire;
+
+static gboolean buddyResyncTimeoutCallback(gpointer data)
+{
+	BuddyResyncCtx* ctx = (BuddyResyncCtx*)data;
+
+	// Rate limit: if a re-sync fired for this account within the last MIN_INTERVAL, defer this one
+	// to the end of that window instead of firing now (coalesces later buddy-load waves into it).
+	// Keep ctx in s_buddyResyncCtx so a further buddy change just resets the debounce as usual.
+	time_t now = time(NULL);
+	std::unordered_map<std::string, time_t>::iterator lt = s_lastResyncFire.find(ctx->accountKey);
+	if (lt != s_lastResyncFire.end() && now >= lt->second && (now - lt->second) < BUDDY_RESYNC_MIN_INTERVAL_SECONDS)
+	{
+		guint wait = (guint)(BUDDY_RESYNC_MIN_INTERVAL_SECONDS - (now - lt->second));
+		ctx->timerId = purple_timeout_add_seconds(wait, buddyResyncTimeoutCallback, ctx);
+		return FALSE; // this occurrence ends; ctx lives on with the new (deferred) timer
+	}
+
+	s_lastResyncFire[ctx->accountKey] = now;
+	s_buddyResyncCtx.erase(ctx->accountKey);
+	if (s_loginState != NULL)
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("buddyResyncTimeoutCallback: requesting buddy re-sync for %s"), ctx->accountKey.c_str());
+		s_loginState->buddyListChanged(ctx->serviceName.c_str(), ctx->username.c_str());
+	}
+	delete ctx;
+	return FALSE; // one-shot
+}
+
+// Schedule (debounced) the post-change re-sync for a live account: buddy-list re-sync + the M3
+// server/channel enumeration. Fires once ~BUDDY_RESYNC_DEBOUNCE_SECONDS after the last change in a
+// burst. Shared by buddy_added_cb (buddies) and blist_node_added_cb (chats/channels).
+static void scheduleAccountResync(PurpleAccount* account)
+{
+	if (account == NULL)
+		return;
+	// Only re-sync for a live, logged-in account. Nodes added while still connecting (or loaded from
+	// the blist at startup) are covered by the normal login-time snapshot / the debounce that follows.
+	if (!purple_account_is_connected(account))
+		return;
+
+	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
+	std::string const& accountKey = getAccountKeyFromPurpleAccount(account);
+	// Report the webOS-side owner username (imloginstate/db8 are keyed on it), not the prpl JID.
+	std::string const usernameStr = getWebosUsername(account->username, serviceName);
+	const char* username = usernameStr.c_str();
+	if (serviceName.empty() || *username == '\0')
+		return;
+
+	// Reset any pending debounce timer for this account so the re-sync fires once, after the LAST
+	// change in the burst (covers the post-login buddy+channel load and later single additions).
+	BuddyResyncCtx* ctx = NULL;
+	std::unordered_map<std::string, BuddyResyncCtx*>::iterator it = s_buddyResyncCtx.find(accountKey);
+	if (it != s_buddyResyncCtx.end())
+	{
+		ctx = it->second;
+		purple_timeout_remove(ctx->timerId);
+	}
+	else
+	{
+		ctx = new BuddyResyncCtx;
+		ctx->accountKey = accountKey;
+		s_buddyResyncCtx[accountKey] = ctx;
+	}
+	ctx->serviceName = serviceName;
+	ctx->username = username;
+	ctx->timerId = purple_timeout_add_seconds(BUDDY_RESYNC_DEBOUNCE_SECONDS, buddyResyncTimeoutCallback, ctx);
+}
+
 static void buddy_added_cb(PurpleBuddy* buddy)
 {
-	// nothing to do...
 	MojLogInfo(IMServiceApp::s_log, _T("buddy added %s"), buddy->name);
+	scheduleAccountResync(purple_buddy_get_account(buddy));
+}
+
+// webOS Servers/Rooms M3: a CHAT (e.g. a Discord guild channel) added to the blist AFTER the
+// initial buddy burst must also (re)trigger the post-login re-sync, so enumerateServersChannels
+// picks up channels that populate late (channels are chats, not buddies, so buddy-added misses
+// them). Fires from the generic "blist-node-added" signal; ignores non-chat nodes.
+static void blist_node_added_cb(PurpleBlistNode* node)
+{
+	if (node == NULL || !PURPLE_BLIST_NODE_IS_CHAT(node))
+		return;
+	scheduleAccountResync(purple_chat_get_account((PurpleChat*)node));
+}
+
+// Delete a disposable QR-preview account OFF the signal-callback stack. Calling
+// purple_accounts_delete() directly from account_logged_in_cb (the account's own "signed-on"
+// handler) deletes the connection/account while libpurple is still using it up the stack; with a
+// large synced buddy list (WhatsApp) the re-entrant mass blist teardown crashes the transport.
+// Deferring via a 0-timeout runs the delete after the signal has finished dispatching.
+// Context for the deferred preview-account delete: the account plus a retry counter, so the
+// delete can wait for an in-flight (async, Go-backed) disconnect to finish before freeing.
+struct PreviewDeleteCtx
+{
+	PurpleAccount* acct;
+	int tries;
+};
+
+static gboolean deferredDeletePreviewAccount(gpointer data)
+{
+	PreviewDeleteCtx* ctx = (PreviewDeleteCtx*)data;
+	if (ctx == NULL)
+		return FALSE;
+	PurpleAccount* acct = ctx->acct;
+	if (acct == NULL)
+	{
+		delete ctx;
+		return FALSE;
+	}
+	// Do not free the account until its connection is fully torn down. Session-based, Go-backed
+	// prpls (whatsmeow/WhatsApp) run the disconnect as an ASYNC client shutdown; calling
+	// purple_accounts_delete() while that is still in flight frees the account out from under the
+	// goroutine still using it -> SIGSEGV a few hundred ms later (the deferral-to-next-tick was not
+	// enough). Poll until the connection object is gone (or give up after ~10s and delete anyway).
+	if ((purple_account_is_connecting(acct) || purple_account_is_connected(acct) ||
+	     purple_account_get_connection(acct) != NULL) && ctx->tries < 40)
+	{
+		ctx->tries++;
+		return TRUE; // reschedule on the next 250ms tick
+	}
+	purple_accounts_delete(acct);
+	delete ctx;
+	return FALSE; // done
+}
+
+// Disconnect + disable a disposable QR-preview account, then delete it once its connection has
+// fully torn down (see deferredDeletePreviewAccount). Shared by both confirm paths -- the
+// "signed-on" handler and the token-poll fallback -- so neither frees a still-connecting account.
+static void schedulePreviewAccountDelete(PurpleAccount* acct)
+{
+	if (acct == NULL)
+		return;
+	if (purple_account_is_connected(acct) || purple_account_is_connecting(acct))
+		purple_account_disconnect(acct);
+	purple_account_set_enabled(acct, UI_ID, FALSE);
+	PreviewDeleteCtx* ctx = new PreviewDeleteCtx();
+	ctx->acct = acct;
+	ctx->tries = 0;
+	purple_timeout_add(250, deferredDeletePreviewAccount, ctx);
+}
+
+// Cancel + free any pending buddy-resync debounce timer for an account about to be torn down,
+// so buddyResyncTimeoutCallback can't fire against a deleted account.
+static void cancelBuddyResync(const std::string& accountKey)
+{
+	std::unordered_map<std::string, BuddyResyncCtx*>::iterator it = s_buddyResyncCtx.find(accountKey);
+	if (it != s_buddyResyncCtx.end())
+	{
+		purple_timeout_remove(it->second->timerId);
+		delete it->second;
+		s_buddyResyncCtx.erase(it);
+	}
+}
+
+// webOS: an OUTGOING attachment's file transfer finished. sendFile stored the Outbox row optimistically
+// as "successful" (it only INITIATES the xfer), so on SUCCESS we just drop the pending-tracking entry.
+// (Standard libpurple xfer signals are VOID__POINTER: (xfer, connected-data).)
+static void xfer_send_complete_cb(PurpleXfer* xfer, gpointer data)
+{
+	if (xfer == NULL)
+		return;
+	const char* local = purple_xfer_get_local_filename(xfer);
+	if (local != NULL)
+		s_pendingAttachmentSends.erase(local);
+}
+
+// webOS: an OUTGOING attachment's file transfer FAILED / was cancelled (e.g. the upload HTTP request
+// died). Downgrade its optimistically-"successful" Outbox row to "failed" so the user sees the failure
+// (! icon + failed-message dashboard) and can resend. The row _id is looked up by the xfer's local
+// filename (what we handed serv_send_file / serv_chat_send_file).
+static void xfer_send_cancel_cb(PurpleXfer* xfer, gpointer data)
+{
+	if (xfer == NULL)
+		return;
+	const char* local = purple_xfer_get_local_filename(xfer);
+	if (local == NULL)
+		return;
+	std::unordered_map<std::string, std::string>::iterator it = s_pendingAttachmentSends.find(local);
+	if (it == s_pendingAttachmentSends.end())
+		return;
+	std::string dbId = it->second;
+	s_pendingAttachmentSends.erase(it);
+	const char* who = purple_xfer_get_remote_user(xfer);
+	MojLogError(IMServiceApp::s_log, _T("xfer_send_cancel_cb: attachment transfer to %s failed (xfer status %d); marking id %s failed"),
+			who ? who : "?", (int) purple_xfer_get_status(xfer), dbId.c_str());
+	if (s_imServiceHandler != NULL)
+		s_imServiceHandler->markAttachmentSendFailed(dbId.c_str());
 }
 
 static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
@@ -810,8 +1494,73 @@ static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 	PurpleAccount* loggedInAccount = purple_connection_get_account(gc);
 	g_return_if_fail(loggedInAccount != NULL);
 
+	/* webOS: an account can reach "signed-on" WITHOUT going through
+	 * LibpurpleAdapter::login() -- e.g. purple auto-login of an account persisted in
+	 * accounts.xml when the transport (re)starts. In that case ui_data (which carries
+	 * the account_key + serviceName) was never set, so the account would be registered
+	 * under an empty key and every sendMessage would fail with "not logged in". Repair
+	 * ui_data here from the account itself so registration is always keyed correctly. */
+	if (loggedInAccount->ui_data == NULL)
+	{
+		const char* prpl = loggedInAccount->protocol_id ? loggedInAccount->protocol_id : "";
+		// Use the special-case-aware inverse map, NOT a bare "prpl-"->"type_" strip: whatsmeow
+		// (prpl-hehoe-whatsmeow -> type_whatsapp) and presage (prpl-hehoe-presage -> type_signal)
+		// would otherwise register under a bogus service key and never adopt into the webOS login.
+		std::string svc = getServiceNameFromPrplProtocolId(prpl);
+		std::string uname = loggedInAccount->username ? loggedInAccount->username : "";
+
+		AccountMetaData* amd = new AccountMetaData;
+		amd->servicename = svc;
+		amd->account_key = getAccountKey(uname, svc);
+		loggedInAccount->ui_data = (void*)amd;
+		MojLogInfo(IMServiceApp::s_log, _T("account_logged_in_cb: repaired missing ui_data (auto-login); accountKey %s"), amd->account_key.c_str());
+	}
+
 	std::string const& serviceName = getServiceNameFromPurpleAccount(loggedInAccount);
 	std::string const& accountKey = getAccountKeyFromPurpleAccount(loggedInAccount);
+
+	/* webOS create-after-confirm: this was a disposable QR-preview login. Remote-auth
+	 * succeeded, so the prpl has persisted the Discord token on the account. Hand the
+	 * token to the AuthChannel as the confirmed credential (the UI creates the real
+	 * account with it) and tear the preview down. Do NOT run the normal login-state
+	 * path -- there is no webOS account for this yet. */
+	if (s_qrPreviewKeys.count(accountKey))
+	{
+		/* The confirmed credential the UI must store on the real account. Discord's
+		 * remote-auth persists it as the "token" account string; session-based prpls
+		 * (gowhatsapp) instead set it as the account PASSWORD (deviceJID|registrationId
+		 * from purple_set_credentials). Prefer the token, fall back to the password, so
+		 * the created account carries whatever lets it reconnect without re-pairing. */
+		const char* token = purple_account_get_string(loggedInAccount, "token", NULL);
+		if (token == NULL || *token == '\0')
+			token = purple_account_get_password(loggedInAccount);
+		MojLogInfo(IMServiceApp::s_log, _T("account_logged_in_cb: QR-preview confirmed for %s (credential %s)"),
+		           accountKey.c_str(), (token && *token) ? "present" : "MISSING");
+		if (s_authChannel)
+			s_authChannel->setConfirmed(serviceName.c_str(), loggedInAccount->username, token ? token : "");
+
+		if (s_accountLoginTimers.count(accountKey))
+		{
+			purple_timeout_remove(s_accountLoginTimers[accountKey]);
+			s_accountLoginTimers.erase(accountKey);
+		}
+		s_qrPreviewKeys.erase(accountKey);
+		s_pendingAccountData.erase(accountKey);
+		cancelBuddyResync(accountKey);
+		// ADOPTION (do NOT delete the paired preview). Earlier this disconnected + deleted the
+		// disposable account here; for session prpls (whatsmeow/WhatsApp) disconnecting a
+		// freshly-paired-and-synced client SIGSEGVs, and deleting orphans it in accounts.xml. So
+		// instead keep the live, paired connection and register it as an online account that has
+		// no webOS accountId yet. The UI creates the real webOS account from the confirmed token;
+		// when its onEnabled -> LibpurpleAdapter::login() arrives it finds THIS account already
+		// online without a webosAccountId and adopts it (stamps the id + marks the login state),
+		// reusing the paired session with no disconnect and no second login. If the user abandons
+		// the flow instead, the fail/timeout/cancel paths still tear the preview down.
+		s_onlineAccountData[accountKey] = loggedInAccount;
+		s_ipAddressesBoundTo[accountKey] = s_ipAddressesBoundTo.count(accountKey) ? s_ipAddressesBoundTo[accountKey] : "";
+		MojLogInfo(IMServiceApp::s_log, _T("account_logged_in_cb: keeping paired preview %s alive for adoption"), accountKey.c_str());
+		return;
+	}
 
 	if (s_onlineAccountData.count(accountKey))
 	{
@@ -832,7 +1581,10 @@ static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 	}
 
 	MojLogInfo(IMServiceApp::s_log, _T("account_logged_in_cb: inserting account into onlineAccountData hash table. accountKey %s"), accountKey.c_str());
-	s_onlineAccountData[accountKey] = s_pendingAccountData[accountKey];
+	/* Use the actually-connected account. For a normal login() this equals
+	 * s_pendingAccountData[accountKey]; for an auto-login (not in pending) that lookup
+	 * would insert a NULL, so key off loggedInAccount directly. */
+	s_onlineAccountData[accountKey] = loggedInAccount;
 	s_pendingAccountData.erase(accountKey);
 
 	MojLogInfo(IMServiceApp::s_log, _T("Account connected..."));
@@ -840,7 +1592,7 @@ static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 	// reply with login success
 	if (loginState)
 	{
-		((LoginCallbackInterface*)loginState)->loginResult(serviceName.c_str(), loggedInAccount->username, LoginCallbackInterface::LOGIN_SUCCESS, false, ERROR_NO_ERROR, true);
+		((LoginCallbackInterface*)loginState)->loginResult(serviceName.c_str(), getWebosUsername(loggedInAccount->username, serviceName).c_str(), LoginCallbackInterface::LOGIN_SUCCESS, false, ERROR_NO_ERROR, true);
 	}
 	else
 	{
@@ -861,8 +1613,22 @@ static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 				GINT_TO_POINTER(FALSE));
 		purple_signal_connect(blist_handle, "buddy-added", &handle, PURPLE_CALLBACK(buddy_added_cb),
 				GINT_TO_POINTER(FALSE));
+		// webOS Servers/Rooms M3: also catch chats (Discord guild channels) added to the blist, so a
+		// late-arriving channel re-triggers the server/channel enumeration (see blist_node_added_cb).
+		purple_signal_connect(blist_handle, "blist-node-added", &handle, PURPLE_CALLBACK(blist_node_added_cb),
+				GINT_TO_POINTER(FALSE));
 		purple_signal_connect(blist_handle, "buddy-privacy-changed", &handle, PURPLE_CALLBACK(buddy_blocked_cb),
 				GINT_TO_POINTER(FALSE));
+
+		// webOS: track OUTGOING attachment transfer completion/failure so a FAILED upload downgrades its
+		// optimistically-"successful" Outbox row to "failed" (see xfer_send_*_cb + markAttachmentSendFailed).
+		// Connecting to a non-existent signal name is a harmless no-op, so cover both the single
+		// "file-send-cancel" and the split -remote/-user cancel forms across libpurple variants.
+		void* xfersHandle = purple_xfers_get_handle();
+		purple_signal_connect(xfersHandle, "file-send-complete", &handle, PURPLE_CALLBACK(xfer_send_complete_cb), NULL);
+		purple_signal_connect(xfersHandle, "file-send-cancel", &handle, PURPLE_CALLBACK(xfer_send_cancel_cb), NULL);
+		purple_signal_connect(xfersHandle, "file-send-cancel-remote", &handle, PURPLE_CALLBACK(xfer_send_cancel_cb), NULL);
+		purple_signal_connect(xfersHandle, "file-send-cancel-user", &handle, PURPLE_CALLBACK(xfer_send_cancel_cb), NULL);
 
 		// testing. Doesn't work: error - "Signal data for sent-im-msg not found". Need to figure out the right handle
 //		purple_signal_connect(purple_connections_get_handle(), "sent-im-msg", &handle, PURPLE_CALLBACK(sent_message_cb),
@@ -877,6 +1643,13 @@ static void account_signed_off_cb(PurpleConnection* gc, gpointer loginState)
 	g_return_if_fail(account != NULL);
 
 	std::string const& accountKey = getAccountKeyFromPurpleAccount(account);
+
+	// See logout()'s comment: erase s_AccountIdsData here, once libpurple confirms this account has
+	// actually finished disconnecting, instead of eagerly at the logout() call site - closes the
+	// race window where buddy_status_changed_cb (etc.) would fire against a still-live buddy list
+	// after the mapping was already gone.
+	s_AccountIdsData.erase(accountKey);
+
 	if (s_onlineAccountData.count(accountKey))
 	{
 		MojLogInfo(IMServiceApp::s_log, _T("account_signed_off_cb: removing account from onlineAccountData hash table. accountKey %s"), accountKey.c_str());
@@ -909,7 +1682,7 @@ static void account_signed_off_cb(PurpleConnection* gc, gpointer loginState)
 	if (loginState)
 	{
 		std::string const& serviceName = getServiceNameFromPurpleAccount(account);
-		((LoginCallbackInterface*)loginState)->loginResult(serviceName.c_str(), account->username, LoginCallbackInterface::LOGIN_SIGNED_OFF, false, ERROR_NO_ERROR, true);
+		((LoginCallbackInterface*)loginState)->loginResult(serviceName.c_str(), getWebosUsername(account->username, serviceName).c_str(), LoginCallbackInterface::LOGIN_SIGNED_OFF, false, ERROR_NO_ERROR, true);
 	}
 	else
 	{
@@ -933,6 +1706,35 @@ static void account_login_failed_cb(PurpleConnection* gc, PurpleConnectionError 
 	bool noRetry = true;
 	std::string const& accountKey = getAccountKeyFromPurpleAccount(account);
 
+	/* webOS create-after-confirm: a disposable QR-preview login failed (bad network,
+	 * QR expired before approval, etc.). Report it on the AuthChannel so the UI can
+	 * offer a refresh, and tear the preview down -- do NOT touch the login-state machine. */
+	if (s_qrPreviewKeys.count(accountKey))
+	{
+		std::string const& svc = getServiceNameFromPurpleAccount(account);
+		MojLogInfo(IMServiceApp::s_log, _T("account_login_failed_cb: QR-preview failed for %s: %s"), accountKey.c_str(), description ? description : "");
+		if (s_authChannel)
+			s_authChannel->setChallengeState(svc.c_str(), account->username,
+			    (type == PURPLE_CONNECTION_ERROR_NETWORK_ERROR) ? AuthChannel::StateExpired : AuthChannel::StateFailed,
+			    description);
+		if (s_accountLoginTimers.count(accountKey))
+		{
+			purple_timeout_remove(s_accountLoginTimers[accountKey]);
+			s_accountLoginTimers.erase(accountKey);
+		}
+		s_qrPreviewKeys.erase(accountKey);
+		s_pendingAccountData.erase(accountKey);
+		s_onlineAccountData.erase(accountKey);
+		cancelBuddyResync(accountKey);
+		// CRITICAL: tear the failed preview down. Previously this path only erased tracking maps and
+		// returned, leaving the disposable account PERSISTED + ENABLED in accounts.xml. It then
+		// auto-logged-in on every transport (re)start and hammered the server -- for WhatsApp that is
+		// a permanent 429 "rate-overlimit" loop even though no real account was ever created. Delete
+		// it (once its connection is fully torn down) exactly like the confirm path does.
+		schedulePreviewAccountDelete(account);
+		return;
+	}
+
 	if (s_onlineAccountData.count(accountKey))
 	{
 		/*
@@ -946,7 +1748,7 @@ static void account_login_failed_cb(PurpleConnection* gc, PurpleConnectionError 
 			loggedOut = TRUE;
 			MojLogError(IMServiceApp::s_log, _T("We were logged out. Reason: %s, prpl error code: %i"), description, type);
 		}
-		MojLogInfo(IMServiceApp::s_log, _T("account_login_failed_cb: removing account from onlineAccountData hash table. accountKey %s"), accountKey);
+		MojLogInfo(IMServiceApp::s_log, _T("account_login_failed_cb: removing account from onlineAccountData hash table. accountKey %s"), accountKey.c_str());
 		s_onlineAccountData.erase(accountKey);
 	}
 	else
@@ -980,12 +1782,25 @@ static void account_login_failed_cb(PurpleConnection* gc, PurpleConnectionError 
 		}
 	}
 
-	// Special handling for broken network connection errors (due to bad coverage or flight mode)
-	// We need to set noRetry to false if there was a network type error regardless of if we were pending or online.
-	if (type == PURPLE_CONNECTION_ERROR_NETWORK_ERROR)
+	// Retry on ANY transient/connection failure; only a genuine credential/config error should park
+	// the account offline (retrying with bad credentials just hammers the server). Previously ONLY
+	// PURPLE_CONNECTION_ERROR_NETWORK_ERROR was retryable, so presage (Signal) reporting a dropped
+	// connection as OTHER_ERROR (16) -- e.g. its async runtime ending on a transient "Invalid
+	// response" -- set noRetry=true and parked Signal at availability=OFFLINE *forever*, requiring a
+	// manual re-toggle in the availability menu. Park only on the real auth/settings errors.
+	switch (type)
 	{
-		MojLogError(IMServiceApp::s_log, _T("We had a network error. Reason: %s, prpl error code: %i. Need to retry"), description, type);
-		noRetry = false;
+		case PURPLE_CONNECTION_ERROR_INVALID_USERNAME:
+		case PURPLE_CONNECTION_ERROR_AUTHENTICATION_FAILED:
+		case PURPLE_CONNECTION_ERROR_AUTHENTICATION_IMPOSSIBLE:
+		case PURPLE_CONNECTION_ERROR_INVALID_SETTINGS:
+			noRetry = true; // credential/config problem -> do not auto-retry (would hammer)
+			break;
+		default:
+			MojLogInfo(IMServiceApp::s_log, _T("account_login_failed_cb: transient error (type %i: %s) -> retry, not park"),
+			           type, description ? description : "");
+			noRetry = false; // network / other / encryption / cert / name-in-use / ... -> retry
+			break;
 	}
 
 	const char* mojoFriendlyErrorCode = getMojoFriendlyErrorCode(type);
@@ -1003,7 +1818,7 @@ static void account_login_failed_cb(PurpleConnection* gc, PurpleConnectionError 
 		std::string const& serviceName = getServiceNameFromPurpleAccount(account);
 		//TODO: determine if there are cases where noRetry should be false
 		//TODO: include "description" parameter because it had useful details?
-		((LoginCallbackInterface*)loginState)->loginResult(serviceName.c_str(), account->username, LoginCallbackInterface::LOGIN_FAILED, loggedOut, mojoFriendlyErrorCode, noRetry);
+		((LoginCallbackInterface*)loginState)->loginResult(serviceName.c_str(), getWebosUsername(account->username, serviceName).c_str(), LoginCallbackInterface::LOGIN_FAILED, loggedOut, mojoFriendlyErrorCode, noRetry);
 	}
 	else
 	{
@@ -1049,6 +1864,245 @@ static void account_auth_accept_cb(PurpleAccount* account, const char* remote_us
 	MojLogInfo(IMServiceApp::s_log, _T("account_auth_accept_cb called. account: %s, remote_user: %s"), account->username, remote_user);
 }
 
+/*
+ * Find a buddy-list chat for this account whose "id" component equals `id`.
+ *
+ * webOS Servers/Rooms: purple-discord names a channel *conversation* by the raw channel snowflake
+ * (e.g. "1410895923755880"), but the blist PurpleChat is keyed by its human name ("general") with
+ * the snowflake stored in the "id" component. So purple_blist_find_chat(account, <snowflake>) - which
+ * matches on the chat's display name - misses for Discord, and we never recover the human channel
+ * name or the parent guild. Walk the blist and match the "id" component instead. Other prpls whose
+ * conversation name is already the human/keyed name resolve via purple_blist_find_chat and never
+ * reach this fallback.
+ */
+static PurpleChat* findChatByIdComponent(PurpleAccount* account, const char* id)
+{
+	if (account == NULL || id == NULL || *id == '\0')
+		return NULL;
+
+	for (PurpleBlistNode* node = purple_blist_get_root(); node != NULL; node = node->next)
+	{
+		if (!PURPLE_BLIST_NODE_IS_GROUP(node))
+			continue;
+		for (PurpleBlistNode* child = node->child; child != NULL; child = child->next)
+		{
+			if (!PURPLE_BLIST_NODE_IS_CHAT(child))
+				continue;
+			PurpleChat* chat = (PurpleChat*)child;
+			if (purple_chat_get_account(chat) != account)
+				continue;
+			GHashTable* comps = purple_chat_get_components(chat);
+			if (comps == NULL)
+				continue;
+			const char* compId = (const char*)g_hash_table_lookup(comps, "id");
+			if (compId != NULL && strcmp(compId, id) == 0)
+				return chat;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * webOS Servers/Rooms: derive the server (guild / team / network) identity for a group chat, used
+ * IDENTICALLY by incoming_message_cb (message-driven) and enumerateServersChannels (proactive) so the
+ * two paths resolve to the SAME imserver (dedup key = serviceName+serverName) instead of duplicating.
+ *  - Telegram (flat): every room lands under one synthetic server = the network name; the blist group
+ *    (tdlib's generic "Chats"/default) is meaningless as a server, so it's ignored.
+ *  - Discord / Teams (hierarchical): the blist group is "Guild: Category" (Discord) or the team name;
+ *    the server is the part before the first ": " (the guild/team). The remainder (Discord category)
+ *    is returned via outCategory for imchannel.parentId.
+ */
+// webOS Servers/Rooms: display-name cleanup for server/channel names read from the prpl blist. Some
+// prpls hand back HTML-escaped names (Teams "LuneOS &amp; webOS-OSE"), which the app shows literally;
+// decode the common entities so the user sees "LuneOS & webOS-OSE".
+static std::string htmlUnescape(const std::string& in)
+{
+	std::string out;
+	out.reserve(in.size());
+	for (size_t i = 0; i < in.size(); )
+	{
+		if (in[i] == '&')
+		{
+			if      (in.compare(i, 5, "&amp;")  == 0) { out += '&';  i += 5; continue; }
+			else if (in.compare(i, 4, "&lt;")   == 0) { out += '<';  i += 4; continue; }
+			else if (in.compare(i, 4, "&gt;")   == 0) { out += '>';  i += 4; continue; }
+			else if (in.compare(i, 6, "&quot;") == 0) { out += '"';  i += 6; continue; }
+			else if (in.compare(i, 6, "&apos;") == 0) { out += '\''; i += 6; continue; }
+			else if (in.compare(i, 5, "&#39;")  == 0) { out += '\''; i += 5; continue; }
+		}
+		out += in[i++];
+	}
+	return out;
+}
+
+// True if `name` is a raw Teams/Skype thread id like "19:<hex>@thread.skype" / "@thread.v2" - i.e. a
+// group chat with no topic set. purple-teams uses that id as the chat title, so it would otherwise be
+// shown to the user verbatim.
+static bool isRawThreadId(const std::string& name)
+{
+	return name.compare(0, 3, "19:") == 0 && name.find("@thread.") != std::string::npos;
+}
+
+// Clean a channel display name for storage/UI: decode HTML entities, and replace an un-named Teams
+// group chat's raw thread id with a readable placeholder. (Proper participant-derived names - "Alice,
+// Bob, ..." like the real client - need the resolved member list and are a purple-teams follow-up.)
+static std::string cleanChannelDisplayName(const char* rawName)
+{
+	if (rawName == NULL || *rawName == '\0')
+		return std::string();
+	std::string n = htmlUnescape(rawName);
+	if (isRawThreadId(n))
+		return std::string("Group chat");
+	return n;
+}
+
+// webOS WhatsApp Channels: true if `name` is a WhatsApp Channel/newsletter JID ("<id>@newsletter").
+// whatsmeow leaves IsGroup=false for the newsletter server, so these otherwise arrive as 1:1 IMs.
+static bool isWhatsAppNewsletter(const char* name)
+{
+	if (name == NULL)
+		return false;
+	size_t len = strlen(name);
+	static const char* suffix = "@newsletter";
+	size_t slen = strlen(suffix);
+	return len > slen && strcmp(name + len - slen, suffix) == 0;
+}
+
+// webOS WhatsApp Status: true if `name` is the synthetic "<phone>@broadcast" JID handle_message.go
+// tags a contact's status update with (types.BroadcastServer) instead of the sender's real JID, so
+// it can be routed into the Servers tab (its own "Status Updates" channel per sender) rather than
+// showing up as an ordinary 1:1 chat.
+static bool isWhatsAppStatus(const char* name)
+{
+	if (name == NULL)
+		return false;
+	size_t len = strlen(name);
+	static const char* suffix = "@broadcast";
+	size_t slen = strlen(suffix);
+	return len > slen && strcmp(name + len - slen, suffix) == 0;
+}
+
+static std::string deriveServerName(PurpleAccount* account, const char* groupName, std::string* outCategory)
+{
+	if (outCategory)
+		outCategory->clear();
+	const char* protoId = account ? purple_account_get_protocol_id(account) : NULL;
+	if (protoId != NULL && strstr(protoId, "telegram") != NULL)
+	{
+		const char* net = purple_account_get_protocol_name(account);
+		return (net != NULL && *net != '\0') ? std::string(net) : std::string("Telegram");
+	}
+	if (groupName == NULL || *groupName == '\0')
+		return std::string();
+	std::string g = groupName;
+	// webOS Teams: purple-teams files ALL Teams chats under one blist group named "Teams - <tenantId>"
+	// (teams_get_blist_group), and for a personal account the tenant is the consumer GUID - so the
+	// Servers tab showed a "server" literally called "Teams - 9188040d-6c67-...". Collapse it to "Teams".
+	if (g == "Teams" || g.compare(0, 8, "Teams - ") == 0)
+		return std::string("Teams");
+	std::string::size_type sep = g.find(": ");
+	if (sep != std::string::npos)
+	{
+		if (outCategory)
+			*outCategory = htmlUnescape(g.substr(sep + 2));
+		return htmlUnescape(g.substr(0, sep));
+	}
+	return htmlUnescape(g);
+}
+
+/*
+ * webOS Servers/Rooms M3: join a group channel so the prpl fetches + delivers its recent history and
+ * accepts sends into it (purple-discord fetches ~100 messages on join). Robust to an unstable buddy
+ * list: if the channel's chat isn't in the blist, build the join components straight from the channel
+ * key (Discord/Telegram store it under "id", Teams under "chatname"). Returns the (existing or newly
+ * joined) chat conversation, or NULL. Joining is idempotent - an already-open chat is returned as-is.
+ */
+static PurpleConversation* joinChannelChat(PurpleAccount* account, const char* channel)
+{
+	if (account == NULL || channel == NULL || *channel == '\0')
+		return NULL;
+	PurpleConnection* gc = purple_account_get_connection(account);
+	if (gc == NULL)
+		return NULL;
+
+	// webOS: do NOT permanently early-return when the conversation already exists. Re-invoking
+	// serv_join_chat is how a RE-opened channel backfills messages that arrived while it wasn't open --
+	// discord's join_chat runs its "?after=<last-seen>" forward catch-up on a re-open. All three group
+	// prpls (discord/teams/telegram) guard join_chat against an existing conversation (find_chat_with_account
+	// + !has_left -> present + return), so re-joining never creates a duplicate conversation. The old
+	// unconditional early-return silently defeated re-open backfill.
+	//
+	// BUT it must be THROTTLED: the Messaging app fires openChannel several times in a burst for the same
+	// channel (on conversation focus / list render), and without the early-return each call would
+	// serv_join_chat -> a fresh limit=100 history fetch -> a Discord-API request storm (7x/sec observed),
+	// risking rate-limiting the account. Allow a re-backfill at most once per channel per
+	// REJOIN_THROTTLE_SECS; within that window just return the existing conversation, exactly as the old
+	// early-return did. Live messages arrive via the gateway (MESSAGE_CREATE), not this fetch, so a short
+	// throttle never delays real-time delivery -- it only rate-limits the catch-up fetch.
+	static std::unordered_map<std::string, time_t> s_lastChannelJoin;
+	const time_t REJOIN_THROTTLE_SECS = 15;
+	std::string channelKey(channel);
+	time_t nowT = time(NULL);
+	PurpleConversation* existingConv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, channel, account);
+	if (existingConv != NULL)
+	{
+		std::unordered_map<std::string, time_t>::iterator it = s_lastChannelJoin.find(channelKey);
+		if (it != s_lastChannelJoin.end() && (nowT - it->second) < REJOIN_THROTTLE_SECS)
+			return existingConv;   // backfilled very recently -> don't storm the API
+	}
+	s_lastChannelJoin[channelKey] = nowT;
+
+	// Prefer the blist chat's own components; fall back to constructing them from the key.
+	PurpleChat* chat = findChatByIdComponent(account, channel);
+	if (chat == NULL)
+		chat = purple_blist_find_chat(account, channel);
+
+	GHashTable* built = NULL;
+	GHashTable* components = (chat != NULL) ? purple_chat_get_components(chat) : NULL;
+	if (components == NULL)
+	{
+		const char* protoId = purple_account_get_protocol_id(account);
+		const char* key = (protoId != NULL && strstr(protoId, "teams") != NULL) ? "chatname" : "id";
+		built = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+		g_hash_table_insert(built, g_strdup(key), g_strdup(channel));
+		components = built;
+	}
+
+	serv_join_chat(gc, components);
+	if (built != NULL)
+		g_hash_table_destroy(built);
+
+	return purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, channel, account);
+}
+
+
+// webOS receive attachments: true if `message` is nothing but a libpurple imgstore image reference
+// (e.g. <img id="7">), optionally surrounded by whitespace. presage emits such a message as an inline
+// copy of a received image IN ADDITION to the file:// URL message we rely on (the auto-download path
+// template writes both), so we drop the redundant inline one to avoid a duplicate/broken image bubble.
+// A real image delivered as a URL (Discord/Telegram) arrives as text, not an <img> tag, so is unaffected.
+static bool isPureImgstoreMessage(const char* message)
+{
+	if (message == NULL)
+		return false;
+	const char* p = message;
+	while (*p && isspace((unsigned char)*p)) p++;
+	if (strncasecmp(p, "<img", 4) != 0)
+		return false;
+	const char* end = strchr(p, '>');
+	if (end == NULL)
+		return false;
+	// must be an imgstore-id reference ("<img id=...>"), not a src=URL <img> - check within the tag
+	std::string tag(p, end - p);
+	for (size_t i = 0; i + 2 < tag.size(); i++)
+		if ((tag[i]=='i'||tag[i]=='I') && (tag[i+1]=='d'||tag[i+1]=='D') && tag[i+2]=='=')
+		{
+			end++;
+			while (*end && isspace((unsigned char)*end)) end++;
+			return *end == '\0';   // nothing follows the single <img id=...> tag
+		}
+	return false;
+}
 
 void incoming_message_cb(PurpleConversation* conv, const char* who, const char* alias, const char* message,
 		PurpleMessageFlags flags, time_t mtime)
@@ -1064,9 +2118,118 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 	else
 		usernameFrom = "";
 
+	// webOS Servers/Rooms: tdlib-purple smuggles a group message sender as "id<userId>\x1f<Display Name>"
+	// through the single `who` slot. Split it so usernameFrom becomes the routable id (-> from.addr, so
+	// the app can open a 1:1 with the sender) and the display name is forwarded separately (-> from.name).
+	// Non-group messages and other prpls have no \x1f and are unaffected.
+	std::string usernameFromBuf;
+	std::string usernameFromDisplayBuf;
+	{
+		const char* sep = (usernameFrom && *usernameFrom) ? strchr(usernameFrom, '\x1f') : NULL;
+		if (sep != NULL)
+		{
+			usernameFromBuf.assign(usernameFrom, sep - usernameFrom); // "id<userId>"
+			usernameFromDisplayBuf.assign(sep + 1);                   // "Display Name"
+			usernameFrom = usernameFromBuf.c_str();
+		}
+	}
+	const char* usernameFromDisplay = usernameFromDisplayBuf.empty() ? NULL : usernameFromDisplayBuf.c_str();
+
 	if ((flags & PURPLE_MESSAGE_RECV) != PURPLE_MESSAGE_RECV)
 	{
-		/* this is a sent message. ignore it. */
+		// A message WE sent. A plain local echo (app-initiated send) is already persisted by
+		// OutgoingIMHandler, so ignore it. But a carbon of a message we sent from ANOTHER client
+		// (PURPLE_MESSAGE_REMOTE_SEND - e.g. the Telegram/Signal/WhatsApp/Discord phone app) has no
+		// local row, so store it as an Outbox message so it shows on the sent side of the thread (and a
+		// reaction can attach to it). Both 1:1 IMs and guild CHANNEL carbons are handled below.
+		if ((flags & PURPLE_MESSAGE_REMOTE_SEND) && s_imServiceHandler != NULL)
+		{
+			PurpleAccount* sentAccount = purple_conversation_get_account(conv);
+			if (sentAccount != NULL)
+			{
+				std::string const& sentService = getServiceNameFromPurpleAccount(sentAccount);
+				std::string ownerWebos = getWebosUsername(sentAccount->username, sentService, sentAccount);
+				// serviceMessageId the prpl stashed on the conv right before this write (its own id).
+				char* svcMsgId = (char*) purple_conversation_get_data(conv, "webos-msg-id");
+				// webOS replies: a carbon of a reply we sent from another client carries the quoted-original
+				// too. Read it (same stash as the RECV path) so the Outbox row renders the inline quote card.
+				char* qMsgId = (char*) purple_conversation_get_data(conv, "webos-quoted-id");
+				char* qText  = (char*) purple_conversation_get_data(conv, "webos-quoted-text");
+				char* qFrom  = (char*) purple_conversation_get_data(conv, "webos-quoted-from");
+
+				if (purple_conversation_get_type(conv) == PURPLE_CONV_TYPE_IM)
+				{
+					const char* peer = purple_conversation_get_name(conv); // the recipient (1:1 peer)
+					if (peer != NULL && *peer != '\0')
+					{
+						std::string peerStripped = stripResourceFromJabberUsername(peer, sentService);
+						std::string peerWebos = getWebosUsername(peerStripped.c_str(), sentService, sentAccount);
+						s_imServiceHandler->incomingIM(sentService.c_str(), ownerWebos.c_str(), peerWebos.c_str(),
+								message, mtime, NULL, NULL, NULL, NULL, false, NULL,
+								(svcMsgId && *svcMsgId) ? svcMsgId : NULL,
+								(qMsgId && *qMsgId) ? qMsgId : NULL, (qText && *qText) ? qText : NULL,
+								(qFrom && *qFrom) ? qFrom : NULL, /* outgoing */ true);
+					}
+				}
+				else if (purple_conversation_get_type(conv) == PURPLE_CONV_TYPE_CHAT)
+				{
+					// webOS #2: a message WE sent in a guild CHANNEL from another device (e.g. the Discord
+					// phone app). Store it as an OUTGOING row in that channel (folder=outbox), resolving
+					// channel + server the same way the RECV channel path does so it groups under the same
+					// imserver. usernameFrom = us (the sender).
+					const char* channelName = purple_conversation_get_name(conv);
+					if (channelName != NULL && *channelName != '\0')
+					{
+						const char* channelDisplayName = purple_conversation_get_title(conv);
+						std::string parentGroupName;
+						PurpleChat* chat = purple_blist_find_chat(sentAccount, channelName);
+						if (chat == NULL)
+							chat = findChatByIdComponent(sentAccount, channelName);
+						if (chat != NULL)
+						{
+							const char* humanName = purple_chat_get_name(chat);
+							if (humanName != NULL && *humanName != '\0')
+								channelDisplayName = humanName;
+							PurpleBlistNode* parent = ((PurpleBlistNode*)chat)->parent;
+							if (parent != NULL && PURPLE_BLIST_NODE_IS_GROUP(parent))
+							{
+								const char* groupName = purple_group_get_name((PurpleGroup*)parent);
+								if (groupName != NULL)
+									parentGroupName = groupName;
+							}
+						}
+						// webOS: don't stamp the raw match key/JID as a display name when no human room
+						// title resolved (unaliased WhatsApp group during backfill) -- see the incoming path.
+						if (channelDisplayName != NULL && strcmp(channelDisplayName, channelName) == 0)
+							channelDisplayName = NULL;
+						std::string serverNameStr = deriveServerName(sentAccount, parentGroupName.empty() ? NULL : parentGroupName.c_str(), NULL);
+						const char* serverName = serverNameStr.empty() ? NULL : serverNameStr.c_str();
+						s_imServiceHandler->incomingIM(sentService.c_str(), ownerWebos.c_str(), ownerWebos.c_str(),
+								message, mtime, channelName, channelDisplayName, serverName, serverName, false, NULL,
+								(svcMsgId && *svcMsgId) ? svcMsgId : NULL,
+								(qMsgId && *qMsgId) ? qMsgId : NULL, (qText && *qText) ? qText : NULL,
+								(qFrom && *qFrom) ? qFrom : NULL, /* outgoing */ true);
+					}
+				}
+
+				if (svcMsgId != NULL)
+				{
+					g_free(svcMsgId);
+					purple_conversation_set_data(conv, "webos-msg-id", NULL);
+				}
+				if (qMsgId != NULL) { g_free(qMsgId); purple_conversation_set_data(conv, "webos-quoted-id", NULL); }
+				if (qText  != NULL) { g_free(qText);  purple_conversation_set_data(conv, "webos-quoted-text", NULL); }
+				if (qFrom  != NULL) { g_free(qFrom);  purple_conversation_set_data(conv, "webos-quoted-from", NULL); }
+			}
+		}
+		return;
+	}
+
+	// webOS receive attachments: drop a redundant inline-imgstore copy of a received image (presage
+	// emits one alongside the file:// URL message we actually render). See isPureImgstoreMessage.
+	if (isPureImgstoreMessage(message))
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("incoming_message_cb: dropping redundant inline-image (imgstore) message"));
 		return;
 	}
 
@@ -1083,8 +2246,327 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 
 	std::string usernameFromStripped = stripResourceFromJabberUsername(usernameFrom, serviceName);
 
+	// webOS Servers/Rooms (Milestone 0): detect multi-user chat (MUC) conversations - e.g.
+	// Discord guild channels, IRC channels, Teams channels. libpurple delivers these through the
+	// same write_conv slot as 1:1 IMs, so branch on the conversation type. For a chat we resolve
+	// the parent "server" (Discord guild / IRC network) from the room's buddy-list group, which
+	// purple-discord sets to the guild name. channelName/serverName are forwarded onto the
+	// immessage so the ChatThreader/UI can group channels under their server. 1:1 IMs are
+	// unaffected: both pointers stay NULL and the stored record is identical to before.
+	const char* channelName = NULL;
+	const char* channelDisplayName = NULL;   // human room title (Telegram group name); channelName stays the key
+	std::string serverNameStr;   // resolved guild/team/network server (via deriveServerName)
+	std::string parentGroupName; // raw blist group of the chat, fed to deriveServerName
+	// Muted-conversation support: the prpl (e.g. tdlib-purple) records a chat's server-side mute
+	// state as a "muted" bool on the buddy (1:1) / chat (group) blist node. Read it here and forward
+	// it so the message is stored with flags.noNotification (banner suppressed, still unread). This
+	// is protocol-agnostic - any prpl that sets the "muted" node bool participates.
+	bool muted = false;
+	if (purple_conversation_get_type(conv) == PURPLE_CONV_TYPE_CHAT)
+	{
+		channelName = purple_conversation_get_name(conv);
+		// Human room title for display. tdlib-purple names the conversation "chat-<id>" (a stable
+		// key, kept as channelName) but exposes the real room title separately - forward it so the
+		// UI shows "Gubbins Calls" instead of "chat-1001609073900". purple-discord's name is already
+		// human, so title==name there and this is harmless.
+		channelDisplayName = purple_conversation_get_title(conv);
+		if (channelName && *channelName)
+		{
+			PurpleChat* chat = purple_blist_find_chat(account, channelName);
+			// purple-discord names the conversation by the raw channel snowflake, so the lookup
+			// above (which matches the chat's human display name) misses - fall back to matching
+			// the "id" component. See findChatByIdComponent.
+			if (chat == NULL)
+				chat = findChatByIdComponent(account, channelName);
+			if (chat != NULL)
+			{
+				// Human channel name for display: purple_chat_get_name() returns the prpl's
+				// get_chat_name (Discord -> components["name"], e.g. "general"). Prefer it over the
+				// conversation title, which for Discord is just the snowflake. Falls through to the
+				// title/name for prpls that don't provide a distinct human name.
+				const char* humanName = purple_chat_get_name(chat);
+				if (humanName != NULL && *humanName != '\0')
+					channelDisplayName = humanName;
+				// The chat's parent blist node is its group; for purple-discord that group
+				// is the guild (server). Use direct field access (public struct member) so we
+				// don't depend on any particular libpurple accessor version.
+				PurpleBlistNode* parent = ((PurpleBlistNode*)chat)->parent;
+				if (parent != NULL && PURPLE_BLIST_NODE_IS_GROUP(parent))
+				{
+					const char* groupName = purple_group_get_name((PurpleGroup*)parent);
+					if (groupName != NULL)
+						parentGroupName = groupName;
+				}
+				// webOS: an archived chat is silenced like a muted one (no notification banner). The
+				// prpl (tdlib-purple) sets both bools on the chat blist node.
+				muted = purple_blist_node_get_bool((PurpleBlistNode*)chat, "muted")
+				        || purple_blist_node_get_bool((PurpleBlistNode*)chat, "archived");
+			}
+		}
+		// webOS: if we couldn't resolve a HUMAN room title, channelDisplayName has fallen back to the
+		// raw match key (for a WhatsApp group that's the "<digits>-<digits>@g.us" JID, before its name
+		// has been fetched during post-connect backfill). Don't stamp that -- leave it NULL so the
+		// ChatThreader keeps the thread's existing (good) name instead of downgrading it to the JID.
+		// (Pairs with the chatthreader JID guard; a later live message re-supplies the real name.)
+		if (channelDisplayName != NULL && channelName != NULL && strcmp(channelDisplayName, channelName) == 0)
+			channelDisplayName = NULL;
+		// Resolve the server identity consistently with enumerateServersChannels: the guild/team (the
+		// part before ": " in the blist group) for Discord/Teams, or the synthetic network server for
+		// flat Telegram (whose blist group is meaningless). Sharing deriveServerName makes a channel's
+		// message-driven and enumerated records dedup to the same imserver instead of duplicating.
+		serverNameStr = deriveServerName(account, parentGroupName.empty() ? NULL : parentGroupName.c_str(), NULL);
+		MojLogInfo(IMServiceApp::s_log,
+			_T("incoming_message_cb: group-chat message. channel: %s title: %s server(guild): %s sender: %s muted: %d"),
+			channelName ? channelName : "", channelDisplayName ? channelDisplayName : "", serverNameStr.c_str(), usernameFromStripped.c_str(), muted);
+	}
+	else
+	{
+		// 1:1 IM: the buddy node carries the per-chat mute/archived flags. (An archived 1:1 whose
+		// buddy was pruned from the list has no node here - that rarer case isn't silenced yet.)
+		PurpleBuddy* buddy = purple_find_buddy(account, usernameFrom);
+		if (buddy != NULL)
+			muted = purple_blist_node_get_bool((PurpleBlistNode*)buddy, "muted")
+			        || purple_blist_node_get_bool((PurpleBlistNode*)buddy, "archived");
+	}
+
+	// webOS WhatsApp Channels: whatsmeow delivers a followed Channel (newsletter) as a 1:1 IM whose
+	// peer JID is "<id>@newsletter" (it leaves IsGroup=false for the newsletter server), so it lands in
+	// the else-branch above with channelName==NULL and would be stored as an ordinary chatthread. Route
+	// it into the Server/Channel tab instead by tagging it like a MUC: channelName = the JID (the stable
+	// match key, == purple_conversation_get_name so it dedups with the enumerated record), server = a
+	// synthetic "WhatsApp Channels". Setting channelName flips IMMessage isGroupChat true. The channel's
+	// human title comes from the buddy alias (best effort; the JID is the fallback).
+	if (channelName == NULL && serviceName == "type_whatsapp")
+	{
+		const char* imName = purple_conversation_get_name(conv);
+		if (isWhatsAppNewsletter(imName))
+		{
+			channelName = imName;
+			serverNameStr = "WhatsApp Channels";
+			PurpleBuddy* nlBuddy = purple_find_buddy(account, imName);
+			if (nlBuddy != NULL)
+			{
+				const char* alias = purple_buddy_get_alias(nlBuddy);
+				if (alias != NULL && *alias != '\0' && !isWhatsAppNewsletter(alias))
+					channelDisplayName = alias;
+			}
+		}
+		// webOS WhatsApp Status: a contact's status update arrives (see handle_message.go) tagged
+		// with a synthetic "<phone>@broadcast" peer JID instead of masquerading as an ordinary 1:1
+		// message from that contact. Route it into its own channel (one per sender) under a
+		// "Status Updates" server, exactly like a followed Channel, instead of showing up as a
+		// random new chat.
+		else if (isWhatsAppStatus(imName))
+		{
+			channelName = imName;
+			serverNameStr = "Status Updates";
+			PurpleBuddy* stBuddy = purple_find_buddy(account, imName);
+			if (stBuddy != NULL)
+			{
+				const char* alias = purple_buddy_get_alias(stBuddy);
+				if (alias != NULL && *alias != '\0' && !isWhatsAppStatus(alias))
+					channelDisplayName = alias;
+			}
+		}
+	}
+
+	// webOS WhatsApp: the sender id is the raw JID "<digits>@s.whatsapp.net" (or opaque "<id>@lid"),
+	// so a message would otherwise show "31611745571@s.whatsapp.net" as the sender. Give from.name a
+	// human value -- the push-name if the sender is a known buddy, else the formatted "+<phone>" --
+	// mirroring getFullBuddyList's whatsAppDisplayName. from.addr keeps the routable JID. Only set
+	// when the prpl didn't already smuggle a display name (usernameFromDisplay via the \x1f split).
+	if (usernameFromDisplay == NULL && serviceName == "type_whatsapp")
+	{
+		PurpleBuddy* senderBuddy = purple_find_buddy(account, usernameFromStripped.c_str());
+		const char* senderAlias = senderBuddy ? purple_buddy_get_alias_only(senderBuddy) : NULL;
+		std::string waDisp = whatsAppDisplayName(senderAlias, usernameFromStripped.c_str());
+		if (!waDisp.empty() && waDisp != usernameFromStripped)
+		{
+			usernameFromDisplayBuf = waDisp;
+			usernameFromDisplay = usernameFromDisplayBuf.c_str();
+		}
+	}
+
+	// webOS Signal: contacts are opaque ACI UUIDs. presage sets a profile-name alias when it has
+	// one; when it doesn't, never surface the raw UUID -- show the alias if human, else a generic
+	// label. from.addr keeps the routable UUID.
+	if (usernameFromDisplay == NULL && serviceName == "type_signal")
+	{
+		PurpleBuddy* senderBuddy = purple_find_buddy(account, usernameFrom);
+		const char* senderAlias = senderBuddy ? purple_buddy_get_alias_only(senderBuddy) : NULL;
+		if (senderAlias && *senderAlias && !isSignalUuid(senderAlias))
+		{
+			usernameFromDisplayBuf = senderAlias;
+			usernameFromDisplay = usernameFromDisplayBuf.c_str();
+		}
+		else if (isSignalUuid(usernameFrom))
+		{
+			usernameFromDisplayBuf = "Signal user";
+			usernameFromDisplay = usernameFromDisplayBuf.c_str();
+		}
+	}
+
 	// call the transport service incoming message handler
-	s_imServiceHandler->incomingIM(serviceName.c_str(), account->username, usernameFromStripped.c_str(), message);
+	// webOS Teams port: forward the libpurple message time (mtime, secs) so history/
+	// offline messages are stored with their original send time, not the arrival time.
+	// webOS Servers/Rooms: forward channel + server (both NULL for 1:1 IMs). serverId has no
+	// stable value from the blist group alone, so mirror serverName for now - Milestone 1 will
+	// pull the real guild id from the chat's components.
+	const char* serverName = serverNameStr.empty() ? NULL : serverNameStr.c_str();
+	// webOS Servers/Rooms: decode HTML entities and replace an un-named Teams group chat's raw thread id
+	// with a readable placeholder, so the stored/displayed room title matches what deriveServerName
+	// already does for the server. channelName (the match key) stays raw.
+	std::string channelDisplayBuf;
+	if (channelDisplayName != NULL && *channelDisplayName != '\0')
+	{
+		channelDisplayBuf = cleanChannelDisplayName(channelDisplayName);
+		if (!channelDisplayBuf.empty())
+			channelDisplayName = channelDisplayBuf.c_str();
+	}
+	// Store the account owner AND the sender in the webOS +E.164 form (getWebosUsername) so the
+	// message threads to the same buddy/contact whose ims.value we now write as "+<phone>". The human
+	// from.name was already computed above from the raw JID, and the buddy lookups above used the raw
+	// JID, so only the STORED addresses change here. Held in locals so the c_str()s outlive the call.
+	std::string ownerWebos = getWebosUsername(account->username, serviceName, account);
+	std::string senderWebos = getWebosUsername(usernameFromStripped.c_str(), serviceName, account);
+
+	// webOS reactions: the prpl stashes its own id for THIS message on the conversation right before
+	// serv_got_im (which synchronously drives us here). Read it so incomingIM can persist it as
+	// serviceMessageId, then free + clear it (the prpl g_strdup'd it; this handoff owns the free).
+	char* svcMsgId = (char*) purple_conversation_get_data(conv, "webos-msg-id");
+	// webOS replies: the prpl also stashes the quoted-original (id/text/sender) this message replies to,
+	// the same way it stashes webos-msg-id. Read alongside so incomingIM can persist a proper inline
+	// quote instead of the raw "> "/HTML folded into the body. Freed + cleared below (the prpl g_strdup'd).
+	char* qMsgId = (char*) purple_conversation_get_data(conv, "webos-quoted-id");
+	char* qText  = (char*) purple_conversation_get_data(conv, "webos-quoted-text");
+	char* qFrom  = (char*) purple_conversation_get_data(conv, "webos-quoted-from");
+
+	s_imServiceHandler->incomingIM(serviceName.c_str(), ownerWebos.c_str(), senderWebos.c_str(),
+			message, mtime, channelName, channelDisplayName, serverName, serverName, muted, usernameFromDisplay, svcMsgId,
+			qMsgId, qText, qFrom);
+
+	if (svcMsgId != NULL) {
+		g_free(svcMsgId);
+		purple_conversation_set_data(conv, "webos-msg-id", NULL);
+	}
+	if (qMsgId != NULL) { g_free(qMsgId); purple_conversation_set_data(conv, "webos-quoted-id", NULL); }
+	if (qText  != NULL) { g_free(qText);  purple_conversation_set_data(conv, "webos-quoted-text", NULL); }
+	if (qFrom  != NULL) { g_free(qFrom);  purple_conversation_set_data(conv, "webos-quoted-from", NULL); }
+}
+
+/*
+ * webOS reactions (cross-prpl): a prpl emitted "webos-im-reaction" for a message it identifies by
+ * targetServiceMessageId. Resolve the owning account + reacting sender to webOS usernames and hand
+ * off to IMServiceHandler, which merges the reaction onto the target message row (ReactionHandler).
+ * emoji=="" (or NULL) means the sender removed their reaction. sender may be NULL/empty for a 1:1
+ * chat (the reactor is the peer); a group reaction carries the member id.
+ */
+static void im_reaction_cb(PurpleAccount* account, const char* targetServiceMessageId, const char* emoji, const char* sender, void* data)
+{
+	if (account == NULL || targetServiceMessageId == NULL || *targetServiceMessageId == '\0' || s_imServiceHandler == NULL)
+		return;
+
+	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
+	std::string ownerWebos  = getWebosUsername(account->username, serviceName, account);
+	std::string senderWebos = (sender != NULL && *sender != '\0') ? getWebosUsername(sender, serviceName, account) : std::string();
+
+	s_imServiceHandler->handleReaction(serviceName.c_str(), ownerWebos.c_str(), targetServiceMessageId,
+			emoji ? emoji : "", senderWebos.c_str());
+}
+
+/*
+ * webOS: a prpl emitted "webos-im-outbox-id" carrying the network id (serviceMessageId) it assigned to
+ * a message the user sent FROM THE APP, plus the sent text as a correlation hint. Resolve the owning
+ * account and hand off to IMServiceHandler, which finds the matching Outbox row and stores the id so a
+ * reaction can later attach to the user's own sent message.
+ */
+static void im_outbox_id_cb(PurpleAccount* account, const char* serviceMessageId, const char* text, void* data)
+{
+	if (account == NULL || serviceMessageId == NULL || *serviceMessageId == '\0' || s_imServiceHandler == NULL)
+		return;
+
+	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
+	std::string ownerWebos = getWebosUsername(account->username, serviceName);
+
+	s_imServiceHandler->handleOutboxId(serviceName.c_str(), ownerWebos.c_str(), serviceMessageId,
+			text ? text : "");
+}
+
+/*
+ * webOS delivery/read receipts (by-id): a prpl (WhatsApp/Signal) reported that the recipient DELIVERED
+ * or READ the outgoing message whose network id is serviceMessageId. Resolve the owning account and
+ * hand off to IMServiceHandler, which upgrades the Outbox row's deliveryStatus (single/double tick).
+ */
+static void im_receipt_cb(PurpleAccount* account, const char* serviceMessageId, const char* status, void* data)
+{
+	if (account == NULL || serviceMessageId == NULL || *serviceMessageId == '\0' || status == NULL || s_imServiceHandler == NULL)
+		return;
+	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
+	std::string ownerWebos = getWebosUsername(account->username, serviceName, account);
+	s_imServiceHandler->handleReceiptById(serviceName.c_str(), ownerWebos.c_str(), serviceMessageId, status);
+}
+
+/*
+ * webOS message edit: a prpl (WhatsApp) reported that the sender edited a previously-sent message whose
+ * network id is serviceMessageId; newText is the new (already HTML-escaped) body. Resolve the owning
+ * account and hand off to IMServiceHandler, which finds the stored immessage and merges the new text so
+ * the original bubble updates in place (rather than a separate "[EDIT]" message).
+ */
+static void im_edit_cb(PurpleAccount* account, const char* serviceMessageId, const char* newText, void* data)
+{
+	if (account == NULL || serviceMessageId == NULL || *serviceMessageId == '\0' || s_imServiceHandler == NULL)
+		return;
+	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
+	std::string ownerWebos = getWebosUsername(account->username, serviceName, account);
+	s_imServiceHandler->handleMessageEdit(serviceName.c_str(), ownerWebos.c_str(), serviceMessageId,
+			newText ? newText : "");
+}
+
+/*
+ * webOS "delete for everyone": a prpl (WhatsApp) reported that the sender revoked a previously-sent
+ * message whose network id is serviceMessageId. Resolve the owning account and hand off to
+ * IMServiceHandler, which finds the stored immessage and replaces its text with a placeholder in
+ * place (the same find-by-serviceMessageId + merge mechanism as im_edit_cb above).
+ */
+static void im_delete_cb(PurpleAccount* account, const char* serviceMessageId, void* data)
+{
+	if (account == NULL || serviceMessageId == NULL || *serviceMessageId == '\0' || s_imServiceHandler == NULL)
+		return;
+	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
+	std::string ownerWebos = getWebosUsername(account->username, serviceName, account);
+	s_imServiceHandler->handleMessageDelete(serviceName.c_str(), ownerWebos.c_str(), serviceMessageId);
+}
+
+/*
+ * webOS delivery/read receipts (watermark): a prpl (Telegram/Facebook/Teams) reported that everything
+ * up to a boundary was delivered/read. scope names the conversation + match field (see ReceiptHandler);
+ * watermark is the numeric boundary. Upgrades every Outbox row at/under it.
+ */
+static void im_receipt_hwm_cb(PurpleAccount* account, const char* scope, const char* watermark, const char* status, void* data)
+{
+	if (account == NULL || scope == NULL || *scope == '\0' || watermark == NULL || *watermark == '\0' || status == NULL || s_imServiceHandler == NULL)
+		return;
+	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
+	std::string ownerWebos = getWebosUsername(account->username, serviceName, account);
+	s_imServiceHandler->handleReceiptWatermark(serviceName.c_str(), ownerWebos.c_str(), scope, watermark, status);
+}
+
+/*
+ * webOS reactions (aggregated/REPLACE): a prpl emitted "webos-im-reaction-set" carrying the whole
+ * reaction summary for one message (serialized as "count<SP>emoji" records separated by '\n'). Used
+ * by prpls that only expose aggregated counts (Telegram). Resolve the owning account and REPLACE the
+ * target message's reactions with this set (an empty `serialized` clears them all).
+ */
+static void im_reaction_set_cb(PurpleAccount* account, const char* targetServiceMessageId, const char* serialized, const char* unused, void* data)
+{
+	if (account == NULL || targetServiceMessageId == NULL || *targetServiceMessageId == '\0' || s_imServiceHandler == NULL)
+		return;
+
+	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
+	std::string ownerWebos = getWebosUsername(account->username, serviceName);
+
+	s_imServiceHandler->handleReactionSet(serviceName.c_str(), ownerWebos.c_str(), targetServiceMessageId,
+			serialized ? serialized : "");
 }
 
 /*
@@ -1120,7 +2602,7 @@ static void *request_authorize_cb (PurpleAccount *account, const char *remote_us
 	logAuthRequestTableValues();
 
 	// call back into IMServiceHandler to create a receivedBuddyInvite imCommand.
-	s_imServiceHandler->receivedBuddyInvite(serviceName.c_str(), account->username, usernameFromStripped.c_str(), message);
+	s_imServiceHandler->receivedBuddyInvite(serviceName.c_str(), getWebosUsername(account->username, serviceName).c_str(), usernameFromStripped.c_str(), message);
 
 	// don't free the authRequestKey - it is not copied, but held onto for the life of the hash table once inserted
 	return NULL;
@@ -1138,7 +2620,12 @@ gboolean connectTimeoutCallback(gpointer data)
 {
 
 	MojLogError(IMServiceApp::s_log, _T("connectTimeoutCallback called - we not neither success nor failure callback from the last login attempt."));
-	bool noRetry = true;
+	// A connect timeout is transient -- a slow or interrupted login (e.g. the login-state machine
+	// re-logging-in an account that was already online, then racing its own re-evaluation). Retry
+	// rather than parking the account at availability=OFFLINE forever, which previously knocked ALL
+	// accounts offline in a burst and required a manual availability re-toggle. A genuinely
+	// unreachable account just times out again on the next (backed-off) retry.
+	bool noRetry = false;
 	std::string* data_ptr = reinterpret_cast<std::string*> (data);
 	std::string accountKey = *data_ptr;
 	delete data_ptr;
@@ -1153,6 +2640,13 @@ gboolean connectTimeoutCallback(gpointer data)
 		MojLogWarning(IMServiceApp::s_log,
 				_T("WARNING: got to connectTimeoutCallback without an account in the pending list. Must have abandoned login earlier."));
 		noRetry = false;
+		// deviceConnectionClosed parks the PurpleAccount in s_offlineAccountData rather than
+		// destroying it (it is kept for reuse on the next login), so recover it from there.
+		// Without this, account stays NULL all the way down to the loginResult call below, which
+		// dereferences account->username -- a NULL deref that took the whole transport down
+		// whenever a connect timeout fired for a login WiFi had already caused us to abandon.
+		if (s_offlineAccountData.count(accountKey))
+			account = s_offlineAccountData[accountKey];
 	}
 	else {
 		account = s_pendingAccountData[accountKey];
@@ -1166,6 +2660,27 @@ gboolean connectTimeoutCallback(gpointer data)
 	s_pendingAccountData.erase(accountKey);
 	s_ipAddressesBoundTo.erase(accountKey);
 
+	// webOS create-after-confirm: a disposable QR-preview login timed out (the user
+	// never scanned / approved). Report expiry on the AuthChannel so the UI offers a
+	// refresh; do NOT route through the login-state machine (no webOS account exists).
+	if (s_qrPreviewKeys.count(accountKey))
+	{
+		s_qrPreviewKeys.erase(accountKey);
+		if (account && s_authChannel)
+		{
+			std::string const& svc = getServiceNameFromPurpleAccount(account);
+			s_authChannel->setChallengeState(svc.c_str(), account->username, AuthChannel::StateExpired, "QR code expired");
+		}
+		// Tear the timed-out preview down so it is not left persisted + enabled in accounts.xml
+		// (it would auto-log-in on every boot otherwise -- see account_login_failed_cb).
+		if (account)
+		{
+			cancelBuddyResync(accountKey);
+			schedulePreviewAccountDelete(account);
+		}
+		return FALSE;
+	}
+
 	if (s_loginState)
 	{
 		std::string const& serviceName = getServiceNameFromPurpleAccount(account);
@@ -1173,7 +2688,10 @@ gboolean connectTimeoutCallback(gpointer data)
 		// TODO - should noRetry be false here in other cases?
 		// Can't really tell - we will get here if the proper sa security certificate is not installed, which is a permanent failure.
 		// libpurple just does not reliably call the login failed callback in all cases...this is not the same as a connection timeout.
-		s_loginState->loginResult(serviceName.c_str(), account->username, LoginCallbackInterface::LOGIN_TIMEOUT, false, ERROR_NETWORK_ERROR, noRetry);
+		// account can still be NULL here if the abandoned login left nothing in s_offlineAccountData
+		// either; getServiceNameFromPurpleAccount and getWebosUsername both handle that (empty
+		// string), so loginResult still runs and resets the db8 watch instead of crashing.
+		s_loginState->loginResult(serviceName.c_str(), getWebosUsername(account ? account->username : NULL, serviceName).c_str(), LoginCallbackInterface::LOGIN_TIMEOUT, false, ERROR_NETWORK_ERROR, noRetry);
 	}
 	else
 	{
@@ -1202,13 +2720,19 @@ static GHashTable* getClientInfo(void)
 
 static void initializeLibpurple()
 {
-	signal(SIGCHLD, SIG_IGN);
+	if (signal(SIGCHLD, SIG_IGN) == SIG_ERR) {
+		MojLogError(IMServiceApp::s_log, _T("initializeLibpurple: signal(SIGCHLD, SIG_IGN) failed"));
+	}
 
 	/* Set a custom user directory (optional) */
 	purple_util_set_user_dir(CUSTOM_USER_DIRECTORY);
 
-	/* We do not want any debugging for now to keep the noise to a minimum. */
-	purple_debug_set_enabled(TRUE);
+	/* libpurple prpl debug (prpl_debug_misc: tdlib "Displaying message", HTTP request tracing,
+	 * "Incoming update", ...) is a huge, continuous drain on this RESIDENT daemon - it fills
+	 * /media/internal/imstdout.log at tens of MB/hour. It is NOT gated by the PmLog level, so
+	 * gate it here: OFF by default, ON only when IM_PURPLE_DEBUG is set in the environment
+	 * (see /var/imdaemon.sh). Flip it on when actively debugging a specific connector. */
+	purple_debug_set_enabled(getenv("IM_PURPLE_DEBUG") != NULL);
 
 	/* Set the core-uiops, which is used to
 	 * 	- initialize the ui specific preferences.
@@ -1227,6 +2751,19 @@ static void initializeLibpurple()
 		abort();
 	}
 
+	// Register the webOS cross-prpl reaction signals NOW, before any account connects, so a prpl that
+	// reconnects instantly from a saved session (whatsmeow) can connect to "webos-im-send-reaction" in
+	// its login handler without racing the (previously per-first-login) registration.
+	registerWebosReactionSignals();
+
+	/* webOS: /var is a small partition (~62MB). libpurple's per-conversation logging duplicates
+	 * what db8 already stores and grows unbounded under /var/preferences/com.palm.purple/transport/logs.
+	 * Disable it (and system logging) so nothing accumulates there. Must be set after purple_core_init
+	 * so the logging subsystem's prefs exist. */
+	purple_prefs_set_bool("/purple/logging/log_ims", FALSE);
+	purple_prefs_set_bool("/purple/logging/log_chats", FALSE);
+	purple_prefs_set_bool("/purple/logging/log_system", FALSE);
+
 	/* Create and load the buddylist. */
 	purple_set_blist(purple_blist_new());
 	purple_blist_load();
@@ -1239,6 +2776,177 @@ static void initializeLibpurple()
 /*
  * End of libpurple initialization methods
  */
+
+/*
+ * webOS: purple_account_set_string(account, "webosAccountId", ...) alone is NOT a reliable way to
+ * make this stamp survive a transport restart. libpurple's own accounts.xml persistence for it is
+ * DEBOUNCED internally (a timer, not immediate) - there's no public purple_accounts_sync()/
+ * schedule_save() in this libpurple build to force it (checked messaging/libpurple/include/
+ * libpurple/account.h: schedule_save is a UI-ops callback we don't implement, not something we can
+ * call). Confirmed live: a transport restart shortly after adopting a QR-paired account (see the
+ * three purple_account_set_string(..., "webosAccountId", ...) call sites in login()) lost the
+ * unsaved stamp - deleteAccountByWebosId then found no matching PurpleAccount at all on the
+ * subsequent remove, silently skipping BOTH the live account teardown (accounts.xml/buddy list/
+ * stored token) AND the db8 chat/contact purge, and leaving the underlying prpl session file
+ * (e.g. presage's <phone>.db3, keyed by username not accountId) in place to confuse the next
+ * re-add with stale session state - exactly the "still not logging in properly after remove +
+ * re-add" symptom this was built to fix. Write our own tiny, synchronous mapping file the instant
+ * we stamp the account, independent of libpurple's save timing, as a reliable fallback source of
+ * truth for accountId -> username/serviceName.
+ */
+static std::string webosIdMapDir()
+{
+	return std::string(purple_user_dir()) + "/webos-account-ids";
+}
+
+static std::string webosIdMapPath(const char* accountId)
+{
+	return webosIdMapDir() + "/" + accountId;
+}
+
+// stampWebosAccountId <account> <accountId> <serviceName>
+// Call this instead of a bare purple_account_set_string(account, "webosAccountId", accountId) at
+// every adoption site - keeps the XML tag (fast path, used when the save DID land) and the
+// fallback file (survives even if it didn't) in sync.
+static void stampWebosAccountId(PurpleAccount* account, const char* accountId, const char* serviceName)
+{
+	if (account == NULL || accountId == NULL || *accountId == '\0')
+		return;
+	purple_account_set_string(account, "webosAccountId", accountId);
+	g_mkdir_with_parents(webosIdMapDir().c_str(), 0700);
+	FILE* f = fopen(webosIdMapPath(accountId).c_str(), "w");
+	if (f != NULL)
+	{
+		fprintf(f, "%s\n%s\n", account->username ? account->username : "", serviceName ? serviceName : "");
+		fclose(f);
+	}
+}
+
+// Reads back a stampWebosAccountId() fallback file. Returns false (and clears both out params) if
+// no file exists.
+static bool readWebosIdMap(const char* accountId, std::string* outUsername, std::string* outServiceName)
+{
+	FILE* f = fopen(webosIdMapPath(accountId).c_str(), "r");
+	if (f == NULL)
+		return false;
+	char userBuf[256] = {0}, svcBuf[256] = {0};
+	char* r1 = fgets(userBuf, sizeof(userBuf), f);
+	char* r2 = fgets(svcBuf, sizeof(svcBuf), f);
+	fclose(f);
+	if (r1 == NULL || r2 == NULL)
+		return false;
+	size_t n;
+	if ((n = strlen(userBuf)) > 0 && userBuf[n - 1] == '\n') userBuf[n - 1] = '\0';
+	if ((n = strlen(svcBuf)) > 0 && svcBuf[n - 1] == '\n') svcBuf[n - 1] = '\0';
+	if (outUsername != NULL) outUsername->assign(userBuf);
+	if (outServiceName != NULL) outServiceName->assign(svcBuf);
+	return true;
+}
+
+/*
+ * webOS Teams port: called from IMServiceHandler::onDelete when a webOS account is
+ * removed. Finds the persisted PurpleAccount tagged with this webOS accountId and
+ * deletes it, so accounts.xml, the buddy list (blist.xml) and the stored OAuth
+ * refresh_token are all removed for a genuinely clean re-add. Returns true if an
+ * account was found and deleted.
+ */
+bool LibpurpleAdapter::deleteAccountByWebosId(const char* accountId, std::string* outUsername, std::string* outServiceName)
+{
+	if (accountId == NULL || *accountId == '\0')
+		return false;
+
+	/* Ensure accounts.xml is loaded so the persisted account is enumerable even if
+	 * the transport was just activated for this delete (idempotent — guarded init). */
+	if (!s_libpurpleInitialized)
+	{
+		initializeLibpurple();
+	}
+
+	for (GList* l = purple_accounts_get_all(); l != NULL; l = l->next)
+	{
+		PurpleAccount* account = (PurpleAccount*)l->data;
+		const char* aid = purple_account_get_string(account, "webosAccountId", NULL);
+		if (aid != NULL && strcmp(aid, accountId) == 0)
+		{
+			/* Capture username + serviceName BEFORE deleting so the caller can purge
+			 * this account's db8 chat records (keyed by username/serviceName). */
+			if (outUsername != NULL && account->username != NULL)
+				outUsername->assign(account->username);
+			if (outServiceName != NULL)
+			{
+				// special-case-aware inverse map so the db8 purge (keyed by serviceName)
+				// finds WhatsApp/Signal chat records too (type_whatsapp / type_signal),
+				// not the bogus type_hehoe-* a bare "prpl-"->"type_" strip would produce.
+				outServiceName->assign(getServiceNameFromPrplProtocolId(account->protocol_id));
+			}
+			MojLogInfo(IMServiceApp::s_log, _T("LibpurpleAdapter::deleteAccountByWebosId removing persisted account for %s"), accountId);
+			purple_accounts_delete(account);
+			unlink(webosIdMapPath(accountId).c_str());
+			return true;
+		}
+	}
+
+	// webOS: no PurpleAccount carries this tag (either never adopted, or - confirmed live - the
+	// accounts.xml save that would have persisted the stamp hadn't landed before a transport
+	// restart lost it). Fall back to our own immediately-written mapping file so the caller can
+	// still resolve username/serviceName to purge db8 data. If that also resolves a LIVE
+	// PurpleAccount by username+serviceName (untagged, but otherwise the same account), delete it
+	// too - the whole point is not to leave a stale session (accounts.xml entry + prpl-specific
+	// session file, e.g. presage's <phone>.db3) behind to confuse a fresh re-add.
+	std::string fbUsername, fbServiceName;
+	if (readWebosIdMap(accountId, &fbUsername, &fbServiceName))
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("LibpurpleAdapter::deleteAccountByWebosId: no live-tagged account for %s, resolved via fallback map (username=%s serviceName=%s)"),
+			accountId, fbUsername.c_str(), fbServiceName.c_str());
+		if (outUsername != NULL) *outUsername = fbUsername;
+		if (outServiceName != NULL) *outServiceName = fbServiceName;
+		if (!fbUsername.empty() && !fbServiceName.empty())
+		{
+			std::string protocolId = getPrplProtocolIdFromServiceName(fbServiceName);
+			PurpleAccount* untaggedAccount = purple_accounts_find(fbUsername.c_str(), protocolId.c_str());
+			if (untaggedAccount != NULL)
+			{
+				MojLogInfo(IMServiceApp::s_log, _T("LibpurpleAdapter::deleteAccountByWebosId: found the matching untagged PurpleAccount for %s via fallback map - removing it too"), accountId);
+				purple_accounts_delete(untaggedAccount);
+			}
+		}
+		unlink(webosIdMapPath(accountId).c_str());
+		return true;
+	}
+
+	MojLogInfo(IMServiceApp::s_log, _T("LibpurpleAdapter::deleteAccountByWebosId no persisted account for %s"), accountId);
+	return false;
+}
+
+/*
+ * Same webosAccountId lookup as deleteAccountByWebosId above, but read-only. Used by the CONTACTS
+ * "sync" LS2 method (IMServiceHandler::sync) to resolve which live account to re-sync contacts for.
+ */
+bool LibpurpleAdapter::findAccountByWebosId(const char* accountId, std::string* outUsername, std::string* outServiceName)
+{
+	if (accountId == NULL || *accountId == '\0')
+		return false;
+
+	if (!s_libpurpleInitialized)
+	{
+		initializeLibpurple();
+	}
+
+	for (GList* l = purple_accounts_get_all(); l != NULL; l = l->next)
+	{
+		PurpleAccount* account = (PurpleAccount*)l->data;
+		const char* aid = purple_account_get_string(account, "webosAccountId", NULL);
+		if (aid != NULL && strcmp(aid, accountId) == 0)
+		{
+			if (outUsername != NULL && account->username != NULL)
+				outUsername->assign(account->username);
+			if (outServiceName != NULL)
+				outServiceName->assign(getServiceNameFromPrplProtocolId(account->protocol_id));
+			return true;
+		}
+	}
+	return false;
+}
 
 /*
  * Service methods
@@ -1298,11 +3006,53 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 		 * We're either already logged in to this account or we're already in the process of logging in to this account
 		 * (i.e. it's pending; waiting for server response)
 		 */
+		/* ADOPTION (must run BEFORE the interface check below, which would otherwise
+		 * disconnect + rebind a mismatched-IP account -> crash whatsmeow): the account may
+		 * already be online because it was paired via a QR-preview login we kept alive (see
+		 * account_logged_in_cb). If it has no webOS accountId yet, THIS login() call is the
+		 * account's creation -- adopt the live paired session: stamp the webosAccountId (so
+		 * onDelete can find it + it is no longer an untagged orphan), bind it to the current
+		 * interface, and report login success. Reuses the paired connection with no disconnect
+		 * and no second login. */
+		if (accountIsAlreadyOnline)
+		{
+			const char* existingWebosId = purple_account_get_string(alreadyActiveAccount, "webosAccountId", NULL);
+			if ((existingWebosId == NULL || *existingWebosId == '\0') && !params.accountId.empty())
+			{
+				stampWebosAccountId(alreadyActiveAccount, params.accountId.data(), params.serviceName.data());
+				if (alreadyActiveAccount->ui_data == NULL)
+				{
+					AccountMetaData* amd = new AccountMetaData;
+					amd->account_key = accountKey;
+					amd->servicename = params.serviceName.data();
+					alreadyActiveAccount->ui_data = (void*)amd;
+				}
+				s_ipAddressesBoundTo[accountKey] = params.localIpAddress.data();
+				MojLogInfo(IMServiceApp::s_log, _T("LibpurpleAdapter::login: adopted already-paired preview account %s"), accountKey.c_str());
+				/* Report success under the webOS-side username (params.username, e.g. the bare
+				 * WhatsApp digits) -- NOT alreadyActiveAccount->username, which whatsmeow has
+				 * rewritten to the JID form; the imloginstate record is keyed on the former. */
+				if (loginState)
+					((LoginCallbackInterface*)loginState)->loginResult(params.serviceName.data(), params.username.data(),
+					    LoginCallbackInterface::LOGIN_SUCCESS, false, ERROR_NO_ERROR, true);
+				return OK;
+			}
+		}
 		std::string const& accountBoundToIpAddress = s_ipAddressesBoundTo[accountKey];
-		if (params.localIpAddress.data() == accountBoundToIpAddress)
+		// Only force a logout+relogin when we have a NEW, non-empty local IP that GENUINELY differs from
+		// the one this account is bound to. A wake-from-sleep or connection-manager blip can deliver an
+		// empty/stale localIpAddress; treating that as an interface change tore every account down and
+		// parked them all offline (availability OFFLINE), and the repeated churn never cleanly reconnected.
+		// If the incoming IP is unknown (empty) or the account was never bound to one, keep the existing
+		// connection - a genuinely dead socket is caught by libpurple's own SIGNED_OFF handling, which
+		// re-drives login through IMLoginState.
+		bool ipReallyChanged = !params.localIpAddress.empty()
+				&& !accountBoundToIpAddress.empty()
+				&& params.localIpAddress.data() != accountBoundToIpAddress;
+		if (!ipReallyChanged)
 		{
 			/*
-			 * We're using the right interface for this account
+			 * We're using the right interface for this account (or the local IP is unknown - don't churn)
 			 */
 			if (accountIsAlreadyPending)
 			{
@@ -1321,7 +3071,8 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 			 * We're not using the right interface. Close the current connection for this account and create a new one
 			 */
 			MojLogError(IMServiceApp::s_log,
-					_T("LibpurpleAdapter::login: We have to logout and login again since the local IP address has changed. Logging out from account."));
+					_T("LibpurpleAdapter::login: We have to logout and login again since the local IP address has changed (bound=%s, new=%s). Logging out from account."),
+					accountBoundToIpAddress.c_str(), params.localIpAddress.data());
 			/*
 			 * Once the current connection is closed we don't want to let mojo know that the account was disconnected.
 			 * Since mojo went down and came back up it didn't know that the account was connected anyways.
@@ -1386,11 +3137,38 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 		{
 			/* Create the account */
     		std::string prplProtocolId = getPrplProtocolIdFromServiceName(params.serviceName.data());
-			account = Util::createPurpleAccount(params.username.data(), prplProtocolId.c_str(), params.config);
+
+			/* WhatsApp's webOS username is +E.164 (for display); whatsmeow requires the JID as the
+			 * purple account username (getPurpleUsername). Every other service passes through verbatim. */
+			std::string const purpleUsername = getPurpleUsername(params.username.data(), params.serviceName.data());
+
+			/* webOS Teams port: persist the PurpleAccount in accounts.xml so the rotated
+			 * OAuth refresh_token (the prpl stores it as the account password) and the
+			 * buddy list survive transport restarts natively — no out-of-band token files.
+			 * Reuse the persisted account across restarts; only create+add a fresh one. */
+			account = purple_accounts_find(purpleUsername.c_str(), prplProtocolId.c_str());
 			if (!account)
 			{
-				MojLogError(IMServiceApp::s_log, _T("LibpurpleAdapter::login failed to create new Purple account"));
-				return FAILED;
+				/* A prpl that can't be resolved (plugin missing / failed g_module_open, or dlclosed for
+				 * lacking g_module_make_resident) makes createPurpleAccount->getProtocolInfo THROW. If we
+				 * let that propagate it hits std::terminate and CRASH-LOOPS the WHOLE transport (every
+				 * account, not just this one). Catch it and fail only THIS account's login. */
+				try
+				{
+					account = Util::createPurpleAccount(purpleUsername.c_str(), prplProtocolId.c_str(), params.config);
+				}
+				catch (const Util::MojoException& e)
+				{
+					MojLogError(IMServiceApp::s_log, _T("LibpurpleAdapter::login: createPurpleAccount threw for prpl '%s' (service %s): %s - failing this account's login only"),
+						prplProtocolId.c_str(), params.serviceName.data(), e.what().c_str());
+					return FAILED;
+				}
+				if (!account)
+				{
+					MojLogError(IMServiceApp::s_log, _T("LibpurpleAdapter::login failed to create new Purple account"));
+					return FAILED;
+				}
+				purple_accounts_add(account);
 			}
 
             // TODO: If the account did exist before we get a leak here,
@@ -1402,11 +3180,104 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 			amd->servicename = params.serviceName.data();
 
 			account->ui_data = (void*)amd;
+
+			/* Record the webOS accountId as a persisted account setting so onDelete
+			 * can find and remove exactly this account later (accounts.xml survives
+			 * restarts; the in-memory ui_data does not - see stampWebosAccountId's
+			 * comment for why the XML tag alone isn't reliable either). */
+			if (!params.accountId.empty())
+				stampWebosAccountId(account, params.accountId.data(), params.serviceName.data());
+		}
+
+		// webOS receive attachments: make image-capable prpls auto-download incoming files to a
+		// persistent, WebKit-readable location (/media/internal) and surface them as a file:// URL in
+		// the conversation body, which the Messaging app renders inline (same path as remote image
+		// URLs). These are plain prpl account options - no plugin rebuild. gowhatsapp's "xfer" image
+		// mode emits ONLY the file:// URL (its inline imgstore copy is suppressed); presage emits the
+		// URL plus a redundant inline imgstore copy that incoming_message_cb drops. Set every login so
+		// accounts persisted before this feature also pick it up.
+		{
+			std::string svc = params.serviceName.data();
+			std::string attachDir;
+			if (svc == "type_whatsapp")
+				attachDir = "/media/internal/.im-attachments/whatsapp";
+			else if (svc == "type_signal")
+				attachDir = "/media/internal/.im-attachments/signal";
+			else if (svc == "type_gometa")
+				// Facebook (E2EE) runs on the SAME combined gowhatsapp plugin as WhatsApp, so incoming
+				// media needs the same auto-download template. Without it the template is the empty
+				// default, so gowhatsapp_handle_attachment falls through to download_via_xfer_mechanism
+				// (an interactive purple_xfer that never auto-completes on webOS) instead of
+				// download_to_templated_destination -- FB images/video/docs decrypt + "queue download"
+				// but no file is ever written and nothing renders. (WhatsApp worked only because it was
+				// in this list.)
+				attachDir = "/media/internal/.im-attachments/facebook";
+			if (!attachDir.empty())
+			{
+				purple_build_dir(attachDir.c_str(), 0755);
+				// $hash is a per-image content hash, $extension includes the leading dot -> unique,
+				// stable filenames; re-receiving the same image just overwrites in place.
+				std::string tmpl = attachDir + "/$hash$extension";
+				purple_account_set_string(account, "attachment-path-template", tmpl.c_str());
+				if (svc == "type_whatsapp" || svc == "type_gometa")
+					purple_account_set_string(account, "handle-images", "xfer");
+			}
 		}
 
 		MojLogInfo(IMServiceApp::s_log, _T("Logging in..."));
 
-		purple_account_set_password(account, params.password.data());
+		/* Don't clobber a persisted refresh_token (stored as the password by the prpl
+		 * on a previous successful login) with the initial webOS credential. Set the
+		 * password from the webOS credential only when the account has none yet — first
+		 * login, or after an invalid_grant cleared it — so steady-state logins take the
+		 * silent-refresh path instead of restarting the device-code flow every time. */
+		{
+			const char* existingPw = purple_account_get_password(account);
+			if (existingPw == NULL || *existingPw == '\0')
+			{
+				purple_account_set_password(account, params.password.data());
+			}
+		}
+
+		/* webOS: let credential-caching prpls skip re-auth on reconnect. purple-facebook only takes
+		 * its saved-token path (fb_login: fb_data_load && remember_password) when this flag is set;
+		 * without it, every login re-runs email+password auth and re-triggers the 2FA challenge. The
+		 * token/cid/mid are already persisted in accounts.xml (fb_data_save after a successful login),
+		 * so honoring remember_password here makes subsequent reconnects silent. Benign for prpls that
+		 * ignore the flag. */
+		purple_account_set_remember_password(account, TRUE);
+	}
+
+	// webOS: the prpl account may ALREADY be connected. libpurple auto-logs-in accounts persisted in
+	// accounts.xml (auto-login=1) at startup, frequently BEFORE the transport registered its "signed-on"
+	// handler (assignIMLoginState), so account_logged_in_cb never fired: the account is online at the
+	// prpl level but untracked here. When login() then runs (needsToLogin, after the user goes
+	// available), re-enabling an already-connected account does NOT re-emit signed-on -- so without this
+	// it would stay untracked forever: availability never resets to ONLINE, getFullBuddyList never runs,
+	// and callbacks see an empty serviceName (the JID then leaks into contacts + incoming messages).
+	// Adopt the live connection instead: ensure ui_data, register it online, and report LOGIN_SUCCESS so
+	// the login-state machine advances to GETTING_BUDDIES. A freshly-created account is NOT yet connected
+	// here, so it correctly falls through to the normal connect path below.
+	if (result == OK && account != NULL && purple_account_is_connected(account) &&
+	    s_onlineAccountData.count(accountKey) == 0)
+	{
+		if (account->ui_data == NULL)
+		{
+			AccountMetaData* amd = new AccountMetaData;
+			amd->account_key = accountKey;
+			amd->servicename = params.serviceName.data();
+			account->ui_data = (void*)amd;
+		}
+		if (!params.accountId.empty())
+			stampWebosAccountId(account, params.accountId.data(), params.serviceName.data());
+		s_onlineAccountData[accountKey] = account;
+		s_pendingAccountData.erase(accountKey);
+		s_ipAddressesBoundTo[accountKey] = params.localIpAddress.data();
+		MojLogInfo(IMServiceApp::s_log, _T("LibpurpleAdapter::login: adopting already-connected account %s (auto-login raced the signed-on handler)"), accountKey.c_str());
+		if (loginState)
+			((LoginCallbackInterface*)loginState)->loginResult(params.serviceName.data(), params.username.data(),
+			    LoginCallbackInterface::LOGIN_SUCCESS, false, ERROR_NO_ERROR, true);
+		return OK;
 	}
 
 	if (result == OK)
@@ -1432,7 +3303,29 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
          *      delete the string-ptr on removal. Need to implement our own
          *      EventUiOps that handle this.
          */
-        guint timerHandle = purple_timeout_add_seconds(CONNECT_TIMEOUT_SECONDS, connectTimeoutCallback, new std::string(accountKey));
+        /* Discord logs in via an interactive QR / remote-auth flow that waits on the
+         * user's phone; use the longer grace period so we don't tear the account down
+         * mid-handshake. Telegram is likewise interactive: the user must type the login
+         * code AND (if enabled) a 2FA password into the "Telegram" auth chat, which
+         * easily exceeds the normal 45s. Facebook (E2EE, prpl-gometa) is likewise
+         * interactive when the account has two-factor enabled: messagix selects the
+         * "Notification on another device" (approve-from-another-device) method and then
+         * polls, waiting for the user to approve the login on their phone — which easily
+         * exceeds 45s. Give all these the longer grace period; otherwise the 45s connect
+         * timeout fires mid-approval, force-disconnects the healthy login (the in-flight
+         * poll then fails with "context canceled") and the account manager records it as
+         * AcctMgr_Bad_Authentication — i.e. the user sees "wrong username and password"
+         * even though the credentials were fine. Other protocols keep the normal timeout.
+         * (Note: the retired plain purple-facebook was "prpl-facebook"; the current E2EE
+         * plugin registers as "prpl-gometa".) */
+        const char* protoId = purple_account_get_protocol_id(account);
+        bool interactiveAuth = (protoId != NULL &&
+                                (strcmp(protoId, "prpl-discord") == 0 ||
+                                 strcmp(protoId, "prpl-telegram") == 0 ||
+                                 strcmp(protoId, "prpl-gometa") == 0 ||
+                                 strcmp(protoId, "prpl-hehoe-presage") == 0));
+        guint connectTimeout = interactiveAuth ? QR_CONNECT_TIMEOUT_SECONDS : CONNECT_TIMEOUT_SECONDS;
+        guint timerHandle = purple_timeout_add_seconds(connectTimeout, connectTimeoutCallback, new std::string(accountKey));
         s_accountLoginTimers[accountKey] = timerHandle;
 
 		PurpleStatusPrimitive prim = getPurpleAvailabilityFromPalmAvailability(params.availability);
@@ -1463,9 +3356,20 @@ bool LibpurpleAdapter::logout(const char* serviceName, const char* username, Log
 
 	std::string const& accountKey = getAccountKey(username, serviceName);
 
-	// Remove the accountId since a logout could be from the user removing the account
-	s_AccountIdsData.erase(accountKey);
-
+	// s_AccountIdsData is intentionally NOT erased here. purple_account_disconnect() below is
+	// async - libpurple keeps delivering signals (buddy-status-changed, etc.) against the still-
+	// live PurpleAccount/buddy list for a bit after this call returns, and erasing the mapping
+	// eagerly opened a window where every one of those in-flight signals hit
+	// "accountId not found in table" (buddy_status_changed_cb et al). Harmless individually, but
+	// under a mass simultaneous relogin (many accounts disconnecting/reconnecting at once) this
+	// produced a huge burst of them - real, evidenced case CAPTURED 2026-08-05: a Signal account's
+	// full ~59-buddy presence re-sync landed mid-teardown-race and logged 50+ of these in under a
+	// second, coinciding with a transport crash-loop and the device hard-rebooting shortly after.
+	// account_signed_off_cb() (this file) now does the erase once libpurple confirms the account
+	// has actually finished disconnecting, closing the window instead of pre-opening it. A logout()
+	// on an already-disconnected/never-connected account (success=FALSE below) leaves the mapping
+	// in place, which is harmless - there's no live PurpleAccount left to emit signals from, and a
+	// future login() for the same key overwrites the entry rather than requiring a prior erase.
 	PurpleAccount* accountTologoutFrom = 0;
 
 	if (s_onlineAccountData.count(accountKey))
@@ -1884,6 +3788,150 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::declineBuddy(const char* serviceN
 	return SENT;
 }
 
+// webOS Telegram port: drop astral-plane characters (Unicode > U+FFFF: emoji, flags, rare CJK-ext) from
+// a display name, keeping ALL Basic-Multilingual-Plane text - Latin, Cyrillic, Greek, Thai, CJK, BMP
+// symbols - which the webOS WebKit renders fine via the fallback-font slots. WebKit's font fallback is
+// UTF-16/BMP-oriented and shows astral codepoints as the replacement glyph (U+FFFD), no matter what
+// emoji font is installed, so we strip those rather than leave a row of "?" glyphs. Whitespace left
+// where an emoji was removed is collapsed, and the result is trimmed.
+static std::string stripAstral(const char* in)
+{
+	std::string out;
+	if (in == NULL)
+		return out;
+	bool prevSpace = false;
+	const unsigned char* p = (const unsigned char*)in;
+	while (*p)
+	{
+		unsigned char c = *p;
+		int len = 1;
+		if (c >= 0xF0)      len = 4;   // 4-byte UTF-8 == U+10000.. (astral) -> drop
+		else if (c >= 0xE0) len = 3;   // 3-byte BMP (Thai, CJK, symbols like U+26A1)
+		else if (c >= 0xC0) len = 2;   // 2-byte BMP (Latin-ext, Cyrillic, Greek, Arabic, Hebrew)
+		for (int i = 1; i < len; ++i)  // guard against a truncated trailing sequence
+			if ((p[i] & 0xC0) != 0x80) { len = 1; break; }
+
+		if (len == 4)
+		{
+			p += 4;
+			continue;
+		}
+		bool isSpace = (len == 1 && (c == ' ' || c == '\t'));
+		if (isSpace)
+		{
+			if (!out.empty() && !prevSpace)
+				out.push_back(' ');
+			prevSpace = true;
+		}
+		else
+		{
+			out.append((const char*)p, len);
+			prevSpace = false;
+		}
+		p += len;
+	}
+	while (!out.empty() && out[out.size() - 1] == ' ')
+		out.erase(out.size() - 1);
+	return out;
+}
+
+// webOS Telegram port: true if a buddy display name (alias) is effectively empty (NULL/""/whitespace).
+// tdlib gives deleted Telegram accounts no name, so they arrive as nameless buddies whose contact then
+// shows the raw "id<number>" - skip those entirely.
+static bool isBlankName(const char* s)
+{
+	if (s == NULL)
+		return true;
+	for (const char* p = s; *p; ++p)
+		if (*p != ' ' && *p != '\t')
+			return false;
+	return true;
+}
+
+// True if a WhatsApp buddy string is just a raw id (no human push-name): the part before '@' is
+// only digits/phone punctuation. A real push-name ("Alan", "Vladushka") has a letter there.
+// true if s is a bare Signal ACI UUID like "1594a976-5256-4fc6-b855-d23232cc5579" (8-4-4-4-12 hex).
+static bool isSignalUuid(const char* s)
+{
+	if (s == NULL)
+		return false;
+	std::string u(s);
+	if (u.size() != 36)
+		return false;
+	for (size_t i = 0; i < 36; ++i)
+	{
+		char c = u[i];
+		if (i == 8 || i == 13 || i == 18 || i == 23)
+		{
+			if (c != '-') return false;
+		}
+		else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+			return false;
+	}
+	return true;
+}
+
+static bool isWhatsAppRawId(const char* s)
+{
+	if (s == NULL || *s == '\0')
+		return true;
+	std::string u(s);
+	size_t at = u.find('@');
+	std::string local = (at == std::string::npos) ? u : u.substr(0, at);
+	if (local.empty())
+		return true;
+	for (size_t i = 0; i < local.size(); ++i)
+	{
+		char c = local[i];
+		if (!((c >= '0' && c <= '9') || c == '+' || c == '.' || c == ':' || c == '-'))
+			return false; // a letter/other -> real push-name
+	}
+	return true;
+}
+
+// Human-friendly display name for a WhatsApp buddy: prefer a real push-name; otherwise format the
+// phone JID "<digits>@s.whatsapp.net" as "+<digits>". Never emit the raw "<id>@s.whatsapp.net" /
+// "<id>@lid" (a "@lid" is an opaque LinkedID with no phone -> fall back to its bare id).
+static std::string whatsAppDisplayName(const char* alias, const char* username)
+{
+	if (!isWhatsAppRawId(alias))
+		return alias;
+	std::string u = username ? username : "";
+	size_t at = u.find('@');
+	std::string local = (at == std::string::npos) ? u : u.substr(0, at);
+	std::string suffix = (at == std::string::npos) ? std::string() : u.substr(at);
+	if (!local.empty() && local[0] == '+')
+		local.erase(0, 1);
+	if (suffix == "@s.whatsapp.net" && !local.empty())
+		return "+" + local;
+	// "@lid" (LinkedID) or any other non-phone JID: no phone number is available and the local part
+	// is an opaque identifier. Never surface that raw id to the user -- WhatsApp normally supplies a
+	// push-name (used above when alias is non-raw); when even that is missing, show a generic label.
+	return "WhatsApp user";
+}
+
+// If a WhatsApp buddy id is a phone-number JID ("<digits>@s.whatsapp.net"), return the bare digits so
+// the contact record can carry a +E.164 phoneNumber (BuddyListConsolidator prepends the "+"). That
+// lets the contacts linker MERGE the buddy into the device contact that already has that number,
+// instead of creating a duplicate JID-only contact -- and the linked contact then shows its real name.
+// Returns "" for opaque "@lid" ids, group ids, or any id whose local part isn't purely digits (e.g. a
+// ":NN" device suffix), where no phone number can be trusted.
+static std::string whatsAppPhoneFromJid(const char* username)
+{
+	std::string u = username ? username : "";
+	static const std::string waSuffix = "@s.whatsapp.net";
+	if (u.size() <= waSuffix.size() ||
+	    u.compare(u.size() - waSuffix.size(), waSuffix.size(), waSuffix) != 0)
+		return "";
+	std::string local = u.substr(0, u.size() - waSuffix.size());
+	if (local.empty())
+		return "";
+	for (std::string::size_type i = 0; i < local.size(); ++i)
+		if (local[i] < '0' || local[i] > '9')
+			return "";
+	return local;
+}
+
 bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* username)
 {
 	MojLogInfo(IMServiceApp::s_log, "%s called.", __FUNCTION__);
@@ -1919,8 +3967,14 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 		MojObject buddyListObj;
 		if (!buddyList)
 		{
-			MojLogError(IMServiceApp::s_log, _T("getFullBuddyList: WARNING: the buddy list was NULL, returning empty buddy list."));
-			s_loginState->buddyListResult(serviceName, username, buddyListObj, true);
+			// webOS resilience: an ONLINE account with ZERO buddies almost always means the protocol
+			// (tdlib) has not finished loading its contact/chat list yet - or couldn't (e.g. /var full).
+			// Reporting an empty full list here would make the BuddyListConsolidator DELETE every
+			// existing contact (this wiped all Telegram contacts when tdlib couldn't load). Treat it as
+			// "not ready": return false so getBuddyLists cleans up WITHOUT deleting anything. The
+			// debounced buddy-added resync runs the real sync once buddies actually load.
+			MojLogWarning(IMServiceApp::s_log, _T("getFullBuddyList: 0 buddies for online account %s - skipping sync to avoid wiping contacts"), serviceName);
+			return FALSE;
 		}
 
 		GSList* buddyIterator = NULL;
@@ -1935,7 +3989,64 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 			buddyObj.clear(MojObject::TypeArray);
 			buddyToBeAdded = (PurpleBuddy*)buddyIterator->data;
 
-			buddyObj.putString("username", buddyToBeAdded->name);
+			// webOS: resolve the buddy's display name as local alias, else SERVER alias. tdlib-purple
+			// (Telegram) writes the local ->alias, but purple-facebook only ever calls
+			// purple_buddy_set_server_alias(), so reading ->alias directly left every Facebook buddy
+			// nameless -> skipped here -> absent from Contacts. purple_buddy_get_alias_only() returns
+			// the local alias, else the server alias, or NULL if neither is set (it does NOT fall back
+			// to the numeric username), which is exactly the "is this buddy nameless?" test we want.
+			const char* resolvedAlias = purple_buddy_get_alias_only(buddyToBeAdded);
+
+			// WhatsApp buddies always get a readable name (push-name, else a formatted "+<phone>")
+			// -- never skipped and never shown as the raw "<id>@s.whatsapp.net" / "<id>@lid".
+			bool isWhatsApp = (serviceName != NULL && strcmp(serviceName, "type_whatsapp") == 0);
+			bool isSignal = (serviceName != NULL && strcmp(serviceName, "type_signal") == 0);
+			bool isGometa = (serviceName != NULL && strcmp(serviceName, "type_gometa") == 0);
+			std::string waName;
+			if (isWhatsApp)
+			{
+				waName = whatsAppDisplayName(resolvedAlias, buddyToBeAdded->name);
+				// Carry the buddy's phone number (bare digits; BuddyListConsolidator adds "+") so the
+				// contacts linker merges this buddy into the existing device contact with that number
+				// instead of creating a JID-only duplicate. Empty for "@lid" / group ids -> no merge.
+				std::string waPhone = whatsAppPhoneFromJid(buddyToBeAdded->name);
+				if (!waPhone.empty())
+					buddyObj.putString("phoneNumber", waPhone.c_str());
+			}
+			// webOS Signal: never DROP a Signal contact for being nameless. On a linked (secondary)
+			// device purple-presage often has no synced address-book name, so the buddy arrives with
+			// an empty alias; skipping it here (like the tdlib path below) hid real contacts that were
+			// actively messaging (e.g. +31611745571 / Alan). Keep it and fall back to the username
+			// (a "+<phone>" or UUID) in the displayName block below. presage's profile-name sync
+			// upgrades this to a real name when one becomes available.
+			else if (isSignal)
+			{
+				// intentionally not skipped; displayName falls back to the username below
+			}
+			// webOS Telegram port: skip deleted/nameless users. tdlib gives them no name, so the
+			// contact would otherwise show a raw "id<number>". Not reporting them here also makes the
+			// BuddyListConsolidator delete any such contacts left from a previous (pre-filter) sync.
+			else if (isBlankName(resolvedAlias) && !isGometa)
+			{
+				// tdlib gives DELETED Telegram users no name -> skip them (they'd show as "id<number>").
+				// But a nameless FACEBOOK (gometa) buddy is NOT deleted -- purple-facebook only sets the
+				// SERVER alias, which lags on reconnect, so the buddy legitimately arrives nameless. Skipping
+				// it drops it from the roster, which then makes BuddyListConsolidator DELETE its contact ->
+				// it comes back unlinked (744870190 no longer merged into the Alan Morford person). So keep
+				// gometa buddies: they fall through with no displayName (formatForDB keeps remoteId+ims; the
+				// merge preserves any existing good name, see hasChanges), and the name fills in when the
+				// server alias syncs.
+				MojLogInfo(IMServiceApp::s_log, _T("getFullBuddyList: skipping nameless buddy %s (deleted user?)"), buddyToBeAdded->name);
+				continue;
+			}
+
+			// Store the buddy's webOS-facing address: for WhatsApp the raw whatsmeow phone JID
+			// ("<digits>@s.whatsapp.net") becomes "+<digits>", so the contact's ims.value + remoteId (and
+			// the conversation "to") read as "+31638307067" instead of the JID, matching the +E.164 the
+			// incoming-message from.addr now uses. Opaque "@lid"/group ids pass through unchanged. The
+			// display name (waName, above) and phone-merge were already derived from the raw JID.
+			std::string const buddyWebosName = getWebosUsername(buddyToBeAdded->name, serviceName, purple_buddy_get_account(buddyToBeAdded));
+			buddyObj.putString("username", buddyWebosName.c_str());
 			buddyObj.putString("serviceName", serviceName);
 
 			group = purple_buddy_get_group(buddyToBeAdded);
@@ -1950,9 +4061,27 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 			int availability = getPalmAvailabilityFromPurpleAvailability(newStatusPrimitive);
 			buddyObj.putInt("availability", availability);
 
-			if (buddyToBeAdded->alias != NULL)
+			if (isWhatsApp)
 			{
-				buddyObj.putString("displayName", buddyToBeAdded->alias);
+				std::string cleanName = stripAstral(waName.c_str());
+				buddyObj.putString("displayName", cleanName.empty() ? waName.c_str() : cleanName.c_str());
+			}
+			else if (resolvedAlias != NULL)
+			{
+				// webOS Telegram port: strip only astral emoji/flags (unrenderable on this WebKit), keep
+				// all BMP text (Thai/Cyrillic/CJK/Latin) which renders via the fallback-font slots. If the
+				// name was entirely astral it strips to empty - keep the original then, so we never fall
+				// back to a raw "id<number>".
+				std::string cleanName = stripAstral(resolvedAlias);
+				buddyObj.putString("displayName", cleanName.empty() ? resolvedAlias : cleanName.c_str());
+			}
+			else if (isSignal)
+			{
+				// nameless Signal buddy (kept above): show its username -- a "+<phone>" or UUID -- so
+				// the contact still appears (by number) instead of vanishing from Contacts.
+				const char* u = buddyToBeAdded->name ? buddyToBeAdded->name : "";
+				std::string cleanName = stripAstral(u);
+				buddyObj.putString("displayName", cleanName.empty() ? u : cleanName.c_str());
 			}
 
 			PurpleBuddyIcon* icon = purple_buddy_get_icon(buddyToBeAdded);
@@ -1972,6 +4101,22 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 			if (customMessage != NULL)
 			{
 				buddyObj.putString("status", customMessage);
+			}
+
+			// webOS Telegram port: extra profile info the prpl (tdlib-purple) stashed on the buddy node
+			// (keys must match BuddyOptions in purple-info.h). Forwarded so BuddyListConsolidator can
+			// enrich the db8 contact with phone / @username / structured name instead of only an id.
+			{
+				PurpleBlistNode* bnode = (PurpleBlistNode*)buddyToBeAdded;
+				const char* bPhone = purple_blist_node_get_string(bnode, "tdlib-phone");
+				const char* bUser  = purple_blist_node_get_string(bnode, "tdlib-username");
+				const char* bFirst = purple_blist_node_get_string(bnode, "tdlib-first-name");
+				const char* bLast  = purple_blist_node_get_string(bnode, "tdlib-last-name");
+				if (bPhone && *bPhone) buddyObj.putString("phoneNumber", bPhone);
+				if (bUser  && *bUser)  buddyObj.putString("handle", bUser);   // @username
+				// Strip astral emoji from the structured name (renders as the header) - keep BMP text.
+				if (bFirst && *bFirst) { std::string s = stripAstral(bFirst); if (!s.empty()) buddyObj.putString("firstName", s.c_str()); }
+				if (bLast  && *bLast)  { std::string s = stripAstral(bLast);  if (!s.empty()) buddyObj.putString("lastName", s.c_str()); }
 			}
 
 			g_message("%s says: %s's presence: availability: '%d', custom message: '%s', avatar location: '%s', display name: '%s', group name:'%s'",
@@ -1994,7 +4139,258 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 	return success;
 }
 
-LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceName, const char* username, const char* usernameTo, const char* messageText)
+/*
+ * webOS Servers/Rooms M3: enumerate a room account's full server->channel roster from the in-memory
+ * buddy list and hand it to the service handler to upsert into db8, so every guild/team/network and
+ * its visible channels appear in the Servers tab immediately, independent of any incoming message.
+ * Works for Discord (guild->channel), Teams (team->channel) and Telegram (flat, one synthetic server);
+ * see deriveServerName. The roster is signature-compared to the previous run per account: an unchanged
+ * roster is skipped, so the frequent blist-changed triggers don't churn the (delete+recreate) db8 sync.
+ */
+// last-enumerated roster signature per account, to skip a no-op delete+recreate (churn guard).
+static std::unordered_map<std::string, std::string> s_lastServerChannelSig;
+
+bool LibpurpleAdapter::enumerateServersChannels(const char* serviceName, const char* username)
+{
+	if (!serviceName || !username || s_imServiceHandler == NULL)
+		return false;
+
+	std::string accountKey = getAccountKey(username, serviceName);
+	if (s_onlineAccountData.count(accountKey) == 0)
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("enumerateServersChannels: no online account for %s/%s"), serviceName, username);
+		return false;
+	}
+	PurpleAccount* account = s_onlineAccountData[accountKey];
+	if (account == NULL)
+		return false;
+
+	// Enumerate for any room protocol (Discord, Teams, Telegram). deriveServerName maps each chat to
+	// its server - guild/team for Discord/Teams, one synthetic network server for flat Telegram - the
+	// same mapping incoming_message_cb uses. Non-room protocols simply have no group chats in the
+	// blist, so this yields nothing and (with the empty-roster guard) is a harmless no-op.
+	// server name -> server MojObject (carrying its "channels" array). std::map keeps a stable
+	// (alphabetical) server order in the output.
+	std::map<std::string, MojObject> serverByGuild;
+	std::set<std::string> sigSet;   // order-independent roster signature ("server\x1f channelId")
+
+	for (PurpleBlistNode* node = purple_blist_get_root(); node != NULL; node = node->next)
+	{
+		if (!PURPLE_BLIST_NODE_IS_GROUP(node))
+			continue;
+		const char* groupName = purple_group_get_name((PurpleGroup*)node);
+		if (groupName == NULL || *groupName == '\0')
+			continue;
+
+		// Server + category via the shared deriveServerName (identical to incoming_message_cb):
+		// Discord/Teams -> guild/team (before ": "), category -> the remainder; Telegram -> synthetic
+		// network server (the group is ignored). Empty -> unrelated group, skip its chats.
+		std::string categoryName;
+		std::string guildName = deriveServerName(account, groupName, &categoryName);
+		if (guildName.empty())
+			continue;
+
+		int position = 0;
+		for (PurpleBlistNode* child = node->child; child != NULL; child = child->next)
+		{
+			if (!PURPLE_BLIST_NODE_IS_CHAT(child))
+				continue;
+			PurpleChat* chat = (PurpleChat*)child;
+			if (purple_chat_get_account(chat) != account)
+				continue;
+			GHashTable* comps = purple_chat_get_components(chat);
+			if (comps == NULL)
+				continue;
+			// Channel key (must equal purple_conversation_get_name so this dedups with the
+			// message-driven record): Discord/Telegram store it as "id", Teams as "chatname".
+			const char* chanId = (const char*)g_hash_table_lookup(comps, "id");
+			if (chanId == NULL || *chanId == '\0')
+				chanId = (const char*)g_hash_table_lookup(comps, "chatname");
+			// Human name: Discord exposes it as the "name" component; Teams/Telegram set it as the
+			// chat alias (returned by purple_chat_get_name).
+			const char* chanName = (const char*)g_hash_table_lookup(comps, "name");
+			if (chanName == NULL || *chanName == '\0')
+				chanName = purple_chat_get_name(chat);
+			if (chanId == NULL || *chanId == '\0')
+				continue;   // no stable key -> skip
+
+			// churn-guard signature: server + channel key (the set makes it order-independent).
+			sigSet.insert(guildName + std::string("\x1f") + chanId);
+
+			if (serverByGuild.find(guildName) == serverByGuild.end())
+			{
+				MojObject server;
+				server.putString(_T("remoteId"), guildName.c_str());
+				server.putString(_T("name"), guildName.c_str());
+				MojObject emptyChannels(MojObject::TypeArray);
+				server.put(_T("channels"), emptyChannels);
+				serverByGuild[guildName] = server;
+			}
+
+			MojObject channel;
+			channel.putString(_T("remoteId"), chanId);
+			std::string chanDisplay = cleanChannelDisplayName(chanName ? chanName : chanId);
+			if (chanDisplay.empty())
+				chanDisplay = chanId;
+			channel.putString(_T("name"), chanDisplay.c_str());
+			if (!categoryName.empty())
+				channel.putString(_T("parentId"), categoryName.c_str());
+			channel.putInt(_T("position"), position++);
+
+			MojObject& server = serverByGuild[guildName];
+			MojObject channels;
+			server.get(_T("channels"), channels);
+			channels.push(channel);
+			server.put(_T("channels"), channels);
+		}
+	}
+
+	// webOS WhatsApp Channels: followed Channels (newsletters) are stored as BUDDIES ("<id>@newsletter")
+	// under the "Whatsapp" blist group, NOT as CHAT nodes, so the group/chat walk above misses them.
+	// Emit each as a channel under a synthetic "WhatsApp Channels" server so all followed channels show
+	// on login (not only after their next post). remoteId = the newsletter JID (== purple_conversation_
+	// get_name for its IM) so it dedups with the message-driven record from incoming_message_cb.
+	if (strcmp(serviceName, "type_whatsapp") == 0)
+	{
+		static const char* kWaChannelsServer = "WhatsApp Channels";
+		std::string waServer = kWaChannelsServer;
+		int nlPosition = 0;
+		GSList* buddies = purple_find_buddies(account, NULL);
+		for (GSList* b = buddies; b != NULL; b = b->next)
+		{
+			PurpleBuddy* buddy = (PurpleBuddy*)b->data;
+			const char* bname = buddy ? purple_buddy_get_name(buddy) : NULL;
+			if (!isWhatsAppNewsletter(bname))
+				continue;
+			sigSet.insert(waServer + std::string("\x1f") + bname);
+			if (serverByGuild.find(waServer) == serverByGuild.end())
+			{
+				MojObject server;
+				server.putString(_T("remoteId"), waServer.c_str());
+				server.putString(_T("name"), waServer.c_str());
+				MojObject emptyChannels(MojObject::TypeArray);
+				server.put(_T("channels"), emptyChannels);
+				serverByGuild[waServer] = server;
+			}
+			const char* alias = purple_buddy_get_alias(buddy);
+			std::string chanDisplay = cleanChannelDisplayName((alias && *alias && !isWhatsAppNewsletter(alias)) ? alias : bname);
+			if (chanDisplay.empty())
+				chanDisplay = bname;
+			MojObject channel;
+			channel.putString(_T("remoteId"), bname);
+			channel.putString(_T("name"), chanDisplay.c_str());
+			channel.putInt(_T("position"), nlPosition++);
+			MojObject& server = serverByGuild[waServer];
+			MojObject channels;
+			server.get(_T("channels"), channels);
+			channels.push(channel);
+			server.put(_T("channels"), channels);
+		}
+		if (buddies != NULL)
+			g_slist_free(buddies);
+	}
+
+	MojObject serversObj(MojObject::TypeArray);
+	int totalChannels = 0;
+	for (std::map<std::string, MojObject>::iterator it = serverByGuild.begin(); it != serverByGuild.end(); ++it)
+	{
+		MojObject channels;
+		it->second.get(_T("channels"), channels);
+		totalChannels += (int)channels.size();
+		serversObj.push(it->second);
+	}
+
+	// SAFETY: if the blist yielded no channels (e.g. Discord guild trees not synced yet / out of sync),
+	// do NOT sync - syncServersChannels would DELETE this account's existing server/channel records and
+	// recreate nothing, wiping a working (message-driven) Servers tab. Only sync when we found a roster.
+	if (serverByGuild.empty())
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("enumerateServersChannels: %s has no channels in the blist; leaving existing records untouched"), serviceName);
+		return false;
+	}
+
+	// Churn guard: if the roster is identical to the last one synced for this account, skip the
+	// (destructive delete+recreate) db8 sync. The blist-changed trigger fires often (tdlib re-adds
+	// Telegram chats etc.); without this the same roster would be deleted and rebuilt every few
+	// seconds, flickering the Servers tab.
+	std::string sig;
+	for (std::set<std::string>::iterator sit = sigSet.begin(); sit != sigSet.end(); ++sit)
+		sig += *sit + "\n";
+	if (s_lastServerChannelSig[accountKey] == sig)
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("enumerateServersChannels: %s roster unchanged (%d channels); skipping sync"), serviceName, totalChannels);
+		return true;
+	}
+	s_lastServerChannelSig[accountKey] = sig;
+
+	MojLogInfo(IMServiceApp::s_log, _T("enumerateServersChannels: %s -> %d servers, %d channels"),
+		serviceName, (int)serverByGuild.size(), totalChannels);
+
+	s_imServiceHandler->syncServersChannels(serviceName, username, serversObj);
+	return true;
+}
+
+/*
+ * webOS Servers/Rooms M3: join a channel on demand (called when the user opens it in the Servers tab)
+ * so the prpl fetches + delivers its history. username may be NULL - the account is then resolved by
+ * serviceName (first online account of that service). Joining also lands the channel in the buddy
+ * list, so a subsequent send finds it instead of falling back to a 1:1 IM ("<snowflake> is offline").
+ */
+bool LibpurpleAdapter::openChannel(const char* serviceName, const char* username, const char* channel)
+{
+	if (!serviceName || !channel || !*channel)
+		return false;
+
+	PurpleAccount* account = NULL;
+	if (username && *username)
+	{
+		std::string accountKey = getAccountKey(username, serviceName);
+		if (s_onlineAccountData.count(accountKey))
+			account = s_onlineAccountData[accountKey];
+	}
+	if (account == NULL)
+	{
+		// resolve by serviceName: first online account of this service
+		for (std::unordered_map<std::string, PurpleAccount*>::iterator it = s_onlineAccountData.begin();
+		     it != s_onlineAccountData.end(); ++it)
+		{
+			if (getServiceNameFromPurpleAccount(it->second) == serviceName)
+			{
+				account = it->second;
+				break;
+			}
+		}
+	}
+	if (account == NULL)
+	{
+		// webOS: s_onlineAccountData can MISS an account that libpurple auto-restored at startup (or after
+		// a transport respawn) before the transport's login() adopted it -- see the adoption note in
+		// login(). Discord in particular reconnects via status-restore and is absent from the online map
+		// even though its PurpleConnection is live and pushing gateway traffic, so openChannel returned
+		// "no online account" and the channel never joined/backfilled. Fall back to the ACTUAL connected
+		// accounts (purple_connections_get_all) so a re-opened channel still resolves + joins.
+		for (GList* c = purple_connections_get_all(); c != NULL; c = c->next)
+		{
+			PurpleConnection* gc = (PurpleConnection*)c->data;
+			PurpleAccount* a = (gc != NULL) ? purple_connection_get_account(gc) : NULL;
+			if (a != NULL && getServiceNameFromPurpleAccount(a) == serviceName)
+			{
+				account = a;
+				break;
+			}
+		}
+	}
+	if (account == NULL)
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("openChannel: no online account for %s"), serviceName);
+		return false;
+	}
+
+	MojLogInfo(IMServiceApp::s_log, _T("openChannel: joining %s on %s"), channel, serviceName);
+	return joinChannelChat(account, channel) != NULL;
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceName, const char* username, const char* usernameTo, const char* messageText, const char* quotedMessageId)
 {
 	if (!serviceName || !username || !usernameTo || !messageText)
 	{
@@ -2007,14 +4403,81 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceNa
 
 	std::string accountKey = getAccountKey(username, serviceName);
 
-	if (s_onlineAccountData.count(accountKey) == 0)
+	// The Messaging app addresses WhatsApp buddies by the +E.164 ims.value we now store
+	// ("+31638307067"); whatsmeow needs the device JID. Translate back here so channel lookup and the
+	// 1:1 conversation both target the id the prpl knows. Group ("@g.us")/opaque ("@lid") ids and every
+	// other service pass through unchanged. Repoint the local so all downstream uses see the JID.
+	std::string const usernameToBuf = getPurpleUsername(usernameTo, serviceName);
+	usernameTo = usernameToBuf.c_str();
+
+	PurpleAccount* accountToSendFrom = NULL;
+	if (s_onlineAccountData.count(accountKey))
+	{
+		accountToSendFrom = s_onlineAccountData[accountKey];
+	}
+	else if (s_pendingAccountData.count(accountKey))
+	{
+		// webOS Telegram port: the account is still authenticating (e.g. tdlib is in
+		// authorizationStateWaitCode / WaitPassword). Route the outgoing message to the
+		// prpl anyway so the plugin can capture the user's reply as the login code / 2FA
+		// password (tdlib-purple's promptAuthInputViaChat -> tgprpl_send_im mechanism).
+		// Without this the code reply is rejected here and login never completes.
+		accountToSendFrom = s_pendingAccountData[accountKey];
+		MojLogInfo(IMServiceApp::s_log, _T("sendMessage: account %s still authenticating; routing message to prpl for auth-input capture"), serviceName);
+	}
+
+	if (accountToSendFrom == NULL)
 	{
 		retVal = LibpurpleAdapter::USER_NOT_LOGGED_IN;
 		MojLogError(IMServiceApp::s_log, _T("sendMessage: Trying to send from an account that is not logged in. service name %s"), serviceName);
 	}
 	else
 	{
-    	PurpleAccount* accountToSendFrom = s_onlineAccountData[accountKey];
+		// webOS Servers/Rooms M3 (outbound to channels): if the target resolves to a group channel -
+		// a blist chat, matched by its "id" component (Discord channel snowflake) or by name (IRC
+		// "#channel") - send into the CHAT conversation via serv_chat_send instead of opening a 1:1 IM.
+		// Join the chat first if it isn't already open (purple-discord's join creates the conversation
+		// synchronously via purple_serv_got_joined_chat, so the chat id is available immediately after).
+		PurpleChat* channelChat = findChatByIdComponent(accountToSendFrom, usernameTo);
+		if (channelChat == NULL)
+			channelChat = purple_blist_find_chat(accountToSendFrom, usernameTo);
+		if (channelChat != NULL)
+		{
+			PurpleConnection* gc = purple_account_get_connection(accountToSendFrom);
+			PurpleConversation* chatConv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, usernameTo, accountToSendFrom);
+			if (chatConv == NULL && gc != NULL)
+			{
+				GHashTable* components = purple_chat_get_components(channelChat);
+				if (components != NULL)
+					serv_join_chat(gc, components);
+				chatConv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, usernameTo, accountToSendFrom);
+			}
+			if (chatConv != NULL && gc != NULL)
+			{
+				// webOS native reply: stash the reply target on the conv so the prpl chat-send reads it and
+				// sets a real reply_to (cleared by the prpl after use). Mirror of the incoming stash.
+				if (quotedMessageId && *quotedMessageId)
+					purple_conversation_set_data(chatConv, "webos-reply-to", g_strdup(quotedMessageId));
+				char* chatMsg = g_strcompress(messageText);
+				int cerr = serv_chat_send(gc, purple_conv_chat_get_id(purple_conversation_get_chat_data(chatConv)),
+						chatMsg, (PurpleMessageFlags)0);
+				free(chatMsg);
+				if (cerr < 0)
+				{
+					retVal = LibpurpleAdapter::SEND_FAILED;
+					MojLogError(IMServiceApp::s_log, _T("sendMessage: serv_chat_send returned err %d for channel %s"), cerr, usernameTo);
+				}
+				else
+					MojLogInfo(IMServiceApp::s_log, _T("sendMessage: sent to channel %s"), usernameTo);
+			}
+			else
+			{
+				retVal = LibpurpleAdapter::SEND_FAILED;
+				MojLogError(IMServiceApp::s_log, _T("sendMessage: could not open chat conversation for channel %s"), usernameTo);
+			}
+			return retVal;
+		}
+
 		PurpleConversation* purpleConversation = purple_conversation_new(PURPLE_CONV_TYPE_IM, accountToSendFrom, usernameTo);
 		char* messageTextUnescaped = g_strcompress(messageText);
 
@@ -2025,6 +4488,10 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceNa
 //					gc = purple_conversation_get_gc(conv);
 //					err = serv_send_im(gc, purple_conversation_get_name(conv), sent, msgflags);
 		// we still don't seem to get an error value back there...returns 1, even for an invalid recipient
+		// webOS native reply: stash the reply target on the conv so tgprpl_send_im reads it and sets a
+		// real reply_to on the tdlib sendMessage (the prpl clears it after use). No-op for non-replies.
+		if (quotedMessageId && *quotedMessageId)
+			purple_conversation_set_data(purpleConversation, "webos-reply-to", g_strdup(quotedMessageId));
 		int err = serv_send_im(purple_conversation_get_gc(purpleConversation), purple_conversation_get_name(purpleConversation), messageTextUnescaped, (PurpleMessageFlags)0);
 		if (err < 0) {
 			retVal = LibpurpleAdapter::SEND_FAILED;
@@ -2033,6 +4500,255 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceNa
 
 		free(messageTextUnescaped);
 	}
+
+	return retVal;
+}
+
+/*
+ * webOS reactions (SEND): the user reacted (or removed a reaction) to a message from the TouchPad.
+ * Resolve the owning account and emit "webos-im-send-reaction" so the owning prpl transmits it over
+ * its backend. targetServiceMessageId is the prpl's own id for the reacted-to message (the same id we
+ * stored as serviceMessageId when it arrived); remove=true removes my `emoji` reaction, else adds it
+ * (emoji is always supplied so backends can remove a specific reaction); usernameTo is the peer/chat.
+ */
+LibpurpleAdapter::SendResult LibpurpleAdapter::sendReaction(const char* serviceName, const char* username, const char* usernameTo, const char* targetServiceMessageId, const char* emoji, bool remove, const char* targetSender)
+{
+	if (!serviceName || !username || !usernameTo || !targetServiceMessageId || *targetServiceMessageId == '\0')
+	{
+		MojLogError(IMServiceApp::s_log, _T("sendReaction: Invalid parameter."));
+		return LibpurpleAdapter::INVALID_PARAMS;
+	}
+
+	std::string accountKey = getAccountKey(username, serviceName);
+	std::string const usernameToBuf = getPurpleUsername(usernameTo, serviceName);
+
+	PurpleAccount* account = NULL;
+	if (s_onlineAccountData.count(accountKey))
+		account = s_onlineAccountData[accountKey];
+
+	if (account == NULL)
+	{
+		MojLogError(IMServiceApp::s_log, _T("sendReaction: account not logged in. service %s"), serviceName);
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	}
+
+	MojLogInfo(IMServiceApp::s_log, _T("sendReaction: %s emoji '%s' on message %s (%s)"),
+			remove ? _T("remove") : _T("add"), emoji ? emoji : "", targetServiceMessageId, serviceName);
+
+	// The app stores/sends the emoji as &#NNNNN; entities (raw astral emoji get mangled through db8);
+	// decode to real UTF-8 in-process so the prpl backend gets a usable emoji (supplied for removes too).
+	char *decodedEmoji = NULL;
+	if (emoji && *emoji) {
+		decodedEmoji = (char*) malloc(strlen(emoji) + 1);
+		if (decodedEmoji) { decode_html_entities_utf8(decodedEmoji, emoji); }
+	}
+
+	// webOS reactions (SEND) db8 fallback: stash the reacted-to message's original sender on the account
+	// right before the (synchronous) emit, so a backend that needs it - whatsmeow, to set FromMe /
+	// Participant on BuildReaction - can read it back in its signal handler even when its in-memory
+	// message cache has no entry for the target (transport restart/crash, or a message older than the
+	// cache). Delivered out-of-band (not a new signal param) so the shared 5-arg signal - and the 5
+	// other prpls connected to it - stay untouched. The handler clears it after reading.
+	purple_account_set_string(account, "webos-reaction-target-sender", targetSender ? targetSender : "");
+
+	purple_signal_emit(purple_conversations_get_handle(), "webos-im-send-reaction",
+			account, targetServiceMessageId, decodedEmoji ? decodedEmoji : "", usernameToBuf.c_str(),
+			remove ? "1" : "0");
+
+	if (decodedEmoji) { free(decodedEmoji); }
+	return LibpurpleAdapter::SENT;
+}
+
+/*
+ * webOS polls (SEND): vote on a poll the user received. Mirrors sendReaction's account resolution.
+ * optionNamesJoined is the FULL current selection, "\x1f"-separated ("" clears the vote). Resolve
+ * the owning account and emit "webos-im-send-poll-vote" so the owning prpl (WhatsApp) transmits it.
+ */
+LibpurpleAdapter::SendResult LibpurpleAdapter::sendPollVote(const char* serviceName, const char* username, const char* usernameTo, const char* pollMessageId, const char* optionNamesJoined, const char* senderJid)
+{
+	if (!serviceName || !username || !usernameTo || !pollMessageId || *pollMessageId == '\0')
+	{
+		MojLogError(IMServiceApp::s_log, _T("sendPollVote: Invalid parameter."));
+		return LibpurpleAdapter::INVALID_PARAMS;
+	}
+
+	std::string accountKey = getAccountKey(username, serviceName);
+	std::string const usernameToBuf = getPurpleUsername(usernameTo, serviceName);
+
+	PurpleAccount* account = NULL;
+	if (s_onlineAccountData.count(accountKey))
+		account = s_onlineAccountData[accountKey];
+
+	if (account == NULL)
+	{
+		MojLogError(IMServiceApp::s_log, _T("sendPollVote: account not logged in. service %s"), serviceName);
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	}
+
+	MojLogInfo(IMServiceApp::s_log, _T("sendPollVote: poll %s options '%s' (%s)"),
+			pollMessageId, optionNamesJoined ? optionNamesJoined : "", serviceName);
+
+	// db8 fallback (same pattern as sendReaction's targetSender): stash the poll's original sender on
+	// the account right before the (synchronous) emit, so whatsmeow can build+encrypt the vote even
+	// when its in-memory message cache has no entry for the poll (transport restart / very old poll).
+	// Delivered out-of-band, not a new signal param, so the shared 4-arg signal stays untouched.
+	purple_account_set_string(account, "webos-pollvote-sender", senderJid ? senderJid : "");
+
+	purple_signal_emit(purple_conversations_get_handle(), "webos-im-send-poll-vote",
+			account, usernameToBuf.c_str(), pollMessageId, optionNamesJoined ? optionNamesJoined : "");
+
+	return LibpurpleAdapter::SENT;
+}
+
+/*
+ * webOS attachment send. Mirrors sendMessage's account resolution + channel detection, but instead of
+ * serv_send_im / serv_chat_send it hands the local file to libpurple's file-transfer path:
+ *   - group channel target -> serv_chat_send_file(gc, chatId, path)  (gated by chat_can_receive_file)
+ *   - 1:1 IM target        -> serv_send_file(gc, who, path)
+ * Every prpl in this build implements send_file with the headless-friendly contract: a non-NULL
+ * filename means the xfer is already accepted (purple_xfer_request_accepted), so no UI dialog is
+ * needed. filePath must be an absolute path that EXISTS and is READABLE in the transport process
+ * (e.g. /media/internal/...); a URL or a path only valid in the app sandbox will fail.
+ */
+LibpurpleAdapter::SendResult LibpurpleAdapter::sendFile(const char* serviceName, const char* username, const char* usernameTo, const char* filePath, const char* dbId)
+{
+	if (!serviceName || !username || !usernameTo || !filePath || !filePath[0])
+	{
+		MojLogError(IMServiceApp::s_log, _T("sendFile: Invalid parameter. Please double check the passed parameters."));
+		return LibpurpleAdapter::INVALID_PARAMS;
+	}
+
+	MojLogInfo(IMServiceApp::s_log, _T("%s called."), __FUNCTION__);
+
+	// The prpl back-end reads the file from disk itself, so the path has to resolve in THIS process.
+	if (!g_file_test(filePath, G_FILE_TEST_EXISTS) || !g_file_test(filePath, G_FILE_TEST_IS_REGULAR))
+	{
+		MojLogError(IMServiceApp::s_log, _T("sendFile: file does not exist or is not a regular file: %s"), filePath);
+		return LibpurpleAdapter::SEND_FAILED;
+	}
+
+	// webOS voice messages: a recorded voice note arrives as a WAV (the native MediaCaptureV3 output;
+	// the file picker is image-only, so a .wav here is always our recorder). Transcode it to Ogg/Opus
+	// so the prpl sends it as a proper voice note (PTT) instead of a raw WAV document - Opus is the
+	// voice-note format for WhatsApp/Telegram/Discord/FB-E2EE. The .ogg is written next to the WAV and
+	// used for the rest of sendFile; `transcoded` must outlive the function so filePath stays valid.
+	std::string transcoded;
+	{
+		size_t plen = strlen(filePath);
+		if (plen > 4 && g_ascii_strcasecmp(filePath + plen - 4, ".wav") == 0)
+		{
+			transcoded.assign(filePath, plen - 4);
+			transcoded += ".ogg";
+			if (wav_to_opus_voicenote(filePath, transcoded.c_str(), 6.0f))
+			{
+				MojLogInfo(IMServiceApp::s_log, _T("sendFile: voice note transcoded %s -> %s"), filePath, transcoded.c_str());
+				filePath = transcoded.c_str();
+			}
+			else
+			{
+				MojLogError(IMServiceApp::s_log, _T("sendFile: voice-note transcode failed for %s; sending as-is"), filePath);
+			}
+		}
+	}
+
+	std::string accountKey = getAccountKey(username, serviceName);
+
+	// Same +E.164 -> device-JID translation as sendMessage (see there); WhatsApp attachments address
+	// the buddy by "+<phone>". No-op for group/@lid ids and other services.
+	std::string const usernameToBuf = getPurpleUsername(usernameTo, serviceName);
+	usernameTo = usernameToBuf.c_str();
+
+	PurpleAccount* accountToSendFrom = NULL;
+	if (s_onlineAccountData.count(accountKey))
+	{
+		accountToSendFrom = s_onlineAccountData[accountKey];
+	}
+	else if (s_pendingAccountData.count(accountKey))
+	{
+		accountToSendFrom = s_pendingAccountData[accountKey];
+	}
+
+	if (accountToSendFrom == NULL)
+	{
+		MojLogError(IMServiceApp::s_log, _T("sendFile: Trying to send from an account that is not logged in. service name %s"), serviceName);
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	}
+
+	PurpleConnection* gc = purple_account_get_connection(accountToSendFrom);
+	if (gc == NULL)
+	{
+		MojLogError(IMServiceApp::s_log, _T("sendFile: no active connection for service %s"), serviceName);
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	}
+
+	LibpurpleAdapter::SendResult retVal = LibpurpleAdapter::SENT;
+
+	// Servers/Rooms: if the target resolves to a group channel (blist chat, matched by its id
+	// component or by name), route the file into the CHAT via serv_chat_send_file. Join first if the
+	// conversation isn't open yet (same pattern as sendMessage's channel branch).
+	PurpleChat* channelChat = findChatByIdComponent(accountToSendFrom, usernameTo);
+	if (channelChat == NULL)
+		channelChat = purple_blist_find_chat(accountToSendFrom, usernameTo);
+	if (channelChat != NULL)
+	{
+		PurpleConversation* chatConv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, usernameTo, accountToSendFrom);
+		if (chatConv == NULL)
+		{
+			GHashTable* components = purple_chat_get_components(channelChat);
+			if (components != NULL)
+				serv_join_chat(gc, components);
+			chatConv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, usernameTo, accountToSendFrom);
+		}
+
+		if (chatConv == NULL)
+		{
+			MojLogError(IMServiceApp::s_log, _T("sendFile: could not open chat conversation for channel %s"), usernameTo);
+			return LibpurpleAdapter::SEND_FAILED;
+		}
+
+		int chatId = purple_conv_chat_get_id(purple_conversation_get_chat_data(chatConv));
+
+		// Only attempt the chat file-send if the prpl advertises it (Discord/Telegram/Teams do;
+		// a prpl without chat_send_file would otherwise no-op or crash).
+		PurplePlugin* prpl = purple_connection_get_prpl(gc);
+		PurplePluginProtocolInfo* prpl_info = prpl ? PURPLE_PLUGIN_PROTOCOL_INFO(prpl) : NULL;
+		if (prpl_info == NULL || prpl_info->chat_send_file == NULL)
+		{
+			MojLogError(IMServiceApp::s_log, _T("sendFile: prpl for %s does not support chat file transfer"), serviceName);
+			return LibpurpleAdapter::SEND_FAILED;
+		}
+		if (prpl_info->chat_can_receive_file != NULL && !prpl_info->chat_can_receive_file(gc, chatId))
+		{
+			MojLogError(IMServiceApp::s_log, _T("sendFile: chat %s cannot receive files"), usernameTo);
+			return LibpurpleAdapter::SEND_FAILED;
+		}
+
+		// webOS: track this transfer by its local filename so a later failure can downgrade the Outbox
+		// row (keyed to xfer->local_filename == filePath). See xfer_send_cancel_cb.
+		if (dbId != NULL && *dbId != '\0')
+			s_pendingAttachmentSends[filePath] = dbId;
+		serv_chat_send_file(gc, chatId, filePath);
+		MojLogInfo(IMServiceApp::s_log, _T("sendFile: initiated chat file transfer to channel %s: %s"), usernameTo, filePath);
+		return retVal;
+	}
+
+	// 1:1 IM file transfer. serv_send_file dispatches to prpl->send_file; with a non-NULL path our
+	// prpls accept the xfer immediately without a UI prompt. Guard on send_file so a prpl without it
+	// fails cleanly here instead of falling into libpurple's generic (UI-driven) xfer path.
+	{
+		PurplePlugin* prpl = purple_connection_get_prpl(gc);
+		PurplePluginProtocolInfo* prpl_info = prpl ? PURPLE_PLUGIN_PROTOCOL_INFO(prpl) : NULL;
+		if (prpl_info == NULL || prpl_info->send_file == NULL)
+		{
+			MojLogError(IMServiceApp::s_log, _T("sendFile: prpl for %s does not support file transfer"), serviceName);
+			return LibpurpleAdapter::SEND_FAILED;
+		}
+	}
+	// webOS: track this transfer by its local filename so a later failure can downgrade the Outbox row.
+	if (dbId != NULL && *dbId != '\0')
+		s_pendingAttachmentSends[filePath] = dbId;
+	serv_send_file(gc, usernameTo, filePath);
+	MojLogInfo(IMServiceApp::s_log, _T("sendFile: initiated file transfer to %s: %s"), usernameTo, filePath);
 
 	return retVal;
 }
@@ -2065,8 +4781,6 @@ bool LibpurpleAdapter::deviceConnectionClosed(bool all, const char* ipAddress)
 
 		if (all == true || (accountBoundToIpAddress != "" && ipAddress == accountBoundToIpAddress))
 		{
-			bool accountWasLoggedIn = FALSE;
-
 			PurpleAccount* account;
 
 			if (s_onlineAccountData.count(accountKey) == 0)
@@ -2084,7 +4798,6 @@ bool LibpurpleAdapter::deviceConnectionClosed(bool all, const char* ipAddress)
 			else
 			{
 				account = s_onlineAccountData[accountKey];
-				accountWasLoggedIn = TRUE;
 				MojLogInfo(IMServiceApp::s_log, _T("Logging out"));
 			}
 
@@ -2122,6 +4835,113 @@ bool LibpurpleAdapter::deviceConnectionClosed(bool all, const char* ipAddress)
 	return TRUE;
 }
 
+// Register + connect the webOS cross-prpl reaction signals ONCE. Called from initializeLibpurple
+// (right after purple_core_init, BEFORE any prpl logs in) so a prpl that reconnects instantly from a
+// saved session (e.g. whatsmeow) can connect to "webos-im-send-reaction" in its login handler without
+// racing this registration. Previously this lived in assignIMLoginState, which runs per-account and
+// fired ~40s AFTER the combined WhatsApp/Facebook plugin had already tried (and failed) to connect,
+// silently dropping every WhatsApp/Facebook reaction. Idempotent via s_reactionSignalRegistered.
+static void registerWebosReactionSignals()
+{
+	static bool s_reactionSignalRegistered = false;
+	if (s_reactionSignalRegistered)
+		return;
+	s_reactionSignalRegistered = true;
+
+	static int webosHandle = 0x1AD6;
+	void* convHandle = purple_conversations_get_handle();
+
+	// RECV per-sender merge (WhatsApp/Facebook/Signal): (account, targetServiceMessageId, emoji, sender).
+	purple_signal_register(convHandle, "webos-im-reaction",
+			purple_marshal_VOID__POINTER_POINTER_POINTER_POINTER, NULL, 4,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+	purple_signal_connect(convHandle, "webos-im-reaction", &webosHandle,
+			PURPLE_CALLBACK(im_reaction_cb), NULL);
+
+	// RECV aggregated REPLACE (Telegram): (account, targetServiceMessageId, serialized, NULL).
+	purple_signal_register(convHandle, "webos-im-reaction-set",
+			purple_marshal_VOID__POINTER_POINTER_POINTER_POINTER, NULL, 4,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+	purple_signal_connect(convHandle, "webos-im-reaction-set", &webosHandle,
+			PURPLE_CALLBACK(im_reaction_set_cb), NULL);
+
+	// react-to-own-sent: a prpl emits (account, serviceMessageId, text) once it learns an app-sent
+	// message's network id; OutboxIdHandler attaches it to the Outbox row.
+	purple_signal_register(convHandle, "webos-im-outbox-id",
+			purple_marshal_VOID__POINTER_POINTER_POINTER, NULL, 3,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+	purple_signal_connect(convHandle, "webos-im-outbox-id", &webosHandle,
+			PURPLE_CALLBACK(im_outbox_id_cb), NULL);
+
+	// message edit-in-place (WhatsApp): a prpl emits (account, serviceMessageId, newText) when the sender
+	// edits a previously-sent message; EditHandler merges the new text onto the stored bubble.
+	purple_signal_register(convHandle, "webos-im-edit",
+			purple_marshal_VOID__POINTER_POINTER_POINTER, NULL, 3,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+	purple_signal_connect(convHandle, "webos-im-edit", &webosHandle,
+			PURPLE_CALLBACK(im_edit_cb), NULL);
+
+	// "delete for everyone" (WhatsApp): a prpl emits (account, serviceMessageId) when the sender
+	// revokes a previously-sent message; DeleteHandler replaces the stored bubble's text in place.
+	purple_signal_register(convHandle, "webos-im-delete",
+			purple_marshal_VOID__POINTER_POINTER, NULL, 2,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING));
+	purple_signal_connect(convHandle, "webos-im-delete", &webosHandle,
+			PURPLE_CALLBACK(im_delete_cb), NULL);
+
+	// delivery/read receipts BY-ID (WhatsApp/Signal): (account, serviceMessageId, status).
+	purple_signal_register(convHandle, "webos-im-receipt",
+			purple_marshal_VOID__POINTER_POINTER_POINTER, NULL, 3,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+	purple_signal_connect(convHandle, "webos-im-receipt", &webosHandle,
+			PURPLE_CALLBACK(im_receipt_cb), NULL);
+
+	// delivery/read receipts WATERMARK (Telegram/Facebook/Teams): (account, scope, watermark, status).
+	purple_signal_register(convHandle, "webos-im-receipt-hwm",
+			purple_marshal_VOID__POINTER_POINTER_POINTER_POINTER, NULL, 4,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+	purple_signal_connect(convHandle, "webos-im-receipt-hwm", &webosHandle,
+			PURPLE_CALLBACK(im_receipt_hwm_cb), NULL);
+
+	// SEND: prpls CONNECT to this to transmit a reaction the user placed (account, targetServiceMessageId,
+	// emoji, peer, removeFlag "1"=remove). Emitted by LibpurpleAdapter::sendReaction; owning prpl handles it.
+	purple_signal_register(convHandle, "webos-im-send-reaction",
+			purple_marshal_VOID__POINTER_POINTER_POINTER_POINTER_POINTER, NULL, 5,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+
+	// SEND: prpls CONNECT to this to transmit a poll vote (account, peer, pollMessageId,
+	// optionNamesJoined - "\x1f"-separated, "" = clear vote). Emitted by LibpurpleAdapter::sendPollVote;
+	// only WhatsApp connects (gometa/Facebook has no polls).
+	purple_signal_register(convHandle, "webos-im-send-poll-vote",
+			purple_marshal_VOID__POINTER_POINTER_POINTER_POINTER, NULL, 4,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+
+	MojLogInfo(IMServiceApp::s_log, _T("registered webos-im-reaction + webos-im-reaction-set + webos-im-outbox-id + webos-im-send-reaction + webos-im-send-poll-vote signals (early)"));
+}
+
 void LibpurpleAdapter::assignIMLoginState(LoginCallbackInterface* loginState)
 {
 	MojLogInfo(IMServiceApp::s_log, _T("%s called."), __FUNCTION__);
@@ -2153,6 +4973,12 @@ void LibpurpleAdapter::assignIMLoginState(LoginCallbackInterface* loginState)
 	{
 		MojLogInfo(IMServiceApp::s_log, _T("Connecting new signals."));
 		s_registeredForAccountSignals = TRUE;
+
+		// webOS cross-prpl reaction signals are registered early in initializeLibpurple (before any prpl
+		// logs in) via registerWebosReactionSignals(). This call is an idempotent fallback so the signals
+		// still exist even on a path where initializeLibpurple's registration didn't run.
+		registerWebosReactionSignals();
+
 		/*
 		 * Listen for a number of different signals:
 		 */
@@ -2180,6 +5006,291 @@ void LibpurpleAdapter::assignIMServiceHandler(IMServiceCallbackInterface* imServ
 	s_imServiceHandler = imServiceHandler;
 }
 
+void LibpurpleAdapter::assignAuthChannel(AuthChannel* authChannel)
+{
+	MojLogInfo(IMServiceApp::s_log, _T("%s called."), __FUNCTION__);
+	s_authChannel = authChannel;
+}
+
+/* QR-preview token poll. prpl-discord persists the obtained token on the account
+ * (purple_account_set_string "token") the instant remote-auth completes -- BEFORE it
+ * opens the main gateway and starts syncing. We poll for that token rather than wait on
+ * the "signed-on" signal (which did not fire reliably for the disposable preview account,
+ * and which only fires AFTER a full gateway sync -> a flood of messages into a webOS
+ * account that doesn't exist yet). On finding it: hand it to the UI as the confirmed
+ * credential and tear the preview down (disconnect) so nothing syncs. */
+struct QRPollCtx {
+	std::string accountKey;
+	std::string serviceName;
+	std::string username;
+	PurpleAccount* account;
+	int elapsed;
+};
+
+static gboolean qrTokenPollCallback(gpointer data)
+{
+	QRPollCtx* ctx = (QRPollCtx*)data;
+
+	// Preview cancelled/torn down elsewhere -> stop polling.
+	if (s_qrPreviewKeys.count(ctx->accountKey) == 0)
+	{
+		delete ctx;
+		return FALSE;
+	}
+
+	// prpl-discord persists the obtained credential as the "token" account string.
+	const char* token = purple_account_get_string(ctx->account, "token", NULL);
+	// Session prpls (gowhatsapp/whatsmeow) never set "token"; they store the reconnect
+	// credential (deviceJID|registrationId) as BOTH the account password and the "credentials"
+	// account string the instant pairing completes (gowhatsapp_store_credentials) -- which is
+	// well BEFORE they signal PURPLE_CONNECTED. gowhatsapp only goes "online" (-> signed-on ->
+	// account_logged_in_cb) after a full contact sync finishes, and on a fresh QR pair that
+	// sync is huge and its end-marker often never arrives in time, so signed-on never fires and
+	// the account is never confirmed -> connectTimeout, stuck on the QR page. Polling the stored
+	// "credentials" instead confirms as soon as pairing is done, independent of that sync.
+	// "credentials" == gowhatsapp's GOWHATSAPP_CREDENTIALS_KEY (its constants.h; inlined to avoid a
+	// prpl header dependency in the transport). Non-session prpls never set it, so this is a no-op there.
+	const char* sessionCred = purple_account_get_string(ctx->account, "credentials", NULL);
+	bool haveToken = (token && *token);
+	bool haveSession = (!haveToken && sessionCred && *sessionCred);
+	if (haveToken || haveSession)
+	{
+		const char* cred = haveToken ? token : sessionCred;
+		MojLogInfo(IMServiceApp::s_log, _T("qrTokenPoll: %s credential obtained for %s -> confirm"),
+		           haveToken ? "token" : "session", ctx->accountKey.c_str());
+		if (s_authChannel)
+			s_authChannel->setConfirmed(ctx->serviceName.c_str(), ctx->username.c_str(), cred);
+
+		s_qrPreviewKeys.erase(ctx->accountKey);
+		s_pendingAccountData.erase(ctx->accountKey);
+		if (s_accountLoginTimers.count(ctx->accountKey))
+		{
+			purple_timeout_remove(s_accountLoginTimers[ctx->accountKey]);
+			s_accountLoginTimers.erase(ctx->accountKey);
+		}
+
+		if (haveToken)
+		{
+			// Discord (token-based): delete the disposable preview entirely -- disconnect it (so it
+			// never syncs) AND remove it from accounts.xml. Keeping it persisted leaves an UNTAGGED
+			// orphan (no webosAccountId) that auto-logs-in on every transport restart and floods, and
+			// that onDelete (matched on webosAccountId) can NEVER clean up. The token was handed to the
+			// UI above; the real account is created by the UI and logs in directly with it (no 2nd QR).
+			s_onlineAccountData.erase(ctx->accountKey);
+			schedulePreviewAccountDelete(ctx->account);
+		}
+		else
+		{
+			// Session prpl (whatsmeow): do NOT tear down. Disconnecting a freshly-paired whatsmeow
+			// client SIGSEGVs, and the live paired session is exactly what we want to reuse. Keep it
+			// alive and register it as an online account with no webOS accountId yet; when the UI
+			// creates the real account, its onEnabled -> LibpurpleAdapter::login() finds THIS session
+			// already online and adopts it (stamps the webosAccountId, reuses the connection -- see the
+			// adoption block in login()). Mirrors account_logged_in_cb's adoption path but fires on
+			// credential-stored rather than the unreliable signed-on signal. The preview already holds
+			// the "credentials" string in accounts.xml, so post-restart auto-login reconnects it too.
+			s_onlineAccountData[ctx->accountKey] = ctx->account;
+			if (s_ipAddressesBoundTo.count(ctx->accountKey) == 0)
+				s_ipAddressesBoundTo[ctx->accountKey] = "";
+			MojLogInfo(IMServiceApp::s_log, _T("qrTokenPoll: keeping paired preview %s alive for adoption"), ctx->accountKey.c_str());
+		}
+
+		delete ctx;
+		return FALSE;
+	}
+
+	ctx->elapsed += 1;
+	if (ctx->elapsed > (int)QR_CONNECT_TIMEOUT_SECONDS)
+	{
+		// overall timeout; connectTimeoutCallback (if still armed) reports expiry.
+		delete ctx;
+		return FALSE;
+	}
+	return TRUE;   // keep polling (~1s)
+}
+
+/*
+ * Start a disposable "QR-preview" login (create-after-confirm). This spins up a prpl
+ * account with the QRLOGIN sentinel purely so prpl-discord runs its remote-auth flow and
+ * emits the QR (surfaced via the request_fields ui-op -> AuthChannel). On sign-on the prpl
+ * has persisted the obtained Discord token on the account; account_logged_in_cb detects the
+ * QR-preview key, hands the token to the AuthChannel as the confirmed credential, and tears
+ * the preview down. The real account is then created by the UI with that token and logs in
+ * directly (no second QR). This does NOT touch the webOS login-state machine.
+ */
+LibpurpleAdapter::LoginResult LibpurpleAdapter::startQRLogin(const char* serviceName, const char* username)
+{
+	if (!serviceName || !*serviceName || !username || !*username)
+	{
+		MojLogError(IMServiceApp::s_log, _T("startQRLogin: empty serviceName/username"));
+		return FAILED;
+	}
+
+	std::string const accountKey = getAccountKey(username, serviceName);
+
+	std::string prplProtocolId = getPrplProtocolIdFromServiceName(serviceName);
+
+	/* WhatsApp's webOS username is +E.164 (for display); whatsmeow requires the JID as the purple
+	 * account username. Translate here so find/create hit the same account the prpl will pair. */
+	std::string const purpleUsername = getPurpleUsername(username, serviceName);
+
+	/* A previously-saved Discord account auto-logs-in on transport start with its stored
+	 * "token", so by the time the user opens Add-Account it is already CONNECTED (and
+	 * quietly flooding messages). prpl-discord's discord_login does a DIRECT login whenever
+	 * the "token" string is non-empty -- and re-enabling an already-connected account never
+	 * re-runs discord_login at all -- so merely clearing the token + enabling emits no QR.
+	 * The only robust way to force remote-auth is to tear any such account down completely
+	 * and start from a brand-new, tokenless account. purple_accounts_delete disconnects it
+	 * (if connected) and removes it from accounts.xml, which also kills the auto-login flood
+	 * source. The real account is (re)created by the UI after confirm with the fresh token. */
+	PurpleAccount* account = purple_accounts_find(purpleUsername.c_str(), prplProtocolId.c_str());
+	if (account)
+	{
+		if (purple_account_is_connected(account) || purple_account_is_connecting(account))
+			purple_account_disconnect(account);
+		purple_account_set_enabled(account, UI_ID, FALSE);
+		purple_accounts_delete(account);
+		account = NULL;
+	}
+	// Drop any stale in-memory session tracking so the fresh login is not mistaken for active.
+	s_onlineAccountData.erase(accountKey);
+	s_pendingAccountData.erase(accountKey);
+	s_offlineAccountData.erase(accountKey);
+
+	MojObject emptyConfig;
+	/* Same guard as login(): an unresolved prpl throws here - catch it so a QR-add of a broken/
+	 * missing plugin fails just this attempt instead of crash-looping the whole transport. */
+	try
+	{
+		account = Util::createPurpleAccount(purpleUsername.c_str(), prplProtocolId.c_str(), emptyConfig);
+	}
+	catch (const Util::MojoException& e)
+	{
+		MojLogError(IMServiceApp::s_log, _T("startQRLogin: createPurpleAccount threw for prpl '%s': %s - failing this login only"),
+			prplProtocolId.c_str(), e.what().c_str());
+		return FAILED;
+	}
+	if (!account)
+	{
+		MojLogError(IMServiceApp::s_log, _T("startQRLogin: failed to create Purple account"));
+		return FAILED;
+	}
+	purple_accounts_add(account);
+
+	AccountMetaData* amd = new AccountMetaData;
+	amd->account_key = accountKey;
+	amd->servicename = serviceName;
+	account->ui_data = (void*)amd;
+
+	/* Fresh account: no "token" string + the QRLOGIN sentinel password -> discord_login
+	 * takes the remote-auth (QR) path (see discord_login: token empty AND password=="QRLOGIN"). */
+	purple_account_set_password(account, "QRLOGIN");
+
+	s_pendingAccountData[accountKey] = account;
+	s_qrPreviewKeys.insert(accountKey);
+
+	purple_account_set_enabled(account, UI_ID, TRUE);
+
+	// Poll for the token the moment remote-auth completes (robust; independent of the
+	// signed-on signal) and tear the preview down before it syncs. See qrTokenPollCallback.
+	QRPollCtx* pollCtx = new QRPollCtx;
+	pollCtx->accountKey  = accountKey;
+	pollCtx->serviceName = serviceName;
+	pollCtx->username    = username;
+	pollCtx->account     = account;
+	pollCtx->elapsed     = 0;
+	purple_timeout_add_seconds(1, qrTokenPollCallback, pollCtx);
+
+	// QR grace-period timeout; connectTimeoutCallback special-cases QR-preview keys.
+	guint timerHandle = purple_timeout_add_seconds(QR_CONNECT_TIMEOUT_SECONDS, connectTimeoutCallback, new std::string(accountKey));
+	s_accountLoginTimers[accountKey] = timerHandle;
+
+	PurpleSavedStatus* savedStatus = purple_savedstatus_new(NULL, PURPLE_STATUS_AVAILABLE);
+	purple_savedstatus_activate_for_account(savedStatus, account);
+
+	MojLogInfo(IMServiceApp::s_log, _T("startQRLogin: pending QR login started for %s"), accountKey.c_str());
+	return OK;
+}
+
+void LibpurpleAdapter::cancelQRLogin(const char* serviceName, const char* username)
+{
+	if (!serviceName || !username)
+		return;
+	std::string const accountKey = getAccountKey(username, serviceName);
+	MojLogInfo(IMServiceApp::s_log, _T("cancelQRLogin: %s"), accountKey.c_str());
+
+	s_qrPreviewKeys.erase(accountKey);
+
+	// Discard any pending captcha request for this account (destroy the held fields).
+	if (s_pendingCaptcha.count(accountKey))
+	{
+		if (s_pendingCaptcha[accountKey].fields)
+			purple_request_fields_destroy(s_pendingCaptcha[accountKey].fields);
+		s_pendingCaptcha.erase(accountKey);
+	}
+
+	if (s_accountLoginTimers.count(accountKey))
+	{
+		purple_timeout_remove(s_accountLoginTimers[accountKey]);
+		s_accountLoginTimers.erase(accountKey);
+	}
+
+	PurpleAccount* account = NULL;
+	if (s_pendingAccountData.count(accountKey))
+		account = s_pendingAccountData[accountKey];
+	else if (s_onlineAccountData.count(accountKey))
+		account = s_onlineAccountData[accountKey];
+
+	s_pendingAccountData.erase(accountKey);
+	s_onlineAccountData.erase(accountKey);
+
+	if (account)
+		purple_account_set_enabled(account, UI_ID, FALSE);
+
+	if (s_authChannel)
+		s_authChannel->clearChallenge(serviceName, username);
+}
+
+/*
+ * Feed a UI-solved captcha response token back into the prpl's pending request_fields
+ * callback. adapter_request_fields stored the PurpleRequestFields + ok callback keyed by
+ * account when Discord raised the hCaptcha; here we set the editable "captcha_key" field
+ * to the solved token and invoke that callback, which re-POSTs remote-auth/login. The
+ * held fields are then destroyed (we own them; the prpl uses no close_request ui-op).
+ */
+bool LibpurpleAdapter::submitCaptcha(const char* serviceName, const char* username, const char* captchaKey)
+{
+	if (!serviceName || !username)
+		return false;
+	std::string const accountKey = getAccountKey(username, serviceName);
+
+	std::unordered_map<std::string, PendingCaptcha>::iterator it = s_pendingCaptcha.find(accountKey);
+	if (it == s_pendingCaptcha.end())
+	{
+		MojLogError(IMServiceApp::s_log, _T("submitCaptcha: no pending captcha request for %s"), accountKey.c_str());
+		return false;
+	}
+
+	PendingCaptcha pc = it->second;
+	s_pendingCaptcha.erase(it);   // erase before invoking (callback may raise a new captcha)
+
+	MojLogInfo(IMServiceApp::s_log, _T("submitCaptcha: completing captcha for %s (key %s)"),
+	           accountKey.c_str(), (captchaKey && *captchaKey) ? "present" : "EMPTY");
+
+	if (pc.fields)
+	{
+		PurpleRequestField* keyField = purple_request_fields_get_field(pc.fields, "captcha_key");
+		if (keyField)
+			purple_request_field_string_set_value(keyField, captchaKey ? captchaKey : "");
+
+		if (pc.okCb)
+			pc.okCb(pc.userData, pc.fields);
+
+		purple_request_fields_destroy(pc.fields);
+	}
+	return true;
+}
+
 /*
  * Value destroy function for s_AuthorizeRequests
  */
@@ -2203,11 +5314,11 @@ bool LibpurpleAdapter::allAccountsOffline()
 			return true;
 		}
 		else {
-			MojLogInfo(IMServiceApp::s_log, _T("allAccountsOffline - %d accounts still pending"), s_pendingAccountData.size());
+			MojLogInfo(IMServiceApp::s_log, _T("allAccountsOffline - %zu accounts still pending"), s_pendingAccountData.size());
 		}
 	}
 	else {
-		MojLogInfo(IMServiceApp::s_log, _T("allAccountsOffline - %d accounts still online"), s_onlineAccountData.size());
+		MojLogInfo(IMServiceApp::s_log, _T("allAccountsOffline - %zu accounts still online"), s_onlineAccountData.size());
 	}
 
 	return false;

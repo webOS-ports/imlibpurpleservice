@@ -143,11 +143,18 @@ MojErr  OnEnabledHandler::getAccountInfoResult(MojObject& payload, MojErr result
 
     if (m_enable)
     {
+#ifdef IMLIBPURPLE_LEGACY_DB8
+        // Legacy db8 (e.g. webOS 3.0.5) has no com.palm.config.libpurple:1 kind
+        // registered, so the per-account config lookup below would fail and block
+        // login. Skip it and enable directly (classic pre-config-management path).
+        err = accountEnabled();
+#else
         MojDbQuery query;
         query.from("com.palm.config.libpurple:1");
         query.where("accountId", MojDbQuery::OpEq, m_accountId);
         query.limit(1);
         err = m_dbClient.find(m_getAccountConfigSlot, query);
+#endif
     }
     else
     {

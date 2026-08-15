@@ -1,24 +1,11 @@
 LIBS := -llunaservice  -lmojoluna -lmojodb -lmojocore -lpurple -lsanitize
 LOCAL_LDFLAGS := $(LDFLAGS) $(LIBS)
 
-IM_SOURCES := \
-	BuddyListConsolidator.cpp \
-	IMMessage.cpp \
-	IMServiceHandler.cpp \
-	IMServiceApp.cpp \
-	LibpurpleAdapter.cpp \
-	IMLoginState.cpp \
-	IncomingIMHandler.cpp \
-	OutgoingIMHandler.cpp \
-	ConnectionStateHandler.cpp \
-	DisplayController.cpp \
-	SendOneMessageHandler.cpp \
-	OutgoingIMCommandHandler.cpp \
-	SendOneCommandHandler.cpp \
-	OnEnabledHandler.cpp \
-	BuddyStatusHandler.cpp
-	
 SOURCE_DIRS := src
+
+# Every translation unit under src/ — same rule as CMakeLists.txt and build.sh,
+# so a new handler only has to be dropped in src/ to land in all three builds.
+IM_SOURCES := $(notdir $(wildcard src/*.cpp))
 
 IM_TARGET := $(OBJDIR)/imlibpurpletransport
 IM_OBJECTS := $(IM_SOURCES:%.cpp=$(OBJDIR)/%.o)

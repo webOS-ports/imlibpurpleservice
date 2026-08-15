@@ -8,6 +8,10 @@
         {
             "name": "byrevision",
             "props": [{"name":"_rev"}]
+        },
+        {
+            "name": "byChannel",
+            "props": [{"name": "channelName"}, {"name": "flags.visible", "default": true}, {"name": "localTimestamp"}]
         }
     ]
 }

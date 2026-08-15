@@ -113,7 +113,27 @@ MojErr BuddyListConsolidator::consolidateContacts()
 
 		if (!contactIdsToDelete.empty())
 		{
-			m_dbClient.del(m_contactsDeleteSlot, contactIdsToDelete.arrayBegin(), contactIdsToDelete.arrayEnd());
+			// webOS: DON'T wipe contacts when the buddy roster arrived INCOMPLETE. consolidate() marks
+			// every contact whose buddy is missing from THIS snapshot for deletion, so a partial sync
+			// (roster still loading on reconnect, or buddies dropped by the nameless filter) deletes many
+			// still-valid contacts -- which come back later as FRESH records with no avatar and no person
+			// link (the recurring "avatar vanished / 744870190 not linked to Alan Morford" bug).
+			// Completeness test (count-based, not a magic delete-%): every existing IM contact was created
+			// FROM a buddy, so a COMPLETE roster reports ~as many buddies as we have contacts. Removing a
+			// few buddies remotely legitimately shrinks the roster, so allow a small shortfall (up to 10%);
+			// but if the roster reports FEWER THAN 90% of our contacts, buddies are missing wholesale -> the
+			// snapshot is incomplete (still loading on reconnect / filtered), so skip the delete pass.
+			// Adds/merges still run; a truly-removed buddy beyond the 10% is cleaned up on the next complete
+			// sync (a lingering stale contact is harmless, a wiped avatar/link is not).
+			MojSize reported = m_newBuddyList.size(), have = m_contacts.size();
+			if (reported * 10 < have * 9)
+			{
+				MojLogWarning(IMServiceApp::s_log, _T("consolidateContacts: roster INCOMPLETE (%d buddies < 90%% of %d contacts) -- SKIPPING delete of %d contacts to avoid wiping avatars/person links"), (int) reported, (int) have, (int) contactIdsToDelete.size());
+			}
+			else
+			{
+				m_dbClient.del(m_contactsDeleteSlot, contactIdsToDelete.arrayBegin(), contactIdsToDelete.arrayEnd());
+			}
 		}
 
 		if (!contactsToMerge.empty())
@@ -144,7 +164,17 @@ MojErr BuddyListConsolidator::consolidateBuddyStatus()
 
 		if (!buddyIdsToDelete.empty())
 		{
-			m_tempdbClient.del(m_buddyStatusDeleteSlot, buddyIdsToDelete.arrayBegin(), buddyIdsToDelete.arrayEnd());
+			// webOS: same count-based incomplete-roster guard as consolidateContacts -- a partial snapshot
+			// would otherwise wipe most imbuddystatus rows (they were down to ~2 on-device), losing presence.
+			MojSize reported = m_newBuddyList.size(), have = m_buddyStatus.size();
+			if (reported * 10 < have * 9)
+			{
+				MojLogWarning(IMServiceApp::s_log, _T("consolidateBuddyStatus: roster INCOMPLETE (%d buddies < 90%% of %d rows) -- SKIPPING delete of %d buddy-status rows"), (int) reported, (int) have, (int) buddyIdsToDelete.size());
+			}
+			else
+			{
+				m_tempdbClient.del(m_buddyStatusDeleteSlot, buddyIdsToDelete.arrayBegin(), buddyIdsToDelete.arrayEnd());
+			}
 		}
 
 		if (!buddiesToMerge.empty())
@@ -313,13 +343,13 @@ bool ContactConsolidationHelper::hasChanges(MojObject& oldContact, MojObject& ne
 	MojString oldDisplayName, newAvatar, newDisplayName;
 	oldContact.get("nickname", oldDisplayName, oldFound);
 	newBuddy.get("displayName", newDisplayName, newFound);
-	if (oldDisplayName != newDisplayName)
+	// webOS: only UPDATE the name when this update carries a NON-empty one. An empty newDisplayName means
+	// "this buddy-list update didn't include a name" (e.g. a Facebook buddy whose server alias hasn't
+	// synced yet on reconnect), NOT "the name was cleared". The old code overwrote the good name with ""
+	// here, blanking contacts and helping un-link 744870190 from Alan Morford (same class as the avatar
+	// bug below). Genuine name changes still carry a non-empty value.
+	if (!newDisplayName.empty() && oldDisplayName != newDisplayName)
 	{
-		if (oldDisplayName.length() > 1 && newDisplayName.empty())
-		{
-			// Needs to contain at least empty string to overwrite the existing display name
-			newDisplayName.assign("");
-		}
 		hasChanges = true;
 		diffs.put("displayName", newDisplayName);
 	}
@@ -349,27 +379,24 @@ bool ContactConsolidationHelper::hasChanges(MojObject& oldContact, MojObject& ne
 		firstPhoto = *photosItr;
 		MojString oldAvatar;
 		firstPhoto.get("localPath", oldAvatar, oldFound);
-		if (oldAvatar != newAvatar)
+		// Only UPDATE the photo when this buddy-list update carries a NEW, non-empty avatar.
+		// whatsmeow (and other prpls) deliver avatars via the buddy-icon API
+		// (presence.c -> purple_buddy_icons_set_for_user -> BuddyStatusHandler), NOT in the
+		// list-consolidation buddy data -- so an empty newAvatar here means "not included in
+		// this update", NOT "removed". The old code treated empty as removal and cleared the
+		// photo, which wiped every icon-set avatar (all WhatsApp contact photos vanished).
+		// Genuine removals arrive through the icon path. (Clearing with [{}] also failed
+		// com.palm.contact:1 schema validation and crashed the contacts.linker node.)
+		if (!newAvatar.empty() && oldAvatar != newAvatar)
 		{
 			hasChanges = true;
-			MojObject newPhotos;
-			if (oldAvatar.length() > 1 && newAvatar.empty())
-			{
-				// To remove the photo, set the photos array to contain an empty object
-				// TODO: verify with contacts guys
-				MojObject emptyObject;
-				newPhotos.push(emptyObject);
-				MojLogInfo(IMServiceApp::s_log, _T("This new contact %s has no photo. Removing path."), newDisplayName.data());
-			}
-			else
-			{
-				firstPhoto.put("localPath", newAvatar);
-				firstPhoto.put("value", newAvatar);
-				firstPhoto.putString("type", "type_square"); // AIM and GTalk generally send small, square-ish images
-				newPhotos.push(firstPhoto);
-				MojLogInfo(IMServiceApp::s_log, _T("Adding localPath %s for new contact %s."), newAvatar.data(), newDisplayName.data());
-			}
+			MojObject newPhotos(MojObject::TypeArray);
+			firstPhoto.put("localPath", newAvatar);
+			firstPhoto.put("value", newAvatar);
+			firstPhoto.putString("type", "type_square"); // AIM and GTalk generally send small, square-ish images
+			newPhotos.push(firstPhoto);
 			diffs.put("photos", newPhotos);
+			MojLogInfo(IMServiceApp::s_log, _T("Adding localPath %s for new contact %s."), newAvatar.data(), newDisplayName.data());
 		}
 	}
 
@@ -422,7 +449,8 @@ bool ContactConsolidationHelper::formatForDB(const MojString& accountId, const M
 			contact.put("remoteId", username); // using username as remote ID since we don't have anything else and this should be unique
 
 			// If the buddy has a displayName, put it in the contact's nickname property
-			if (MojErrNone == buddy.getRequired("displayName", nickname))
+			bool hasDisplayName = (MojErrNone == buddy.getRequired("displayName", nickname));
+			if (hasDisplayName)
 	        {
 				contact.put("nickname", nickname);
 	        }
@@ -432,6 +460,17 @@ bool ContactConsolidationHelper::formatForDB(const MojString& accountId, const M
 			newImObj.put("type", serviceName);
 			//newImObj.put("serviceName", serviceName);
 			newImsArray.push(newImObj);
+			// webOS Telegram port: add the @username as a second IM entry (informational + searchable)
+			// when the prpl supplied one; the id-based entry above stays the primary routing address.
+			MojString handle;
+			buddy.get("handle", handle, found);
+			if (found && !handle.empty())
+			{
+				MojObject handleImObj;
+				handleImObj.put("value", handle);
+				handleImObj.put("type", serviceName);
+				newImsArray.push(handleImObj);
+			}
 			contact.put("ims", newImsArray);
 
 			// need to add email address too for contacts linker
@@ -463,6 +502,65 @@ bool ContactConsolidationHelper::formatForDB(const MojString& accountId, const M
 				newPhotoObj.putString("type", "type_square"); // AIM and GTalk generally send small, square-ish images
 				newPhotosArray.push(newPhotoObj);
 				contact.put("photos", newPhotosArray);
+			}
+
+			// webOS Telegram port: phone number + structured name, when the prpl provided them (stashed
+			// on the buddy node). Telegram only exposes phone for mutual contacts, so it fills in for
+			// saved contacts but not most group members.
+			MojString phone;
+			buddy.get("phoneNumber", phone, found);
+			if (found && !phone.empty())
+			{
+				// webOS: Telegram phone numbers always carry the country code but arrive without the
+				// leading "+". Store canonical E.164 (with "+") so the Contacts/Phone apps recognise it.
+				MojString e164;
+				if (phone.data()[0] == '+')
+					e164.assign(phone);
+				else
+					e164.format(_T("+%s"), phone.data());
+
+				MojObject phonesArray, phoneObj;
+				phoneObj.put("value", e164);
+				phoneObj.putString("type", "type_mobile");
+				phonesArray.push(phoneObj);
+				contact.put("phoneNumbers", phonesArray);
+			}
+
+			MojString firstName, lastName;
+			buddy.get("firstName", firstName, found);
+			bool hasFirst = found && !firstName.empty();
+			buddy.get("lastName", lastName, found);
+			bool hasLast = found && !lastName.empty();
+			if (hasFirst || hasLast)
+			{
+				MojObject nameObj;
+				if (hasFirst) nameObj.put("givenName", firstName);
+				if (hasLast)  nameObj.put("familyName", lastName);
+				contact.put("name", nameObj);
+			}
+			else if (hasDisplayName && !nickname.empty())
+			{
+				// webOS: prpls like Facebook provide only a full display name (structured_name.text),
+				// not first/last. Without a "name" object the Contacts/Messaging app shows the raw IM
+				// id ("id<username>") instead of the name (nickname alone is not used for display).
+				// Split the display name on the last space so it renders properly:
+				// "Alan Morford" -> given "Alan", family "Morford"; a single token -> givenName.
+				MojObject nameObj;
+				const char* full = nickname.data();
+				const char* sp = strrchr(full, ' ');
+				if (sp != NULL && sp != full && *(sp + 1) != '\0')
+				{
+					MojString given, family;
+					given.assign(full, (MojSize)(sp - full));
+					family.assign(sp + 1);
+					nameObj.put("givenName", given);
+					nameObj.put("familyName", family);
+				}
+				else
+				{
+					nameObj.put("givenName", nickname);
+				}
+				contact.put("name", nameObj);
 			}
 
 			valid = true;

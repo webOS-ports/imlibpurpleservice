@@ -11,6 +11,10 @@
         {
             "name": "serviceAndUsername",
             "props": [{"name": "serviceName"},{"name": "username"}]
+        },
+        {
+            "name": "serviceMessageId",
+            "props": [{"name": "serviceName"},{"name": "username"},{"name": "serviceMessageId"}]
         }
     ]
 }

@@ -172,6 +172,36 @@ void IMLoginState::buddyListResult(const char* serviceName, const char* username
 }
 
 
+/*
+ * webOS Telegram port: the transport (LibpurpleAdapter::buddy_added_cb, debounced) tells us the
+ * buddy list changed after the login-time snapshot. Re-run the full buddy sync by bumping the
+ * account's imloginstate record back to GETTING_BUDDIES; the existing db-watch then re-drives
+ * getBuddyLists() -> getFullBuddyList() + consolidate, which now sees the async-loaded buddies.
+ * A short-lived handler carries the db8 merge (kept alive by its outstanding request slot).
+ */
+void IMLoginState::buddyListChanged(const char* serviceName, const char* username)
+{
+	if (serviceName == NULL || username == NULL)
+		return;
+
+	MojLogInfo(IMServiceApp::s_log, _T("buddyListChanged: scheduling buddy re-sync for %s/%s"), serviceName, username);
+
+	MojString svc;
+	svc.assign(serviceName);
+	MojString user;
+	user.assign(username);
+
+	MojRefCountedPtr<IMLoginStateHandler> handler = new IMLoginStateHandler(m_service, m_loginStateRevision, this);
+	handler->requestBuddyResync(svc, user);
+
+	// webOS Servers/Rooms M3: the buddy list has settled (this fires on a debounce after login),
+	// so refresh the guild->channel roster in db8 from it. Makes every guild + all its visible
+	// channels appear in the Servers tab immediately, independent of any incoming message.
+	// No-op for non-hierarchical protocols (the adapter gates on Discord).
+	LibpurpleAdapter::enumerateServersChannels(serviceName, username);
+}
+
+
 bool IMLoginState::getLoginStateData(const MojString& key, LoginStateData& state)
 {
 	bool found = (m_loginState.find(key) != m_loginState.end());
@@ -214,6 +244,7 @@ IMLoginStateHandler::IMLoginStateHandler(MojService* service, MojInt64 loginStat
   m_loginStateQuerySlot(this, &IMLoginStateHandler::loginStateQueryResult),
   m_getCredentialsSlot(this, &IMLoginStateHandler::getCredentialsResult),
   m_updateLoginStateSlot(this, &IMLoginStateHandler::updateLoginStateResult),
+  m_resyncBumpSlot(this, &IMLoginStateHandler::resyncBumpResult),
   m_ignoreUpdateLoginStateSlot(this, &IMLoginStateHandler::ignoreUpdateLoginStateResult),
   m_queryForContactsSlot(this, &IMLoginStateHandler::queryForContactsResult),
   m_queryForBuddyStatusSlot(this, &IMLoginStateHandler::queryForBuddyStatusResult),
@@ -321,7 +352,12 @@ MojErr IMLoginStateHandler::handleConnectionChanged(const MojObject payload)
 		MojObject mergeProps;
 		mergeProps.putString("state", LOGIN_STATE_OFFLINE);
 		mergeProps.putString("ipAddress", "");
-		err = m_dbClient.merge(m_ignoreUpdateLoginStateSlot, query, mergeProps);
+		MojErr err = m_dbClient.merge(m_ignoreUpdateLoginStateSlot, query, mergeProps);
+		if (err) {
+			MojString error;
+			MojErrToString(err, error);
+			MojLogError(IMServiceApp::s_log, _T("handleConnectionChanged: merge login-states to offline failed: %d - %s"), err, error.data());
+		}
 
 		// Mark all buddies so they look offline to us
 		MojString empty;
@@ -344,7 +380,12 @@ MojErr IMLoginStateHandler::handleConnectionChanged(const MojObject payload)
 		MojObject mergeProps;
 		mergeProps.putString("state", LOGIN_STATE_OFFLINE);
 		mergeProps.putString("ipAddress", "");
-		err = m_dbClient.merge(m_ignoreUpdateLoginStateSlot, query, mergeProps);
+		MojErr err = m_dbClient.merge(m_ignoreUpdateLoginStateSlot, query, mergeProps);
+		if (err) {
+			MojString error;
+			MojErrToString(err, error);
+			MojLogError(IMServiceApp::s_log, _T("handleConnectionChanged: merge login-states to offline failed: %d - %s"), err, error.data());
+		}
 
 		// Also tell libpurple to disconnect
 		LibpurpleAdapter::deviceConnectionClosed(false, ConnectionState::wanIpAddress());
@@ -360,10 +401,42 @@ MojErr IMLoginStateHandler::handleConnectionChanged(const MojObject payload)
 		MojObject mergeProps;
 		mergeProps.putString("state", LOGIN_STATE_OFFLINE);
 		mergeProps.putString("ipAddress", "");
-		err = m_dbClient.merge(m_ignoreUpdateLoginStateSlot, query, mergeProps);
+		MojErr err = m_dbClient.merge(m_ignoreUpdateLoginStateSlot, query, mergeProps);
+		if (err) {
+			MojString error;
+			MojErrToString(err, error);
+			MojLogError(IMServiceApp::s_log, _T("handleConnectionChanged: merge login-states to offline failed: %d - %s"), err, error.data());
+		}
 
 		// Also tell libpurple to disconnect
 		LibpurpleAdapter::deviceConnectionClosed(false, ConnectionState::wifiIpAddress());
+	}
+
+	// webOS: connection is (back) UP. Historically handleConnectionChanged ONLY ever set accounts
+	// OFFLINE (the branches above: no-internet / interface switch); nothing re-drove login when the
+	// network RETURNED. Because the imloginstate db-watch only fires on a RECORD change and nothing
+	// rewrote the record on reconnect, an account dropped by a blip / WiFi roam / sleep-wake sat
+	// state=offline until the user manually toggled their status. Fix: when there is a usable internet
+	// connection, re-fire the watch for every imloginstate record by merging the current interface IP.
+	// handleLoginStateChange -> needsToLogin() then logs the want-online ones back in; needsToLogin()
+	// is availability-gated so intentionally-offline accounts are skipped, and online accounts are a
+	// no-op. Runs LAST so accounts the interface-switch branches just moved offline are re-driven onto
+	// the new interface. The empty query mirrors the "all records" merge used by the no-internet branch.
+	if (ConnectionState::hasInternetConnection())
+	{
+		MojString currentIp = ConnectionState::wifiConnected() ? ConnectionState::wifiIpAddress()
+		                                                       : ConnectionState::wanIpAddress();
+		MojLogInfo(IMServiceApp::s_log, _T("handleConnectionChanged: internet available - re-driving login for offline accounts (ip %s)"), currentIp.data());
+		MojDbQuery query; // intentionally empty query - all records; needsToLogin() filters to offline + want-online
+		query.from(IM_LOGINSTATE_KIND);
+		MojObject mergeProps;
+		mergeProps.putString("ipAddress", currentIp);
+		MojErr merr = m_dbClient.merge(m_ignoreUpdateLoginStateSlot, query, mergeProps);
+		if (merr) {
+			MojString error;
+			MojErrToString(merr, error);
+			MojLogError(IMServiceApp::s_log, _T("handleConnectionChanged: re-drive merge failed: %d - %s"), merr, error.data());
+		}
 	}
 
 	return MojErrNone;
@@ -477,7 +550,12 @@ MojErr IMLoginStateHandler::handleBadCredentials(const MojString& serviceName, c
 	mergeProps.putString("ipAddress", "");
 	mergeProps.putString("errorCode", err);
 
-	m_dbClient.merge(m_updateLoginStateSlot, query, mergeProps);
+	MojErr mErr = m_dbClient.merge(m_updateLoginStateSlot, query, mergeProps);
+	if (mErr) {
+		MojString error;
+		MojErrToString(mErr, error);
+		MojLogError(IMServiceApp::s_log, _T("handleBadCredentials: merge login-state to offline failed: %d - %s"), mErr, error.data());
+	}
 
 	// update the syncState record for this account so account dashboard can display errors
 	// first we need to find our account id
@@ -524,8 +602,28 @@ MojErr IMLoginStateHandler::getCredentialsResult(MojObject& payload, MojErr resu
 	else if (!ConnectionState::hasInternetConnection())
 	{
 		MojLogInfo(IMServiceApp::s_log, _T("No internet connection available!"));
-		// No internet so mark this activity complete and reset the watch
-		// which will fire next time there's a stable connection
+		// webOS backstop: the login bailed for lack of internet. Just resetting the watch and trusting
+		// "next stable connection" is not enough - the imloginstate db-watch only fires on a RECORD
+		// change, so if the connection-restored event in handleConnectionChanged is ever missed the
+		// account stays offline until a manual status toggle. Schedule a retry timer that, after a
+		// delay, re-merges state=offline for THIS account, re-firing the watch -> needsToLogin -> a
+		// fresh attempt. If still offline it bails here again and reschedules, polling until the
+		// network returns (no permanent OFFLINE parking; the availability gate keeps intentionally-
+		// offline accounts out).
+		MojString retrySvc = m_workingLoginState.getServiceName();
+		MojString retryUsr = m_workingLoginState.getUsername();
+		if (!retrySvc.empty() && !retryUsr.empty())
+		{
+			MojDbQuery retryQuery;
+			retryQuery.where("serviceName", MojDbQuery::OpEq, retrySvc);
+			retryQuery.where("username", MojDbQuery::OpEq, retryUsr);
+			retryQuery.from(IM_LOGINSTATE_KIND);
+			MojObject retryMerge;
+			retryMerge.putString("state", LOGIN_STATE_OFFLINE);
+			MojRefCountedPtr<IMLoginFailRetryHandler> retryHandler(new IMLoginFailRetryHandler(m_service));
+			retryHandler->startTimerActivity(retrySvc, retryQuery, retryMerge, 20);
+		}
+		// mark this activity complete and reset the watch which will fire next time there's a change
 		completeAndResetWatch();
 	}
 	else
@@ -536,11 +634,13 @@ MojErr IMLoginStateHandler::getCredentialsResult(MojObject& payload, MojErr resu
 
 		// Now get the login params and request login
 		MojObject credentials;
-    	MojErr err = payload.getRequired("credentials", credentials);
+    	payload.getRequired("credentials", credentials);
 
 		LoginParams loginParams;
 		MojString password;
-		err = credentials.getRequired("password", password);
+		// Note: a missing "password" key leaves password empty, which the check below
+		// handles the same as an explicit failure -- so the getRequired result is not stored.
+		credentials.getRequired("password", password);
 		if (password.empty())
 		{
 			MojLogError(IMServiceApp::s_log, _T("Password is empty. I think this is not ok."));
@@ -585,7 +685,12 @@ MojErr IMLoginStateHandler::getCredentialsResult(MojObject& payload, MojErr resu
 				MojObject mergeProps;
 				mergeProps.putString("state", LOGIN_STATE_ONLINE);
 				mergeProps.putString("ipAddress", localIpAddress);
-				m_dbClient.merge(m_updateLoginStateSlot, query, mergeProps);
+				MojErr mErr = m_dbClient.merge(m_updateLoginStateSlot, query, mergeProps);
+				if (mErr) {
+					MojString error;
+					MojErrToString(mErr, error);
+					MojLogError(IMServiceApp::s_log, _T("getCredentialsResult: merge login-state to online failed: %d - %s"), mErr, error.data());
+				}
 
 				// update any imcommands that are in the "waiting-for-connection" status
 				moveWaitingCommandsToPending();
@@ -824,10 +929,22 @@ MojErr IMLoginStateHandler::processLoginStates(MojObject& loginStateArray)
 			{
 				MojRefCountedPtr<MojServiceRequest> req;
 				err = m_service->createRequest(req);
-				MojObject params;
-				err = params.put("accountId", accountId);
-				err = params.putString("name", "common");
-				err = req->send(m_getCredentialsSlot, "com.palm.service.accounts","readCredentials", params, 1);
+				if (err) {
+					MojString error;
+					MojErrToString(err, error);
+					MojLogError(IMServiceApp::s_log, _T("processLoginStates: createRequest for readCredentials failed: %d - %s"), err, error.data());
+				}
+				else {
+					MojObject params;
+					params.put("accountId", accountId);
+					params.putString("name", "common");
+					err = req->send(m_getCredentialsSlot, "com.palm.service.accounts","readCredentials", params, 1);
+					if (err) {
+						MojString error;
+						MojErrToString(err, error);
+						MojLogError(IMServiceApp::s_log, _T("processLoginStates: readCredentials send failed: %d - %s"), err, error.data());
+					}
+				}
 			}
 		}
 		else if (newState.needsToLogoff(cachedState))
@@ -879,10 +996,69 @@ MojErr IMLoginStateHandler::processLoginStates(MojObject& loginStateArray)
 }
 
 
+// webOS Telegram port: bump the account's imloginstate record back to GETTING_BUDDIES. This is a
+// no-op state-wise for an already-online account, but it makes the login-state db-watch re-fire
+// (LoginStateData::needsToGetBuddies now also accepts an ONLINE predecessor) so getBuddyLists()
+// runs again and picks up buddies that tdlib loaded asynchronously after the login snapshot.
+MojErr IMLoginStateHandler::requestBuddyResync(const MojString& serviceName, const MojString& username)
+{
+	MojLogInfo(IMServiceApp::s_log, _T("requestBuddyResync: bumping imloginstate to GETTING_BUDDIES for %s/%s"),
+			serviceName.data(), username.data());
+
+	MojDbQuery query;
+	MojErr err = query.where("serviceName", MojDbQuery::OpEq, serviceName);
+	MojErrCheck(err);
+	err = query.where("username", MojDbQuery::OpEq, username);
+	MojErrCheck(err);
+	err = query.from(IM_LOGINSTATE_KIND);
+	MojErrCheck(err);
+
+	MojObject mergeProps;
+	err = mergeProps.putString("state", LOGIN_STATE_GETTING_BUDDIES);
+	MojErrCheck(err);
+
+	err = m_dbClient.merge(m_resyncBumpSlot, query, mergeProps);
+	MojErrCheck(err);
+
+	return MojErrNone;
+}
+
+MojErr IMLoginStateHandler::resyncBumpResult(MojObject& result, MojErr err)
+{
+	if (err)
+		MojLogError(IMServiceApp::s_log, _T("resyncBumpResult: imloginstate bump failed err=%d"), err);
+	else
+		MojLogInfo(IMServiceApp::s_log, _T("resyncBumpResult: imloginstate bumped; db-watch will re-sync buddies"));
+	return MojErrNone;
+}
+
+
 // This fires off 3 asynchronous requests with the responses being stored in m_buddyListConsolidator
 // So whichever of the 3 returns last will continue the buddy list processing
 MojErr IMLoginStateHandler::getBuddyLists(const MojString& serviceName, const MojString& username, const MojString& accountId)
 {
+	// webOS: m_buddyListConsolidator (and m_queryForContactsSlot/m_queryForBuddyStatusSlot below) are
+	// single, reused members of this handler instance, not scoped per-account. processLoginStates()
+	// loops over EVERY account's changed imloginstate record in one db-watch callback, and this
+	// function's own contacts/buddystatus queries are ASYNC (return immediately, complete later via
+	// queryForContactsResult/queryForBuddyStatusResult). If getBuddyLists() runs again for a
+	// DIFFERENT (or the same) account before an already-in-flight one's queries return, the
+	// reassignment below silently swaps out the consolidator instance those pending callbacks will
+	// fire against - so account A's contacts/buddystatus land on account B's freshly-fetched buddy
+	// list. Confirmed live: this produced "adding buddy=<uuid> to delete list" for every existing
+	// Signal contact (none matched the wrong account's buddy map, since the map keys came from a
+	// different account entirely) and "This new buddy has no buddy name" for the replacement
+	// inserts - two accounts (Signal + Telegram, both resyncing within the same ~20s window) were
+	// clobbering each other's in-flight sync. Defer instead of clobbering: complete the watch as
+	// usual so it can fire again, and let the existing debounced/timeout resync machinery
+	// (buddyResyncTimeoutCallback etc.) retry this account shortly once the current one clears.
+	if (m_buddyListConsolidator != NULL)
+	{
+		MojLogWarning(IMServiceApp::s_log, _T("getBuddyLists: a buddy-list sync is already in flight - deferring %s/%s to the next retry instead of clobbering it"), serviceName.data(), username.data());
+		completeAndResetWatch();
+		return MojErrNone;
+	}
+
 	m_buddyListConsolidator = new BuddyListConsolidator(m_service, accountId);
 
 	// Get a full list of buddies. The result is asynchronously returned via the buddyListResult() callback
@@ -910,14 +1086,28 @@ MojErr IMLoginStateHandler::getBuddyLists(const MojString& serviceName, const Mo
 	}
 	else
 	{
-		//TODO: set the state to offline?? Perhaps loginstate needs a retry count.
-		MojLogError(IMServiceApp::s_log, _T("getBuddyLists: getFullBuddyList return false. This is not good"));
+		// webOS resilience: getFullBuddyList returned false because the buddy list isn't ready yet -
+		// the protocol (tdlib) is still loading its contact/chat list, or couldn't (e.g. /var was full).
+		// Do NOT leave the account stuck in GETTING_BUDDIES: mark it ONLINE (it IS logged in; there are
+		// simply no buddies to reconcile right now) and leave the existing contacts untouched. The
+		// debounced buddy-added resync - which re-fires from an ONLINE predecessor - runs the real sync
+		// once buddies actually load. (Previously this left the state stuck and could not recover.)
+		MojLogWarning(IMServiceApp::s_log, _T("getBuddyLists: buddy list not ready for %s - marking online, keeping existing contacts"), serviceName.data());
 
 		delete m_buddyListConsolidator;
 		m_buddyListConsolidator = NULL;
 
+		MojDbQuery stateQuery;
+		stateQuery.where("serviceName", MojDbQuery::OpEq, serviceName);
+		stateQuery.where("username", MojDbQuery::OpEq, username);
+		stateQuery.from(IM_LOGINSTATE_KIND);
+		MojObject stateProps;
+		stateProps.putString("state", LOGIN_STATE_ONLINE);
+		MojErr mErr = m_dbClient.merge(m_updateLoginStateSlot, stateQuery, stateProps);
+		if (mErr)
+			MojLogError(IMServiceApp::s_log, _T("getBuddyLists: failed to mark online after empty buddy list: %d"), mErr);
 
-		// Since it failed, we need to reset the watch ourself.
+		// Reset the watch ourself since we short-circuited the normal consolidate path.
 		completeAndResetWatch();
 	}
 
@@ -1063,17 +1253,18 @@ void IMLoginStateHandler::loginResult(const char* serviceName, const char* usern
 		m_loginStateController->resetRetryCount();
 	}
 	else {
-		// happens for login_failed or timeout and we had a network error
-		if (m_loginStateController->hitMaxRetry()) {
-			// done retrying
-			m_loginStateController->resetRetryCount();
-			noRetry = true;
-			MojLogError(IMServiceApp::s_log, _T("loginResult: max retries exceeded. giving up login attempts for %s on %s"), username, serviceName);
-		}
-		else {
-			m_loginStateController->incrementRetryCount();
-			MojLogInfo(IMServiceApp::s_log, _T("loginResult: incrementing retry count to %i."), m_loginStateController->getRetryCount());
-		}
+		// happens for login_failed or timeout and we had a network error.
+		// webOS: do NOT give up and park the account OFFLINE after a fixed number of tries. The old
+		// behaviour (MAX_RETRY=6, 2s apart) exhausted its budget in ~12s, so any WiFi blip or sleep/wake
+		// longer than that parked availability=OFFLINE; because needsToLogin() is availability-gated the
+		// account then stayed offline even after the network came back, and the user had to toggle their
+		// status to recover. Instead keep retrying indefinitely with an exponential backoff (see the
+		// delay computed for startTimerActivity below) so the account auto-reconnects whenever the
+		// network returns. The retry count is reset on a successful login. A genuinely permanent,
+		// non-network error still arrives with noRetry==true from the adapter and parks below, so this
+		// does not mask a misconfigured account.
+		m_loginStateController->incrementRetryCount();
+		MojLogInfo(IMServiceApp::s_log, _T("loginResult: network login failure for %s on %s, retry #%i (backoff, no permanent give-up)"), username, serviceName, m_loginStateController->getRetryCount());
 	}
 
 	// Want to merge the new state and errorCode values for the given username and serviceName
@@ -1090,6 +1281,19 @@ void IMLoginStateHandler::loginResult(const char* serviceName, const char* usern
 		if (type == LoginCallbackInterface::LOGIN_SUCCESS)
 		{
 			MojLogInfo(IMServiceApp::s_log, _T("loginResult: ignoring noRetry==true because type==login_success"));
+		}
+		else if (type == LoginCallbackInterface::LOGIN_SIGNED_OFF)
+		{
+			// webOS: a SIGNED_OFF is a CONNECTION event, not the user's intent to go offline. On this
+			// device WiFi roams between two similar-strength APs on different subnets, so the IP keeps
+			// changing and libpurple signs the account off to re-bind. Parking availability=OFFLINE
+			// here made the account manager treat the user as intentionally offline, so it never
+			// re-logged-in and the user had to manually toggle their status. The user's DESIRED
+			// presence is owned by the status UI / setMyAvailability - leave it untouched. We only set
+			// the current state=OFFLINE below, so needsToLogin() re-drives the login on the new IP.
+			// (A genuinely unreachable network still parks eventually via the LOGIN_FAILED/TIMEOUT
+			// retry path, so this does not loop forever.)
+			MojLogInfo(IMServiceApp::s_log, _T("loginResult: SIGNED_OFF - preserving desired availability so the account auto-reconnects (e.g. WiFi roam / IP change)"));
 		}
 		else
 		{
@@ -1110,7 +1314,17 @@ void IMLoginStateHandler::loginResult(const char* serviceName, const char* usern
 		MojRefCountedPtr<IMLoginFailRetryHandler> handler(new IMLoginFailRetryHandler(m_service));
 		mergeProps.putString("state", LOGIN_STATE_OFFLINE);
 		mergeProps.put("errorCode", errorCodeMoj);
-		handler->startTimerActivity(serviceNameMoj, query, mergeProps);
+		// Exponential backoff capped at 30s: 2,4,8,16,30s. A transient blip OR a slow/flaky reboot (where
+		// several accounts fail their first login attempts before the network settles) recovers within
+		// ~30s. The earlier 300s cap left accounts stuck offline for MINUTES after such a reboot. 30s
+		// still avoids a tight retry loop against a genuinely-down network, and there is no OFFLINE
+		// parking, so an account always reconnects on its own once the network is back - no user toggle.
+		int retryDelaySeconds = 2;
+		for (MojUInt32 k = 1; k < m_loginStateController->getRetryCount() && retryDelaySeconds < 30; k++)
+			retryDelaySeconds *= 2;
+		if (retryDelaySeconds > 30)
+			retryDelaySeconds = 30;
+		handler->startTimerActivity(serviceNameMoj, query, mergeProps, retryDelaySeconds);
 	}
 	else
 	{
@@ -1119,6 +1333,15 @@ void IMLoginStateHandler::loginResult(const char* serviceName, const char* usern
 		case LoginCallbackInterface::LOGIN_SUCCESS:
 			mergeProps.putString("state", LOGIN_STATE_GETTING_BUDDIES);
 			mergeProps.put("errorCode", errorCodeMoj);
+			// webOS Telegram port: a successful login means the account IS online, so force
+			// availability back to ONLINE. Prior failed attempts stamp availability=OFFLINE
+			// (see line ~1097), and an onEnabled-triggered login (re-add / interactive auth)
+			// doesn't go through the availability-gated needsToLogin path, so the stale
+			// OFFLINE would otherwise make needsToLogoff() fire and tear down the just-online
+			// account (and block needsToGetBuddies()). Resetting it here keeps us online and
+			// lets buddy retrieval proceed. Intentional sign-out comes via LOGIN_SIGNED_OFF,
+			// and AWAY/BUSY are set post-login via setMyAvailability, so neither is affected.
+			mergeProps.putInt("availability", PalmAvailability::ONLINE);
 			// Since the login succeeded, move any waiting messages back to pending
 			moveWaitingMessagesToPending(serviceNameMoj, usernameMoj);
 			break;
@@ -1132,6 +1355,11 @@ void IMLoginStateHandler::loginResult(const char* serviceName, const char* usern
 			break;
 		}
 		err = m_dbClient.merge(m_updateLoginStateSlot, query, mergeProps);
+		if (err) {
+			MojString error;
+			MojErrToString(err, error);
+			MojLogError(IMServiceApp::s_log, _T("loginResult: merge login-state update failed: %d - %s"), err, error.data());
+		}
 	}
 
 	// update the syncState record for this account so account dashboard can display errors
@@ -1256,7 +1484,10 @@ bool LoginStateData::needsToLogin(LoginStateData& oldState)
 
 bool LoginStateData::needsToGetBuddies(LoginStateData& oldState)
 {
-	return (m_state == LOGIN_STATE_GETTING_BUDDIES && m_availability != PalmAvailability::OFFLINE && m_availability != PalmAvailability::NO_PRESENCE && (oldState.m_state == LOGIN_STATE_OFFLINE || oldState.m_state == LOGIN_STATE_LOGGING_ON));
+	// webOS Telegram port: also allow an already-ONLINE account to re-enter GETTING_BUDDIES. This
+	// lets a post-login buddy re-sync (see IMLoginState::buddyListChanged / requestBuddyResync) drive
+	// getBuddyLists() again for buddies that tdlib loaded asynchronously after the login snapshot.
+	return (m_state == LOGIN_STATE_GETTING_BUDDIES && m_availability != PalmAvailability::OFFLINE && m_availability != PalmAvailability::NO_PRESENCE && (oldState.m_state == LOGIN_STATE_OFFLINE || oldState.m_state == LOGIN_STATE_LOGGING_ON || oldState.m_state == LOGIN_STATE_ONLINE));
 }
 
 bool LoginStateData::needsToLogoff(LoginStateData& oldState)
@@ -1288,9 +1519,9 @@ IMLoginFailRetryHandler::IMLoginFailRetryHandler(MojService* service)
 {
 }
 
-MojErr IMLoginFailRetryHandler::startTimerActivity(const MojString& serviceName, const MojDbQuery& query, const MojObject& mergeProps)
+MojErr IMLoginFailRetryHandler::startTimerActivity(const MojString& serviceName, const MojDbQuery& query, const MojObject& mergeProps, int delaySeconds)
 {
-	MojLogInfo(IMServiceApp::s_log, _T("IMLoginFailRetryHandler::startTimerActivity"));
+	MojLogInfo(IMServiceApp::s_log, _T("IMLoginFailRetryHandler::startTimerActivity (retry in %ds)"), delaySeconds);
 	MojRefCountedPtr<MojServiceRequest> req;
 	MojErr err = m_service->createRequest(req);
 	if (err != MojErrNone)
@@ -1325,11 +1556,22 @@ MojErr IMLoginFailRetryHandler::startTimerActivity(const MojString& serviceName,
 
 		// activity.schedule
 		time_t targetDate;
-		time(&targetDate);
-		targetDate += 2; // schedule for 2 seconds in the future
+		if (time(&targetDate) == (time_t)-1) {
+			MojLogError(IMServiceApp::s_log, _T("IMLoginFailRetryHandler: time() failed"));
+		}
+		targetDate += delaySeconds; // schedule the retry after the (backoff) delay
 		tm* ptm = gmtime(&targetDate);
 		char scheduleTime[50];
-		sprintf(scheduleTime, "%d-%02d-%02d %02d:%02d:%02dZ", ptm->tm_year+1900, ptm->tm_mon+1, ptm->tm_mday, ptm->tm_hour, ptm->tm_min, ptm->tm_sec);
+		if (ptm == NULL) {
+			MojLogError(IMServiceApp::s_log, _T("IMLoginFailRetryHandler: gmtime() returned NULL"));
+			scheduleTime[0] = '\0';
+		}
+		else {
+			int written = snprintf(scheduleTime, sizeof(scheduleTime), "%d-%02d-%02d %02d:%02d:%02dZ", ptm->tm_year+1900, ptm->tm_mon+1, ptm->tm_mday, ptm->tm_hour, ptm->tm_min, ptm->tm_sec);
+			if (written < 0 || (size_t)written >= sizeof(scheduleTime)) {
+				MojLogError(IMServiceApp::s_log, _T("IMLoginFailRetryHandler: scheduleTime truncated"));
+			}
+		}
 		MojLogDebug(IMServiceApp::s_log, _T("IMLoginFailRetryHandler: com.palm.activitymanager/create date=%s"), scheduleTime);
 		MojObject scheduleObj;
 		scheduleObj.putString("start", scheduleTime);

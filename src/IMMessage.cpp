@@ -23,9 +23,62 @@
  * IMMessage class handles saving and retrieving an immessage object from the DB
  */
 
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 #include "IMMessage.h"
 #include "IMServiceHandler.h"
 #include "sanitize.h"
+
+// Recover http(s) URLs that live only inside HTML tag attributes (src=/href=/alt=). sanitizeHtml
+// below strips every non-trusted tag entirely — attributes and all — so a URL present only in an
+// attribute would be destroyed. Discord's "display images" mode delivers image URLs exactly like
+// that (<img alt="URL">, <a href="URL">), which is why those images vanished. Append each unique
+// attribute-URL as plain text so it survives sanitize and the Messaging app can render/linkify it.
+// Returns a malloc'd string (caller frees) or NULL if nothing was recovered.
+static char *recoverAttributeUrls(const char *html)
+{
+	if (!html) return NULL;
+	size_t inlen = strlen(html);
+	// worst case appends one space per recovered URL plus the URL bytes; 2*inlen is a safe bound.
+	char *extras = (char *)malloc(2 * inlen + 2);
+	if (!extras) return NULL;
+	extras[0] = '\0';
+	size_t extralen = 0;
+	const char *p = html;
+	const char *marker;
+	while ((marker = strstr(p, "://")) != NULL) {
+		const char *s = marker; // walk back over the scheme letters (http/https)
+		while (s > html && isalpha((unsigned char)*(s - 1))) s--;
+		// require the scheme to sit inside an attribute value: preceded by =" or ='
+		if (s >= html + 2 && (*(s - 1) == '"' || *(s - 1) == '\'') && *(s - 2) == '=') {
+			char quote = *(s - 1);
+			const char *e = marker + 3;
+			while (*e && *e != quote && *e != '<' && *e != '>' && !isspace((unsigned char)*e)) e++;
+			size_t urllen = (size_t)(e - s);
+			if (urllen > 8 && urllen < 2048 &&
+			    (strncmp(s, "http://", 7) == 0 || strncmp(s, "https://", 8) == 0)) {
+				char tmp[2048];
+				memcpy(tmp, s, urllen);
+				tmp[urllen] = '\0';
+				if (!strstr(extras, tmp)) { // dedup (alt= and href= usually repeat the URL)
+					extras[extralen++] = ' ';
+					memcpy(extras + extralen, s, urllen);
+					extralen += urllen;
+					extras[extralen] = '\0';
+				}
+			}
+		}
+		p = marker + 3;
+	}
+	if (extralen == 0) { free(extras); return NULL; }
+	char *result = (char *)malloc(inlen + extralen + 1);
+	if (!result) { free(extras); return NULL; }
+	memcpy(result, html, inlen);
+	memcpy(result + inlen, extras, extralen + 1);
+	free(extras);
+	return result;
+}
 
 const char* IMMessage::statusStrings[] = {
 	"successful",
@@ -54,6 +107,10 @@ IMMessage::IMMessage()
 	serverTimestamp = 0;
 	status = Successful;
 	folder = Inbox;
+	// webOS Servers/Rooms: default to a 1:1 IM; set true only when channelName is supplied.
+	isGroupChat = false;
+	// muted messages (chat muted on the server side) get flags.noNotification; default off.
+	muted = false;
 }
 
 IMMessage::~IMMessage() {
@@ -69,7 +126,13 @@ IMMessage::~IMMessage() {
  *
  *
  */
-MojErr IMMessage::initFromCallback(const char* serviceName, const char* username, const char* usernameFrom, const char* message) {
+MojErr IMMessage::initFromCallback(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp,
+		const char* channelName, const char* channelDisplayName, const char* serverId, const char* serverName, bool muted,
+		const char* usernameFromDisplay, bool outgoing) {
+
+	// Remember whether the source conversation is muted; createDBObject turns this into
+	// flags.noNotification so the Messaging app stores the message but skips the banner.
+	this->muted = muted;
 
 	MojErr err;
 
@@ -83,22 +146,35 @@ MojErr IMMessage::initFromCallback(const char* serviceName, const char* username
 	// message is const char* - need a char* version
 	char *unescapedMessage = unsanitizeHtml((char*)message);
 
+	// Pull URLs out of tag attributes (Discord image mode etc.) before they're sanitized away.
+	char *recoveredMessage = recoverAttributeUrls(unescapedMessage);
+	const char *toSanitize = recoveredMessage ? recoveredMessage : unescapedMessage;
+
 	// now remove offending html
 	// char * sanitizeHtml(const char *input, char **except, bool remove);
 	//     remove set to true if you want the the tags to actually be removed vs just "escaped".
 	//     except is an array of char* containing tags to ignore when sanitizing. The
 	//          last element must be a null. You need to include both beginning and ending
 	//          tag if you want both removed (i.e. "b", "/b", "i", "/i")
-	char *sanitizedMessage = sanitizeHtml(unescapedMessage, (char**)IMMessage::trustedTags, true);
+	char *sanitizedMessage = sanitizeHtml(toSanitize, (char**)IMMessage::trustedTags, true);
 
 	// can't keep this log...
 	//MojLogInfo(IMServiceApp::s_log, _T("original message: %s, unescaped message: %s, sanitized message: %s"), message, unescapedMessage, sanitizedMessage);
 
-	err = msgText.assign(sanitizedMessage);
-	MojErrCheck(err);
-	// cleanup
+	// Encode astral (>U+FFFF) emoji as numeric HTML entities before storing. The device's JS
+	// runtimes corrupt raw 4-byte UTF-8 to U+FFFD on the way out of db8, so this is the only
+	// place (native, pre-db8) the emoji is still intact. The Messaging app decodes the
+	// entities back into inline emoji images. See sanitize.h.
+	char *emojiSafeMessage = encodeAstralEntities(sanitizedMessage);
+
+	err = msgText.assign(emojiSafeMessage);
+	free(emojiSafeMessage);
+	// cleanup -- must come BEFORE the MojErrCheck: that macro returns on failure, and doing it
+	// first leaked all three buffers on every failed assign (this is the per-incoming-message path).
+	if (recoveredMessage) free(recoveredMessage);
 	free(unescapedMessage);
 	free(sanitizedMessage);
+	MojErrCheck(err);
 
 	// remove blanks and convert to lowercase
 	// for AOL, this is screen name with no "@aol.com"...
@@ -108,18 +184,89 @@ MojErr IMMessage::initFromCallback(const char* serviceName, const char* username
 	err = unformatFromAddress(formattedUserName, fromAddress);
 	MojErrCheck(err);
 
+	// If the sender name carries astral emoji, keep an encoded copy for DISPLAY only (written
+	// as the "name" on the from address in createDBObject). fromAddress stays raw so the
+	// conversation match key is unchanged -> emoji-named chats never split. See sanitize.h.
+	char *encFrom = encodeAstralEntities(usernameFrom);
+	if (encFrom && strcmp(encFrom, usernameFrom) != 0) {
+		err = fromDisplayName.assign(encFrom);
+	} else {
+		err = MojErrNone;
+	}
+	if (encFrom) free(encFrom);
+	MojErrCheck(err);
+
 	err = toAddress.assign(username);
 	MojErrCheck(err);
+
+	// Outgoing carbon (a message we sent from another client): the parties are reversed - we are the
+	// sender and usernameFrom is really the recipient. Swap so from = self, to = peer, and file it in
+	// the Outbox. fromDisplayName (a sender-name label) is meaningless for our own messages -> clear it.
+	if (outgoing) {
+		MojString peer = fromAddress;   // usernameFrom, unformatted above -> the recipient
+		fromAddress = toAddress;        // self (account username)
+		toAddress = peer;
+		fromDisplayName.clear();
+		folder = Outbox;
+	}
+
 	err = msgType.assign(serviceName);
 	MojErrCheck(err);
 
-	// set time stamp to current time - seconds since 1/1/1970
+	// set time stamp - seconds since 1/1/1970
 	// for some reason multiplying a time_t by 1000 doesn't work - you have to convert to a long first...
 	//deviceTimestamp = time (NULL) * 1000;
-	MojInt64 sec = time (NULL);
+	// webOS Teams port: prefer the libpurple message time (composetime of the actual
+	// message) when the caller supplied one, so history/offline messages keep their
+	// original send time instead of appearing with the current (arrival) time. A
+	// non-positive timestamp means "unknown" -> fall back to now.
+	MojInt64 sec = (timestamp > 0) ? (MojInt64) timestamp : (MojInt64) time (NULL);
 	deviceTimestamp = sec * 1000;
 	// server timestamp is new Date().getTime()
 	serverTimestamp = sec * 1000;
+
+	// webOS Servers/Rooms (Milestone 0): capture multi-user-chat (MUC) metadata. When channelName
+	// is supplied the message belongs to a room (Discord channel etc.) rather than a 1:1 IM;
+	// serverId/serverName identify the parent server (guild/network). Stored so ChatThreader can
+	// group channels under their server. Left empty for ordinary 1:1 IMs.
+	isGroupChat = (channelName != NULL && *channelName != '\0');
+	if (isGroupChat) {
+		err = this->channelName.assign(channelName);
+		MojErrCheck(err);
+		if (channelDisplayName != NULL && *channelDisplayName != '\0') {
+			// Human room title (Telegram group name etc.) - display only, so encode astral emoji
+			// like serverName. channelName remains the stable match key. See sanitize.h.
+			char *safeChannel = encodeAstralEntities(channelDisplayName);
+			err = this->channelDisplayName.assign(safeChannel);
+			free(safeChannel);
+			MojErrCheck(err);
+		}
+		if (serverName != NULL && *serverName != '\0') {
+			// serverName is the guild/network DISPLAY name (serverId is the match key), so encoding
+			// its emoji is display-only and safe. See sanitize.h.
+			char *safeServer = encodeAstralEntities(serverName);
+			err = this->serverName.assign(safeServer);
+			free(safeServer);
+			MojErrCheck(err);
+		}
+		if (serverId != NULL && *serverId != '\0') {
+			err = this->serverId.assign(serverId);
+			MojErrCheck(err);
+		}
+
+		// webOS Servers/Rooms: keep the sender's readable DISPLAY name as from.name so the Messaging app
+		// can label each group message with who sent it (fromAddress above stays the routable match key).
+		// Telegram passes the routable id as usernameFrom and the human name separately as
+		// usernameFromDisplay; Discord/IRC put the human name directly in usernameFrom. Encode astral
+		// emoji (display-only, like channelDisplayName/serverName). from.addr is unaffected.
+		const char* dispName = (usernameFromDisplay != NULL && *usernameFromDisplay != '\0') ? usernameFromDisplay : usernameFrom;
+		if (dispName != NULL && *dispName != '\0') {
+			char *safeSender = encodeAstralEntities(dispName);
+			err = fromDisplayName.assign(safeSender ? safeSender : dispName);
+			if (safeSender) free(safeSender);
+			MojErrCheck(err);
+		}
+	}
 
 	return MojErrNone;
 }
@@ -140,6 +287,13 @@ MojErr IMMessage::createDBObject(MojObject& returnObj) {
 	MojObject addressObj;
 	MojErr err = addressObj.putString(MOJDB_ADDRESS, fromAddress);
 	MojErrCheck(err);
+	// Display-only encoded sender name (set only when it contained astral emoji). The
+	// chatthreader inherits conversation.displayName from this "name" while still matching on
+	// the raw addr above, so emoji render in thread/buddy names without splitting chats.
+	if (!fromDisplayName.empty()) {
+		err = addressObj.putString(_T("name"), fromDisplayName);
+		MojErrCheck(err);
+	}
 	err = returnObj.put(MOJDB_FROM, addressObj);
 	MojErrCheck(err);
 
@@ -161,8 +315,10 @@ MojErr IMMessage::createDBObject(MojObject& returnObj) {
 	err = returnObj.putString(MOJDB_MSG_TEXT, msgText);
 	MojErrCheck(err);
 
-	// username - since this is incoming message, the username is always in toAddress
-	err = returnObj.putString(MOJDB_USERNAME, toAddress);
+	// username = the account owner (self). For an incoming message that's the recipient (toAddress);
+	// for an outgoing carbon we are the sender, so it's fromAddress. Getting this right keeps the
+	// message scoped to the correct account and threaded into the right conversation.
+	err = returnObj.putString(MOJDB_USERNAME, folder == Outbox ? fromAddress : toAddress);
 	MojErrCheck(err);
 
 	// service name
@@ -176,6 +332,65 @@ MojErr IMMessage::createDBObject(MojObject& returnObj) {
 	// incoming server
 	err = returnObj.putInt(MOJDB_SERVER_TIMESTAMP, serverTimestamp);
 	MojErrCheck(err);
+
+	// Muted conversation (e.g. a Telegram chat the user muted server-side): store the message but
+	// mark it "no notification" so the Messaging app's DashboardManager (isNewMessage checks
+	// flags.noNotification) skips the banner. The message still lands in the inbox and counts as
+	// unread - matching native Telegram, which shows muted chats without alerting.
+	if (muted) {
+		MojObject flags;
+		err = flags.putBool(_T("noNotification"), true);
+		MojErrCheck(err);
+		err = returnObj.put(_T("flags"), flags);
+		MojErrCheck(err);
+	}
+
+	// webOS Servers/Rooms (Milestone 0): tag multi-user-chat messages with their room + parent
+	// server so ChatThreader/the Messaging app can group channels under a server. Only written for
+	// group-chat messages; 1:1 IMs are stored exactly as before. db8 is schemaless, so these extra
+	// properties need no kind change (query indexes come in Milestone 1).
+	if (isGroupChat) {
+		err = returnObj.putString(MOJDB_CHAT_TYPE, _T("groupchat"));
+		MojErrCheck(err);
+		err = returnObj.putString(MOJDB_CHANNEL_NAME, channelName);
+		MojErrCheck(err);
+		if (!channelDisplayName.empty()) {
+			err = returnObj.putString(MOJDB_CHANNEL_DISPLAY_NAME, channelDisplayName);
+			MojErrCheck(err);
+		}
+		if (!serverName.empty()) {
+			err = returnObj.putString(MOJDB_SERVER_NAME, serverName);
+			MojErrCheck(err);
+		}
+		if (!serverId.empty()) {
+			err = returnObj.putString(MOJDB_SERVER_ID, serverId);
+			MojErrCheck(err);
+		}
+	}
+
+	// webOS reactions: persist the prpl's own message id so a later reaction can target this row.
+	// Schemaless field; the reaction handler queries it via the serviceMessageId index. Absent when
+	// the prpl didn't stash one on the conversation, so pre-reaction behaviour is unchanged.
+	if (!serviceMessageId.empty()) {
+		err = returnObj.putString(MOJDB_SERVICE_MSG_ID, serviceMessageId);
+		MojErrCheck(err);
+	}
+
+	// webOS replies: persist the quoted-original so the Messaging UI renders an inline quote card
+	// (ConversationItem.buildQuote). Schemaless fields; all empty for non-reply messages, so behaviour
+	// is unchanged when a message isn't a reply. quotedText is the trigger; id/from are optional.
+	if (!quotedText.empty()) {
+		err = returnObj.putString(MOJDB_QUOTED_TEXT, quotedText);
+		MojErrCheck(err);
+		if (!quotedFrom.empty()) {
+			err = returnObj.putString(MOJDB_QUOTED_FROM, quotedFrom);
+			MojErrCheck(err);
+		}
+		if (!quotedMessageId.empty()) {
+			err = returnObj.putString(MOJDB_QUOTED_MSG_ID, quotedMessageId);
+			MojErrCheck(err);
+		}
+	}
 
 	IMServiceHandler::privatelogIMMessage(_T("DB Message object %s:"), returnObj, MOJDB_MSG_TEXT);
 
