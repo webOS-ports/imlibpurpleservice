@@ -3621,9 +3621,11 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::removeBuddy(const char* serviceNa
 
 		PurpleBuddy* buddy = purple_find_buddy(account, buddyUsername);
 		if (NULL == buddy) {
-            res = INVALID_PARAMS;
-
-			MojLogError(IMServiceApp::s_log, _T("could not find buddy in list - cannot remove"));
+			// Already not a buddy (removed on the server, or only a stale Messaging row is left):
+			// that IS the requested end state, so report it done and let the caller delete the
+			// Messaging rows. Failing here left those rows -- and the buddy on screen -- forever.
+			res = SENT;
+			MojLogInfo(IMServiceApp::s_log, _T("removeBuddy: %s is not in the buddy list; clearing Messaging's records"), buddyUsername);
 		}
 		else {
 			PurpleGroup* group = purple_buddy_get_group(buddy);
