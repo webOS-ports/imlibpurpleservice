@@ -38,8 +38,19 @@ LOCKDIR=/var/run/imlibpurpletransport.lock
 if ! mkdir "$LOCKDIR" 2>/dev/null; then
   OLDPID=$(cat "$LOCKDIR/pid" 2>/dev/null)
   if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
-    echo "$(date -Iseconds 2>/dev/null) imwrap.sh: already running as pid $OLDPID, not starting a second instance" >> "$LOG"
-    exit 0
+    if [ -z "$IM_RESIDENT" ]; then
+      echo "$(date -Iseconds 2>/dev/null) imwrap.sh: already running as pid $OLDPID, not starting a second instance" >> "$LOG"
+      exit 0
+    fi
+    # The resident (upstart) launch lost the race to an on-demand copy ls-hubd started first --
+    # anything calling com.palm.imlibpurple before the imtransport job is up does that, e.g. the
+    # loginstate activities at boot. Exiting here made upstart respawn the job every few seconds
+    # (through its pre-start, if it has one) until its respawn limit stopped it for good, leaving
+    # only the on-demand copy, which idles out once every account is offline with nothing
+    # resident behind it. Stay up as the job's main process instead, and take over (through the
+    # stale-lock reclaim below) once that copy exits.
+    echo "$(date -Iseconds 2>/dev/null) imwrap.sh: on-demand pid $OLDPID holds the transport; resident launch waiting for it to exit" >> "$LOG"
+    while kill -0 "$OLDPID" 2>/dev/null; do sleep 5; done
   fi
   echo "$(date -Iseconds 2>/dev/null) imwrap.sh: stale lock (pid $OLDPID gone), reclaiming" >> "$LOG"
   rm -rf "$LOCKDIR"
