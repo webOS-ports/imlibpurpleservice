@@ -2764,6 +2764,15 @@ static void initializeLibpurple()
 	purple_prefs_set_bool("/purple/logging/log_chats", FALSE);
 	purple_prefs_set_bool("/purple/logging/log_system", FALSE);
 
+	/* webOS: availability is the user's, set from Messaging (setMyAvailability). libpurple's
+	 * defaults go away by themselves after 5 minutes idle (away_when_idle, mins_before_away), and
+	 * with no UI idle ops "idle" is the time since the last purple_idle_touch(), which nothing here
+	 * calls: so every account went away 5 minutes after signing in, with libpurple's auto-away
+	 * message, and buddies saw it idle with Messaging open and the screen on. Turn auto-away and
+	 * idle reporting off; that also lifts an auto-away already set. */
+	purple_prefs_set_bool("/purple/away/away_when_idle", FALSE);
+	purple_prefs_set_string("/purple/away/idle_reporting", "none");
+
 	/* Create and load the buddylist. */
 	purple_set_blist(purple_blist_new());
 	purple_blist_load();
