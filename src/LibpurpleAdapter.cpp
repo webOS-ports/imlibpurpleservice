@@ -1252,8 +1252,22 @@ static void buddy_avatar_changed_cb(PurpleBuddy* buddy)
  */
 static void buddy_removed_cb(PurpleBuddy* buddy)
 {
-	// nothing to do...
 	MojLogInfo(IMServiceApp::s_log, _T("buddy removed %s"), buddy->name);
+
+	// Drop a presence tick still waiting in the batch for this buddy. Otherwise the flush
+	// (PRESENCE_FLUSH_DEBOUNCE_SECONDS later) re-puts the imbuddystatus row that removeBuddyResult
+	// just deleted, and the removed buddy comes straight back in Messaging. Measured: a buddy
+	// signed on at login, was removed 0.1 s later, and the 3 s flush wrote it back ("put 2").
+	PurpleAccount* account = purple_buddy_get_account(buddy);
+	std::string const& accountKey = getAccountKeyFromPurpleAccount(account);
+	if (s_AccountIdsData.count(accountKey) == 0)
+		return;
+	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
+	std::string const buddyWebosName = getWebosUsername(buddy->name, serviceName, account);
+	std::unordered_map<std::string, std::unordered_map<std::string, PendingPresence> >::iterator ai =
+		s_pendingPresence.find(s_AccountIdsData[accountKey]);
+	if (ai != s_pendingPresence.end() && ai->second.erase(buddyWebosName) > 0)
+		MojLogInfo(IMServiceApp::s_log, _T("buddy removed %s: dropped its queued presence update"), buddy->name);
 }
 
 /*
