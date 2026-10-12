@@ -1018,10 +1018,11 @@ static void buddy_signed_on_off_cb(PurpleBuddy* buddy, gpointer data)
 		buddyAvatarLocation = purple_buddy_icon_get_full_path(icon);
 	}
 
-	if (buddy->alias == NULL)
-	{
-		buddy->alias = (char*)"";
-	}
+	// Never store a string literal in buddy->alias: libpurple owns that field and g_free()s it when
+	// the buddy is destroyed (purple_blist_remove_buddy), so a literal there aborted the transport
+	// with "munmap_chunk(): invalid pointer" on every removal of a buddy that had no local alias --
+	// and Messaging re-sends the pending deleteBuddy at each sign-on, so it crash-looped. The alias
+	// is only read for the log line below, where glibc prints NULL as "(null)".
 
 	customMessage = purple_status_get_attr_string(activeStatus, "message");
 	if (customMessage == NULL)
