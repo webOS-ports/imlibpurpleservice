@@ -1486,11 +1486,60 @@ static void xfer_send_cancel_cb(PurpleXfer* xfer, gpointer data)
 		s_imServiceHandler->markAttachmentSendFailed(dbId.c_str());
 }
 
-static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
+/*
+ * Connect the buddy-list / presence / transfer signals, once per process. Called from every path that
+ * makes an account live in the transport: account_logged_in_cb (the normal sign-on) AND
+ * LibpurpleAdapter::login's adopt path, taken when libpurple auto-logged the account in from
+ * accounts.xml before the "signed-on" handler existed. That adopt path used to return without
+ * connecting these, so presence never reached Messaging for the rest of the process (buddies stuck at
+ * whatever the sign-in buddy list said). Measured on webOS CE 3.1.0: every transport start after the
+ * account existed took the adopt path, and no buddy-status-changed callback ran.
+ */
+static void registerPresenceUpdateSignals(gpointer loginState)
 {
 	void* blist_handle = purple_blist_get_handle();
 	static int handle;
 
+	if (s_registeredForPresenceUpdateSignals == FALSE)
+	{
+		purple_signal_connect(blist_handle, "buddy-status-changed", &handle, PURPLE_CALLBACK(buddy_status_changed_cb),
+				loginState);
+		purple_signal_connect(blist_handle, "buddy-signed-on", &handle, PURPLE_CALLBACK(buddy_signed_on_off_cb),
+				GINT_TO_POINTER(TRUE));
+		purple_signal_connect(blist_handle, "buddy-signed-off", &handle, PURPLE_CALLBACK(buddy_signed_on_off_cb),
+				GINT_TO_POINTER(FALSE));
+		purple_signal_connect(blist_handle, "buddy-icon-changed", &handle, PURPLE_CALLBACK(buddy_avatar_changed_cb),
+				GINT_TO_POINTER(FALSE));
+		purple_signal_connect(blist_handle, "buddy-removed", &handle, PURPLE_CALLBACK(buddy_removed_cb),
+				GINT_TO_POINTER(FALSE));
+		purple_signal_connect(blist_handle, "buddy-added", &handle, PURPLE_CALLBACK(buddy_added_cb),
+				GINT_TO_POINTER(FALSE));
+		// webOS Servers/Rooms M3: also catch chats (Discord guild channels) added to the blist, so a
+		// late-arriving channel re-triggers the server/channel enumeration (see blist_node_added_cb).
+		purple_signal_connect(blist_handle, "blist-node-added", &handle, PURPLE_CALLBACK(blist_node_added_cb),
+				GINT_TO_POINTER(FALSE));
+		purple_signal_connect(blist_handle, "buddy-privacy-changed", &handle, PURPLE_CALLBACK(buddy_blocked_cb),
+				GINT_TO_POINTER(FALSE));
+
+		// webOS: track OUTGOING attachment transfer completion/failure so a FAILED upload downgrades its
+		// optimistically-"successful" Outbox row to "failed" (see xfer_send_*_cb + markAttachmentSendFailed).
+		// Connecting to a non-existent signal name is a harmless no-op, so cover both the single
+		// "file-send-cancel" and the split -remote/-user cancel forms across libpurple variants.
+		void* xfersHandle = purple_xfers_get_handle();
+		purple_signal_connect(xfersHandle, "file-send-complete", &handle, PURPLE_CALLBACK(xfer_send_complete_cb), NULL);
+		purple_signal_connect(xfersHandle, "file-send-cancel", &handle, PURPLE_CALLBACK(xfer_send_cancel_cb), NULL);
+		purple_signal_connect(xfersHandle, "file-send-cancel-remote", &handle, PURPLE_CALLBACK(xfer_send_cancel_cb), NULL);
+		purple_signal_connect(xfersHandle, "file-send-cancel-user", &handle, PURPLE_CALLBACK(xfer_send_cancel_cb), NULL);
+
+		// testing. Doesn't work: error - "Signal data for sent-im-msg not found". Need to figure out the right handle
+//		purple_signal_connect(purple_connections_get_handle(), "sent-im-msg", &handle, PURPLE_CALLBACK(sent_message_cb),
+//						GINT_TO_POINTER(FALSE));
+		s_registeredForPresenceUpdateSignals = TRUE;
+	}
+}
+
+static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
+{
 	PurpleAccount* loggedInAccount = purple_connection_get_account(gc);
 	g_return_if_fail(loggedInAccount != NULL);
 
@@ -1599,42 +1648,7 @@ static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 		MojLogError(IMServiceApp::s_log, _T("ERROR: account_logged_in_cb called with loginState=NULL"));
 	}
 
-	if (s_registeredForPresenceUpdateSignals == FALSE)
-	{
-		purple_signal_connect(blist_handle, "buddy-status-changed", &handle, PURPLE_CALLBACK(buddy_status_changed_cb),
-				loginState);
-		purple_signal_connect(blist_handle, "buddy-signed-on", &handle, PURPLE_CALLBACK(buddy_signed_on_off_cb),
-				GINT_TO_POINTER(TRUE));
-		purple_signal_connect(blist_handle, "buddy-signed-off", &handle, PURPLE_CALLBACK(buddy_signed_on_off_cb),
-				GINT_TO_POINTER(FALSE));
-		purple_signal_connect(blist_handle, "buddy-icon-changed", &handle, PURPLE_CALLBACK(buddy_avatar_changed_cb),
-				GINT_TO_POINTER(FALSE));
-		purple_signal_connect(blist_handle, "buddy-removed", &handle, PURPLE_CALLBACK(buddy_removed_cb),
-				GINT_TO_POINTER(FALSE));
-		purple_signal_connect(blist_handle, "buddy-added", &handle, PURPLE_CALLBACK(buddy_added_cb),
-				GINT_TO_POINTER(FALSE));
-		// webOS Servers/Rooms M3: also catch chats (Discord guild channels) added to the blist, so a
-		// late-arriving channel re-triggers the server/channel enumeration (see blist_node_added_cb).
-		purple_signal_connect(blist_handle, "blist-node-added", &handle, PURPLE_CALLBACK(blist_node_added_cb),
-				GINT_TO_POINTER(FALSE));
-		purple_signal_connect(blist_handle, "buddy-privacy-changed", &handle, PURPLE_CALLBACK(buddy_blocked_cb),
-				GINT_TO_POINTER(FALSE));
-
-		// webOS: track OUTGOING attachment transfer completion/failure so a FAILED upload downgrades its
-		// optimistically-"successful" Outbox row to "failed" (see xfer_send_*_cb + markAttachmentSendFailed).
-		// Connecting to a non-existent signal name is a harmless no-op, so cover both the single
-		// "file-send-cancel" and the split -remote/-user cancel forms across libpurple variants.
-		void* xfersHandle = purple_xfers_get_handle();
-		purple_signal_connect(xfersHandle, "file-send-complete", &handle, PURPLE_CALLBACK(xfer_send_complete_cb), NULL);
-		purple_signal_connect(xfersHandle, "file-send-cancel", &handle, PURPLE_CALLBACK(xfer_send_cancel_cb), NULL);
-		purple_signal_connect(xfersHandle, "file-send-cancel-remote", &handle, PURPLE_CALLBACK(xfer_send_cancel_cb), NULL);
-		purple_signal_connect(xfersHandle, "file-send-cancel-user", &handle, PURPLE_CALLBACK(xfer_send_cancel_cb), NULL);
-
-		// testing. Doesn't work: error - "Signal data for sent-im-msg not found". Need to figure out the right handle
-//		purple_signal_connect(purple_connections_get_handle(), "sent-im-msg", &handle, PURPLE_CALLBACK(sent_message_cb),
-//						GINT_TO_POINTER(FALSE));
-		s_registeredForPresenceUpdateSignals = TRUE;
-	}
+	registerPresenceUpdateSignals(loginState);
 }
 
 static void account_signed_off_cb(PurpleConnection* gc, gpointer loginState)
@@ -3283,6 +3297,8 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 		s_pendingAccountData.erase(accountKey);
 		s_ipAddressesBoundTo[accountKey] = params.localIpAddress.data();
 		MojLogInfo(IMServiceApp::s_log, _T("LibpurpleAdapter::login: adopting already-connected account %s (auto-login raced the signed-on handler)"), accountKey.c_str());
+		// account_logged_in_cb never ran for this connection, so connect the presence signals here.
+		registerPresenceUpdateSignals(loginState);
 		if (loginState)
 			((LoginCallbackInterface*)loginState)->loginResult(params.serviceName.data(), params.username.data(),
 			    LoginCallbackInterface::LOGIN_SUCCESS, false, ERROR_NO_ERROR, true);
