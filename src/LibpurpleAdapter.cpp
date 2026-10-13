@@ -2780,6 +2780,26 @@ static void initializeLibpurple()
 		abort();
 	}
 
+	/* webOS: libpurple keeps its own account list in accounts.xml, and purple_core_init signs in every
+	 * account still enabled there -- whether or not it still exists in webOS. An account removed while
+	 * the transport wasn't running (or crashed) is never disabled, so every later start signed it in
+	 * again, invisibly: messages to that screen name went to a session Messaging doesn't show, and
+	 * the real owner online elsewhere was knocked off in turn (found by the Lunacy project; the same
+	 * auto-login is what raced the signed-on handler into the adopt path in login()).
+	 * Sign in only what webOS asks for: disable every saved account here, before anything connects.
+	 * login() enables an account when webOS asks for it -- after a restart, IMLoginState re-drives
+	 * every account that wants to be online -- and saved credentials/sessions are kept. */
+	for (GList* l = purple_accounts_get_all(); l != NULL; l = l->next)
+	{
+		PurpleAccount* saved = (PurpleAccount*)l->data;
+		if (purple_account_get_enabled(saved, UI_ID))
+		{
+			MojLogInfo(IMServiceApp::s_log, _T("initializeLibpurple: not auto-signing-in saved account %s (%s); webOS signs in the ones it wants"),
+				saved->username ? saved->username : "", saved->protocol_id ? saved->protocol_id : "");
+			purple_account_set_enabled(saved, UI_ID, FALSE);
+		}
+	}
+
 	// Register the webOS cross-prpl reaction signals NOW, before any account connects, so a prpl that
 	// reconnects instantly from a saved session (whatsmeow) can connect to "webos-im-send-reaction" in
 	// its login handler without racing the (previously per-first-login) registration.
