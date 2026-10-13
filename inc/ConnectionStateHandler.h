@@ -71,6 +71,24 @@ public:
 		MojService*	m_service;
 	};
 
+	/*
+	 * Once per process, when the first connection report shows internet: make every imloginstate
+	 * record change so the loginstate watch fires and accounts that want to be online sign in.
+	 * See StartupLoginRedrive::start() for why.
+	 */
+	class StartupLoginRedrive : public MojSignalHandler {
+	public:
+		StartupLoginRedrive(MojService* service, const MojString& ipAddress);
+		MojErr start();
+	private:
+		MojErr offlineResult(MojObject& result, MojErr err);
+		MojErr ipResult(MojObject& result, MojErr err);
+		MojDbClient::Signal::Slot<StartupLoginRedrive> m_offlineSlot;
+		MojDbClient::Signal::Slot<StartupLoginRedrive> m_ipSlot;
+		MojDbServiceClient m_dbClient;
+		MojString m_ipAddress;
+	};
+
 	ConnectionState(MojService* service);
 	// Owns m_handler via a raw `new`; never meant to be copied (single instance held
 	// through the static m_connState). Delete the copy ops so an accidental copy can't

@@ -26,6 +26,7 @@
 #include "ConnectionStateHandler.h"
 #include "IMServiceApp.h"
 #include "IMServiceHandler.h"
+#include "IMDefines.h"
 
 ConnectionState* ConnectionState::m_connState = NULL;
 IMLoginState* ConnectionState::m_loginState = NULL;
@@ -271,6 +272,16 @@ MojErr ConnectionState::ConnectionStateHandler::connectionManagerResult(MojObjec
 				MojLogInfo(IMServiceApp::s_log, _T("ConnectionStateHandler::connectionManagerResult found=%i, wan ipAddress=%s"), found, m_connState->m_wanIpAddress.data());
 			}
 
+			// webOS: re-drive login once per process (see StartupLoginRedrive::start).
+			static bool s_startupRedriveDone = false;
+			if (!s_startupRedriveDone && ConnectionState::hasInternetConnection())
+			{
+				s_startupRedriveDone = true;
+				MojString ipAddress = m_connState->m_wifiConnected ? m_connState->m_wifiIpAddress : m_connState->m_wanIpAddress;
+				MojRefCountedPtr<ConnectionState::StartupLoginRedrive> redrive(new ConnectionState::StartupLoginRedrive(m_service, ipAddress));
+				redrive->start();
+			}
+
 			// If the loginState machine setup a listener, then post the change
 			if (m_loginState != NULL)
 			{
@@ -417,3 +428,65 @@ MojErr ConnectionState::ConnectionChangedScheduler::activityCompleteResult(MojOb
 	return err;
 }
 
+
+/*
+ * webOS: a transport that starts while accounts should be online -- after a crash, a restart, or the
+ * imwrap.sh watchdog replacing a copy that hung at boot -- never signed them in. Login is driven
+ * only by the db watch on imloginstate, which fires on a record CHANGE; the records still say what
+ * the previous process left, the watch has already seen that revision, and nothing else creates
+ * IMLoginState (IMServiceHandler only builds it when the loginstate activity fires). Palm's own
+ * comment in processLoginStates: "If im service crashes ... user will have to toggle availability
+ * to offline and then back online". handleConnectionChanged's re-drive merge doesn't help either:
+ * it isn't run at startup, and merging an unchanged ipAddress is a no-op in db8 (putObj returns
+ * early when nothing changed, so _rev doesn't move).
+ *
+ * So, once per process: mark every record offline with no ipAddress -- true, this process has signed
+ * nothing in -- then merge the current ipAddress back. The second merge always changes the record,
+ * the watch fires, and processLoginStates' "process just started" branch logs in each account whose
+ * availability is not offline; intentionally-offline accounts stay offline. The same two writes as
+ * a network drop followed by a reconnect.
+ */
+ConnectionState::StartupLoginRedrive::StartupLoginRedrive(MojService* service, const MojString& ipAddress)
+: m_offlineSlot(this, &ConnectionState::StartupLoginRedrive::offlineResult),
+  m_ipSlot(this, &ConnectionState::StartupLoginRedrive::ipResult),
+  m_dbClient(service, MojDbServiceDefs::ServiceName),
+  m_ipAddress(ipAddress)
+{
+}
+
+MojErr ConnectionState::StartupLoginRedrive::start()
+{
+	MojLogInfo(IMServiceApp::s_log, _T("StartupLoginRedrive: re-driving login for accounts that want to be online (ip %s)"), m_ipAddress.data());
+	MojDbQuery query; // all records
+	query.from(IM_LOGINSTATE_KIND);
+	MojObject props;
+	props.putString("state", LOGIN_STATE_OFFLINE);
+	props.putString("ipAddress", "");
+	MojErr err = m_dbClient.merge(m_offlineSlot, query, props);
+	if (err)
+		MojLogError(IMServiceApp::s_log, _T("StartupLoginRedrive: offline merge failed to send: %d"), err);
+	return err;
+}
+
+MojErr ConnectionState::StartupLoginRedrive::offlineResult(MojObject& result, MojErr err)
+{
+	if (err)
+		MojLogError(IMServiceApp::s_log, _T("StartupLoginRedrive: offline merge failed: %d"), err);
+	MojDbQuery query;
+	query.from(IM_LOGINSTATE_KIND);
+	MojObject props;
+	props.putString("ipAddress", m_ipAddress);
+	MojErr e = m_dbClient.merge(m_ipSlot, query, props);
+	if (e)
+		MojLogError(IMServiceApp::s_log, _T("StartupLoginRedrive: ipAddress merge failed to send: %d"), e);
+	return MojErrNone;
+}
+
+MojErr ConnectionState::StartupLoginRedrive::ipResult(MojObject& result, MojErr err)
+{
+	if (err)
+		MojLogError(IMServiceApp::s_log, _T("StartupLoginRedrive: ipAddress merge failed: %d"), err);
+	else
+		MojLogInfo(IMServiceApp::s_log, _T("StartupLoginRedrive: login states re-driven"));
+	return MojErrNone;
+}
