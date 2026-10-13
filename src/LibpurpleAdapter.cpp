@@ -1018,10 +1018,11 @@ static void buddy_signed_on_off_cb(PurpleBuddy* buddy, gpointer data)
 		buddyAvatarLocation = purple_buddy_icon_get_full_path(icon);
 	}
 
-	if (buddy->alias == NULL)
-	{
-		buddy->alias = (char*)"";
-	}
+	// Never store a string literal in buddy->alias: libpurple owns that field and g_free()s it when
+	// the buddy is destroyed (purple_blist_remove_buddy), so a literal there aborted the transport
+	// with "munmap_chunk(): invalid pointer" on every removal of a buddy that had no local alias --
+	// and Messaging re-sends the pending deleteBuddy at each sign-on, so it crash-looped. The alias
+	// is only read for the log line below, where glibc prints NULL as "(null)".
 
 	customMessage = purple_status_get_attr_string(activeStatus, "message");
 	if (customMessage == NULL)
@@ -1251,8 +1252,22 @@ static void buddy_avatar_changed_cb(PurpleBuddy* buddy)
  */
 static void buddy_removed_cb(PurpleBuddy* buddy)
 {
-	// nothing to do...
 	MojLogInfo(IMServiceApp::s_log, _T("buddy removed %s"), buddy->name);
+
+	// Drop a presence tick still waiting in the batch for this buddy. Otherwise the flush
+	// (PRESENCE_FLUSH_DEBOUNCE_SECONDS later) re-puts the imbuddystatus row that removeBuddyResult
+	// just deleted, and the removed buddy comes straight back in Messaging. Measured: a buddy
+	// signed on at login, was removed 0.1 s later, and the 3 s flush wrote it back ("put 2").
+	PurpleAccount* account = purple_buddy_get_account(buddy);
+	std::string const& accountKey = getAccountKeyFromPurpleAccount(account);
+	if (s_AccountIdsData.count(accountKey) == 0)
+		return;
+	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
+	std::string const buddyWebosName = getWebosUsername(buddy->name, serviceName, account);
+	std::unordered_map<std::string, std::unordered_map<std::string, PendingPresence> >::iterator ai =
+		s_pendingPresence.find(s_AccountIdsData[accountKey]);
+	if (ai != s_pendingPresence.end() && ai->second.erase(buddyWebosName) > 0)
+		MojLogInfo(IMServiceApp::s_log, _T("buddy removed %s: dropped its queued presence update"), buddy->name);
 }
 
 /*
@@ -1486,11 +1501,60 @@ static void xfer_send_cancel_cb(PurpleXfer* xfer, gpointer data)
 		s_imServiceHandler->markAttachmentSendFailed(dbId.c_str());
 }
 
-static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
+/*
+ * Connect the buddy-list / presence / transfer signals, once per process. Called from every path that
+ * makes an account live in the transport: account_logged_in_cb (the normal sign-on) AND
+ * LibpurpleAdapter::login's adopt path, taken when libpurple auto-logged the account in from
+ * accounts.xml before the "signed-on" handler existed. That adopt path used to return without
+ * connecting these, so presence never reached Messaging for the rest of the process (buddies stuck at
+ * whatever the sign-in buddy list said). Measured on webOS CE 3.1.0: every transport start after the
+ * account existed took the adopt path, and no buddy-status-changed callback ran.
+ */
+static void registerPresenceUpdateSignals(gpointer loginState)
 {
 	void* blist_handle = purple_blist_get_handle();
 	static int handle;
 
+	if (s_registeredForPresenceUpdateSignals == FALSE)
+	{
+		purple_signal_connect(blist_handle, "buddy-status-changed", &handle, PURPLE_CALLBACK(buddy_status_changed_cb),
+				loginState);
+		purple_signal_connect(blist_handle, "buddy-signed-on", &handle, PURPLE_CALLBACK(buddy_signed_on_off_cb),
+				GINT_TO_POINTER(TRUE));
+		purple_signal_connect(blist_handle, "buddy-signed-off", &handle, PURPLE_CALLBACK(buddy_signed_on_off_cb),
+				GINT_TO_POINTER(FALSE));
+		purple_signal_connect(blist_handle, "buddy-icon-changed", &handle, PURPLE_CALLBACK(buddy_avatar_changed_cb),
+				GINT_TO_POINTER(FALSE));
+		purple_signal_connect(blist_handle, "buddy-removed", &handle, PURPLE_CALLBACK(buddy_removed_cb),
+				GINT_TO_POINTER(FALSE));
+		purple_signal_connect(blist_handle, "buddy-added", &handle, PURPLE_CALLBACK(buddy_added_cb),
+				GINT_TO_POINTER(FALSE));
+		// webOS Servers/Rooms M3: also catch chats (Discord guild channels) added to the blist, so a
+		// late-arriving channel re-triggers the server/channel enumeration (see blist_node_added_cb).
+		purple_signal_connect(blist_handle, "blist-node-added", &handle, PURPLE_CALLBACK(blist_node_added_cb),
+				GINT_TO_POINTER(FALSE));
+		purple_signal_connect(blist_handle, "buddy-privacy-changed", &handle, PURPLE_CALLBACK(buddy_blocked_cb),
+				GINT_TO_POINTER(FALSE));
+
+		// webOS: track OUTGOING attachment transfer completion/failure so a FAILED upload downgrades its
+		// optimistically-"successful" Outbox row to "failed" (see xfer_send_*_cb + markAttachmentSendFailed).
+		// Connecting to a non-existent signal name is a harmless no-op, so cover both the single
+		// "file-send-cancel" and the split -remote/-user cancel forms across libpurple variants.
+		void* xfersHandle = purple_xfers_get_handle();
+		purple_signal_connect(xfersHandle, "file-send-complete", &handle, PURPLE_CALLBACK(xfer_send_complete_cb), NULL);
+		purple_signal_connect(xfersHandle, "file-send-cancel", &handle, PURPLE_CALLBACK(xfer_send_cancel_cb), NULL);
+		purple_signal_connect(xfersHandle, "file-send-cancel-remote", &handle, PURPLE_CALLBACK(xfer_send_cancel_cb), NULL);
+		purple_signal_connect(xfersHandle, "file-send-cancel-user", &handle, PURPLE_CALLBACK(xfer_send_cancel_cb), NULL);
+
+		// testing. Doesn't work: error - "Signal data for sent-im-msg not found". Need to figure out the right handle
+//		purple_signal_connect(purple_connections_get_handle(), "sent-im-msg", &handle, PURPLE_CALLBACK(sent_message_cb),
+//						GINT_TO_POINTER(FALSE));
+		s_registeredForPresenceUpdateSignals = TRUE;
+	}
+}
+
+static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
+{
 	PurpleAccount* loggedInAccount = purple_connection_get_account(gc);
 	g_return_if_fail(loggedInAccount != NULL);
 
@@ -1599,42 +1663,7 @@ static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 		MojLogError(IMServiceApp::s_log, _T("ERROR: account_logged_in_cb called with loginState=NULL"));
 	}
 
-	if (s_registeredForPresenceUpdateSignals == FALSE)
-	{
-		purple_signal_connect(blist_handle, "buddy-status-changed", &handle, PURPLE_CALLBACK(buddy_status_changed_cb),
-				loginState);
-		purple_signal_connect(blist_handle, "buddy-signed-on", &handle, PURPLE_CALLBACK(buddy_signed_on_off_cb),
-				GINT_TO_POINTER(TRUE));
-		purple_signal_connect(blist_handle, "buddy-signed-off", &handle, PURPLE_CALLBACK(buddy_signed_on_off_cb),
-				GINT_TO_POINTER(FALSE));
-		purple_signal_connect(blist_handle, "buddy-icon-changed", &handle, PURPLE_CALLBACK(buddy_avatar_changed_cb),
-				GINT_TO_POINTER(FALSE));
-		purple_signal_connect(blist_handle, "buddy-removed", &handle, PURPLE_CALLBACK(buddy_removed_cb),
-				GINT_TO_POINTER(FALSE));
-		purple_signal_connect(blist_handle, "buddy-added", &handle, PURPLE_CALLBACK(buddy_added_cb),
-				GINT_TO_POINTER(FALSE));
-		// webOS Servers/Rooms M3: also catch chats (Discord guild channels) added to the blist, so a
-		// late-arriving channel re-triggers the server/channel enumeration (see blist_node_added_cb).
-		purple_signal_connect(blist_handle, "blist-node-added", &handle, PURPLE_CALLBACK(blist_node_added_cb),
-				GINT_TO_POINTER(FALSE));
-		purple_signal_connect(blist_handle, "buddy-privacy-changed", &handle, PURPLE_CALLBACK(buddy_blocked_cb),
-				GINT_TO_POINTER(FALSE));
-
-		// webOS: track OUTGOING attachment transfer completion/failure so a FAILED upload downgrades its
-		// optimistically-"successful" Outbox row to "failed" (see xfer_send_*_cb + markAttachmentSendFailed).
-		// Connecting to a non-existent signal name is a harmless no-op, so cover both the single
-		// "file-send-cancel" and the split -remote/-user cancel forms across libpurple variants.
-		void* xfersHandle = purple_xfers_get_handle();
-		purple_signal_connect(xfersHandle, "file-send-complete", &handle, PURPLE_CALLBACK(xfer_send_complete_cb), NULL);
-		purple_signal_connect(xfersHandle, "file-send-cancel", &handle, PURPLE_CALLBACK(xfer_send_cancel_cb), NULL);
-		purple_signal_connect(xfersHandle, "file-send-cancel-remote", &handle, PURPLE_CALLBACK(xfer_send_cancel_cb), NULL);
-		purple_signal_connect(xfersHandle, "file-send-cancel-user", &handle, PURPLE_CALLBACK(xfer_send_cancel_cb), NULL);
-
-		// testing. Doesn't work: error - "Signal data for sent-im-msg not found". Need to figure out the right handle
-//		purple_signal_connect(purple_connections_get_handle(), "sent-im-msg", &handle, PURPLE_CALLBACK(sent_message_cb),
-//						GINT_TO_POINTER(FALSE));
-		s_registeredForPresenceUpdateSignals = TRUE;
-	}
+	registerPresenceUpdateSignals(loginState);
 }
 
 static void account_signed_off_cb(PurpleConnection* gc, gpointer loginState)
@@ -2751,6 +2780,26 @@ static void initializeLibpurple()
 		abort();
 	}
 
+	/* webOS: libpurple keeps its own account list in accounts.xml, and purple_core_init signs in every
+	 * account still enabled there -- whether or not it still exists in webOS. An account removed while
+	 * the transport wasn't running (or crashed) is never disabled, so every later start signed it in
+	 * again, invisibly: messages to that screen name went to a session Messaging doesn't show, and
+	 * the real owner online elsewhere was knocked off in turn (found by the Lunacy project; the same
+	 * auto-login is what raced the signed-on handler into the adopt path in login()).
+	 * Sign in only what webOS asks for: disable every saved account here, before anything connects.
+	 * login() enables an account when webOS asks for it -- after a restart, IMLoginState re-drives
+	 * every account that wants to be online -- and saved credentials/sessions are kept. */
+	for (GList* l = purple_accounts_get_all(); l != NULL; l = l->next)
+	{
+		PurpleAccount* saved = (PurpleAccount*)l->data;
+		if (purple_account_get_enabled(saved, UI_ID))
+		{
+			MojLogInfo(IMServiceApp::s_log, _T("initializeLibpurple: not auto-signing-in saved account %s (%s); webOS signs in the ones it wants"),
+				saved->username ? saved->username : "", saved->protocol_id ? saved->protocol_id : "");
+			purple_account_set_enabled(saved, UI_ID, FALSE);
+		}
+	}
+
 	// Register the webOS cross-prpl reaction signals NOW, before any account connects, so a prpl that
 	// reconnects instantly from a saved session (whatsmeow) can connect to "webos-im-send-reaction" in
 	// its login handler without racing the (previously per-first-login) registration.
@@ -2763,6 +2812,15 @@ static void initializeLibpurple()
 	purple_prefs_set_bool("/purple/logging/log_ims", FALSE);
 	purple_prefs_set_bool("/purple/logging/log_chats", FALSE);
 	purple_prefs_set_bool("/purple/logging/log_system", FALSE);
+
+	/* webOS: availability is the user's, set from Messaging (setMyAvailability). libpurple's
+	 * defaults go away by themselves after 5 minutes idle (away_when_idle, mins_before_away), and
+	 * with no UI idle ops "idle" is the time since the last purple_idle_touch(), which nothing here
+	 * calls: so every account went away 5 minutes after signing in, with libpurple's auto-away
+	 * message, and buddies saw it idle with Messaging open and the screen on. Turn auto-away and
+	 * idle reporting off; that also lifts an auto-away already set. */
+	purple_prefs_set_bool("/purple/away/away_when_idle", FALSE);
+	purple_prefs_set_string("/purple/away/idle_reporting", "none");
 
 	/* Create and load the buddylist. */
 	purple_set_blist(purple_blist_new());
@@ -3274,6 +3332,8 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 		s_pendingAccountData.erase(accountKey);
 		s_ipAddressesBoundTo[accountKey] = params.localIpAddress.data();
 		MojLogInfo(IMServiceApp::s_log, _T("LibpurpleAdapter::login: adopting already-connected account %s (auto-login raced the signed-on handler)"), accountKey.c_str());
+		// account_logged_in_cb never ran for this connection, so connect the presence signals here.
+		registerPresenceUpdateSignals(loginState);
 		if (loginState)
 			((LoginCallbackInterface*)loginState)->loginResult(params.serviceName.data(), params.username.data(),
 			    LoginCallbackInterface::LOGIN_SUCCESS, false, ERROR_NO_ERROR, true);
@@ -3581,9 +3641,11 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::removeBuddy(const char* serviceNa
 
 		PurpleBuddy* buddy = purple_find_buddy(account, buddyUsername);
 		if (NULL == buddy) {
-            res = INVALID_PARAMS;
-
-			MojLogError(IMServiceApp::s_log, _T("could not find buddy in list - cannot remove"));
+			// Already not a buddy (removed on the server, or only a stale Messaging row is left):
+			// that IS the requested end state, so report it done and let the caller delete the
+			// Messaging rows. Failing here left those rows -- and the buddy on screen -- forever.
+			res = SENT;
+			MojLogInfo(IMServiceApp::s_log, _T("removeBuddy: %s is not in the buddy list; clearing Messaging's records"), buddyUsername);
 		}
 		else {
 			PurpleGroup* group = purple_buddy_get_group(buddy);

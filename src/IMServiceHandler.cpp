@@ -47,6 +47,8 @@
 
 #define IMVersionString  "IMLibpurpleService 7-13 12:30pm starting...."
 
+const char* const IMServiceHandler::RESIDENT_FLAG = "/var/run/imlibpurple.resident";
+
 const IMServiceHandler::Method IMServiceHandler::s_methods[] = {
 	{_T("loginForTesting"), (Callback) &IMServiceHandler::loginForTesting},
 	{_T("onEnabled"), (Callback) &IMServiceHandler::onEnabled},
@@ -1692,16 +1694,18 @@ gboolean IMServiceHandler::ShutdownCallback(void* data)
  */
 bool IMServiceHandler::OkToShutdown()
 {
-	// When launched as the resident upstart daemon (imdaemon.sh sets IM_RESIDENT=1), never
-	// self-terminate on idle: the daemon owns the process lifecycle and respawns us immediately, so
+	// When kept resident by the upstart daemon (imdaemon.sh), never self-terminate on idle: the
+	// daemon owns the process lifecycle and starts us again immediately, so
 	// an idle self-shutdown just produces a shutdown<->respawn churn every SHUTDOWN_DELAY window that
 	// tears down and reloads every prpl each cycle -- including purple-signal's in-process JVM, which
 	// looks like "Signal keeps crashing" and never lets slow accounts (Signal's JVM, WhatsApp's
 	// contact sync) reach a stable connection. Staying resident lets the login-state machine retry
-	// with backoff until accounts reconnect. The on-demand .service path (no IM_RESIDENT) keeps the
-	// original idle-out behaviour. An external SIGTERM (reboot / upstart stop) still shuts us down.
-	static const bool resident = (getenv("IM_RESIDENT") != NULL);
-	if (resident)
+	// with backoff until accounts reconnect. Without the daemon, the on-demand .service path keeps
+	// the original idle-out behaviour. An external SIGTERM (reboot / upstart stop) still shuts us down.
+	// imdaemon.sh has ls-hubd launch us (one launcher, no race), and a hub launch can't carry an
+	// environment variable, so the daemon says so with RESIDENT_FLAG instead; IM_RESIDENT is still
+	// honoured for a direct launch. Checked on every call: the daemon may start after an on-demand copy.
+	if (getenv("IM_RESIDENT") != NULL || access(RESIDENT_FLAG, F_OK) == 0)
 		return false;
 
 	// ask libpurple if all accounts are logged off

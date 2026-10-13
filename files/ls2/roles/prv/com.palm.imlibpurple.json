@@ -16,6 +16,7 @@
       "inbound": [
         "com.palm.imlibpurple",
         "com.palm.activitymanager",
+        "com.palm.lunasend",
         "com.palm.app.messaging",
         "com.palm.app.accounts",
         "com.palm.app.discord",

@@ -29,6 +29,9 @@ if [ "$SZ" -gt 31457280 ] 2>/dev/null; then mv -f "$LOG" "$LOG.1" 2>/dev/null; f
 # login. Whichever one loses a given connector's LSRegisterPalmService call can't receive LS2
 # calls for it even though it may have its own valid, separately-logged-in session -- explains a
 # night of "REGISTERED but never responds to dial", not any single connector's own code.
+# imdaemon.sh no longer launches the transport itself (it has ls-hubd do it, so ls-hubd is the
+# only launcher), but ls-hubd still activates each of those service names on its own, so the
+# lock stays.
 # mkdir is atomic on POSIX (unlike a plain file test+create) so this is race-safe without flock,
 # which isn't reliably available here. PID-liveness check (not a trap-based cleanup) handles a
 # stale lock from a kill -9'd previous instance -- SIGKILL can't be trapped, and this script's own
