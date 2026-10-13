@@ -29,6 +29,9 @@ if [ "$SZ" -gt 31457280 ] 2>/dev/null; then mv -f "$LOG" "$LOG.1" 2>/dev/null; f
 # login. Whichever one loses a given connector's LSRegisterPalmService call can't receive LS2
 # calls for it even though it may have its own valid, separately-logged-in session -- explains a
 # night of "REGISTERED but never responds to dial", not any single connector's own code.
+# imdaemon.sh no longer launches the transport itself (it has ls-hubd do it, so ls-hubd is the
+# only launcher), but ls-hubd still activates each of those service names on its own, so the
+# lock stays.
 # mkdir is atomic on POSIX (unlike a plain file test+create) so this is race-safe without flock,
 # which isn't reliably available here. PID-liveness check (not a trap-based cleanup) handles a
 # stale lock from a kill -9'd previous instance -- SIGKILL can't be trapped, and this script's own
@@ -38,36 +41,8 @@ LOCKDIR=/var/run/imlibpurpletransport.lock
 if ! mkdir "$LOCKDIR" 2>/dev/null; then
   OLDPID=$(cat "$LOCKDIR/pid" 2>/dev/null)
   if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
-    if [ -z "$IM_RESIDENT" ]; then
-      echo "$(date -Iseconds 2>/dev/null) imwrap.sh: already running as pid $OLDPID, not starting a second instance" >> "$LOG"
-      exit 0
-    fi
-    # The resident (upstart) launch lost the race to an on-demand copy ls-hubd started first --
-    # anything calling com.palm.imlibpurple before the imtransport job is up does that, e.g. the
-    # loginstate activities at boot. Exiting here made upstart respawn the job every few seconds
-    # (through its pre-start, if it has one) until its respawn limit stopped it for good, leaving
-    # only the on-demand copy, which idles out once every account is offline with nothing
-    # resident behind it. Stay up as the job's main process instead, and take over (through the
-    # stale-lock reclaim below) once that copy exits.
-    echo "$(date -Iseconds 2>/dev/null) imwrap.sh: on-demand pid $OLDPID holds the transport; resident launch waiting for it to exit" >> "$LOG"
-    # An on-demand copy that never got past startup will never exit by itself: one thread blocked
-    # on a futex before its first log line (a PmLog client killed mid-init during boot leaves
-    # sem.PmLogLib locked; see the self-heal below). A healthy transport waits in poll(), so after
-    # 60 s of that, kill it and take over -- the reclaim below clears the semaphore first.
-    stuck=0
-    while kill -0 "$OLDPID" 2>/dev/null; do
-      sleep 5
-      if [ "$(cat /proc/$OLDPID/wchan 2>/dev/null)" = futex_wait_queue_me ] &&
-         grep -q '^Threads:[[:space:]]*1$' /proc/$OLDPID/status 2>/dev/null; then
-        stuck=$((stuck+5))
-        if [ $stuck -ge 60 ]; then
-          echo "$(date -Iseconds 2>/dev/null) imwrap.sh: on-demand pid $OLDPID stuck in startup for 60s (futex, 1 thread); killing it" >> "$LOG"
-          kill -9 "$OLDPID" 2>/dev/null
-        fi
-      else
-        stuck=0
-      fi
-    done
+    echo "$(date -Iseconds 2>/dev/null) imwrap.sh: already running as pid $OLDPID, not starting a second instance" >> "$LOG"
+    exit 0
   fi
   echo "$(date -Iseconds 2>/dev/null) imwrap.sh: stale lock (pid $OLDPID gone), reclaiming" >> "$LOG"
   rm -rf "$LOCKDIR"

@@ -8,7 +8,10 @@ builds `/usr/bin/imlibpurpletransport`). They are vendored here so a reflash can
 1. **`/etc/event.d/imtransport`** — upstart job. Starts on `ls-hubd_private-ready`, `respawn`s,
    and execs `/var/imdaemon.sh`. This is the keep-alive: it holds the transport resident so the
    luna hub cannot idle-reap it (see the job's own comment for the full rationale).
-2. **`/var/imdaemon.sh`** — launcher. Execs `imwrap.sh` with the same args as the LS2 `.service`.
+2. **`/var/imdaemon.sh`** — keep-alive loop. It doesn't launch the transport: it calls
+   `com.palm.imlibpurple` (as `com.palm.lunasend`, which the private role accepts for this) so that
+   `ls-hubd` launches it through the LS2 `.service`, then waits for it to exit and asks again. See
+   "One launcher" below.
 3. **`/var/imwrap.sh`** — the LD_PRELOAD / LD_LIBRARY_PATH wrapper that loads the transport under
    the wpe-glibc loader (required for purple-signal's in-process JVM). Also self-rotates the log,
    and self-provisions the OpenSSL override (see below).
@@ -76,6 +79,29 @@ fixed `.service` files): `ps -ef | grep imlibpurpletransport` shows two process 
 different parent PIDs (one PPID 1, one PPID = `ls-hubd`'s PID); `grep 'LSRegisterPalmService FAIL'
 imstdout.log` / `teams-call.log` (etc.) shows a registration collision; a connector's call service
 answers `callStateQuery` but never delivers `dial`/`answer` to the plugin's own log.
+
+## One launcher: imdaemon.sh asks ls-hubd (2026-10-13)
+
+The lock above stops two copies from running, but the upstart job and `ls-hubd` still both
+launched the transport, and at boot the hub usually won: anything calling `com.palm.imlibpurple`
+before the job is up (the loginstate activities, for one) starts an on-demand copy. The job's
+launch then found the lock taken and exited, so upstart respawned it until its respawn limit
+stopped it for good. A later fix had the job wait behind the on-demand copy instead, plus a
+heuristic watchdog (one thread blocked on a futex for 60 s) for a copy stuck in startup.
+
+Now the job never launches the transport. `imdaemon.sh` calls it on the bus, and `ls-hubd` starts it
+through the `.service` if it isn't running, so the hub is the only launcher and there is nothing to
+race. The job:
+
+- creates `/var/run/imlibpurple.resident`. The transport checks it in `OkToShutdown` to stay
+  resident: a hub launch can't carry the old `IM_RESIDENT` environment variable, which is still
+  honoured for a direct launch;
+- treats any reply as "up" (`Unknown method` included: the transport is on the bus), waits for that
+  process to exit, then asks again, backing off if it keeps dying at once;
+- treats no reply within 60 s as stuck in startup: it kills that copy, clears the PmLog semaphore,
+  and asks again. Getting onto the bus is the test, not a guess from `/proc`;
+- if the role doesn't accept `com.palm.lunasend` (an older role file), falls back to launching
+  the transport directly, after any on-demand copy has gone.
 
 ## Contacts search-by-service (two parts)
 

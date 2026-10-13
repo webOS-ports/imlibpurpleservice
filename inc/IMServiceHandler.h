@@ -97,6 +97,7 @@ public:
 
 private:
 	static const MojInt64 SHUTDOWN_DELAY_SECONDS = 30; // number of seconds to wait before shutting down
+	static const char* const RESIDENT_FLAG; // present while imdaemon.sh keeps the transport resident
 	static const Method s_methods[];
 	static const char* const COM_PALM_MESSAGING_KIND;
 
