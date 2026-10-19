@@ -1321,10 +1321,16 @@ MojErr IMLoginStateHandler::setWatch()
 	MojErrCheck(err);
 	err = params.putBool(_T("replace"), true);
 	MojErrCheck(err);
-	err = params.putBool(_T("subscribe"), true);
-	MojErrCheck(err);
 
-	err = req->send(m_activityCreateSlot, "com.palm.activitymanager", "create", params, MojServiceRequest::Unlimited);
+	// Deliberately NOT subscribing here. Subscribing on create makes this process the activity's
+	// holder, and then the adopt that adoptActivity() does when the callback arrives is refused:
+	//
+	//   method adopt {"activityId":273,"subscribe":true} -> "Resource temporarily unavailable" (11)
+	//
+	// which leaves the activity with no accepted owner and it expires. Create it unheld and let
+	// the usual fired-callback -> adoptActivity() path take ownership, which is the same sequence
+	// an activity created by the Configurator goes through.
+	err = req->send(m_activityCreateSlot, "com.palm.activitymanager", "create", params, 1);
 	MojErrCheck(err);
 
 	return MojErrNone;
