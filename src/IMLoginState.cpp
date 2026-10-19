@@ -241,6 +241,7 @@ void IMLoginState::putLoginStateData(const MojString& key, LoginStateData& newSt
 IMLoginStateHandler::IMLoginStateHandler(MojService* service, MojInt64 loginStateRevision, IMLoginState* loginStateController)
 : m_activityAdoptSlot(this, &IMLoginStateHandler::activityAdoptResult),
   m_activityCompleteSlot(this, &IMLoginStateHandler::activityCompleteResult),
+  m_activityCreateSlot(this, &IMLoginStateHandler::activityCreateResult),
   m_loginStateQuerySlot(this, &IMLoginStateHandler::loginStateQueryResult),
   m_getCredentialsSlot(this, &IMLoginStateHandler::getCredentialsResult),
   m_updateLoginStateSlot(this, &IMLoginStateHandler::updateLoginStateResult),
@@ -1219,12 +1220,131 @@ MojErr IMLoginStateHandler::completeAndResetWatch()
 	}
 	else
 	{
-		// this can happen if we got logged out from libpurple because user logged in somewhere else in which case our watch never fired
-		MojLogWarning(IMServiceApp::s_log, _T("completeAndResetWatch - no activity id to complete"));
-//		setWatch();
+		// No activity to complete, so there is nothing to restart - and without the call below
+		// that meant the login-state watch was simply gone, permanently.
+		//
+		// How we get here: the "Libpurple loginstate" activity (declared in
+		// /etc/palm/activities/com.palm.imlibpurple/com.palm.imloginstate.libpurple) triggers on
+		// `_rev > 0`, which is satisfied the moment any login state exists. It therefore fires
+		// immediately on creation rather than waiting for a change, and if nobody adopts it at
+		// that instant - the transport not up yet at boot, or the callback not delivered - it
+		// expires with no owner. Nothing re-created it, so from then on no imloginstate change
+		// could reach us: accounts sat at availability ONLINE, state offline, and no login was
+		// ever attempted. Toggling availability did nothing at all.
+		//
+		// Observed on a MindPhone: activitymanager listed "Libpurple loginstate" state=expired
+		// while the outbound message/command activities - whose queries match nothing yet, so
+		// they have never fired - sat correctly unsatisfied; and this very warning was the last
+		// thing logged.
+		MojLogWarning(IMServiceApp::s_log, _T("completeAndResetWatch - no activity id to complete, re-creating the watch"));
+		err = setWatch();
+		MojErrCheck(err);
 	}
 
 	return err;
+}
+
+/*
+ * (Re)create the login-state watch activity.
+ *
+ * Declared years ago and left commented out with a TODO ("No activity, so query the activity
+ * manager to see if we've got one. If not, create/start one."); this is that. The payload mirrors
+ * the on-disk config exactly, and "replace":true makes it idempotent - if a good activity is
+ * still there it is simply replaced by an identical one, and if it expired we get it back.
+ *
+ * We subscribe (Unlimited) so this process holds the activity rather than leaving it ownerless
+ * the way a create-and-exit does.
+ */
+MojErr IMLoginStateHandler::setWatch()
+{
+	MojLogInfo(IMServiceApp::s_log, _T("setWatch - (re)creating the login-state watch activity"));
+
+	MojRefCountedPtr<MojServiceRequest> req;
+	MojErr err = m_service->createRequest(req);
+	MojErrCheck(err);
+
+	MojObject trigger;
+	err = trigger.putString(_T("method"), _T("palm://com.palm.db/watch"));
+	MojErrCheck(err);
+	err = trigger.putString(_T("key"), _T("fired"));
+	MojErrCheck(err);
+
+	MojDbQuery dbQuery;
+	err = getLoginStateQuery(dbQuery);
+	MojErrCheck(err);
+	MojObject queryDetails;
+	err = dbQuery.toObject(queryDetails);
+	MojErrCheck(err);
+
+	MojObject triggerParams;
+	err = triggerParams.putBool(_T("subscribe"), true);
+	MojErrCheck(err);
+	err = triggerParams.put(_T("query"), queryDetails);
+	MojErrCheck(err);
+	err = trigger.put(_T("params"), triggerParams);
+	MojErrCheck(err);
+
+	MojObject callback;
+	err = callback.putString(_T("method"), _T("palm://com.palm.imlibpurple/loginStateChanged"));
+	MojErrCheck(err);
+
+	MojObject type;
+	err = type.putBool(_T("explicit"), true);
+	MojErrCheck(err);
+	err = type.putBool(_T("power"), true);
+	MojErrCheck(err);
+	err = type.putBool(_T("foreground"), true);
+	MojErrCheck(err);
+
+	MojObject requirements;
+	err = requirements.putBool(_T("internet"), true);
+	MojErrCheck(err);
+
+	MojObject activity;
+	err = activity.putString(_T("name"), _T("Libpurple loginstate"));
+	MojErrCheck(err);
+	err = activity.putString(_T("description"), _T("Watch for changes to the imloginstate"));
+	MojErrCheck(err);
+	err = activity.put(_T("type"), type);
+	MojErrCheck(err);
+	err = activity.put(_T("requirements"), requirements);
+	MojErrCheck(err);
+	err = activity.put(_T("trigger"), trigger);
+	MojErrCheck(err);
+	err = activity.put(_T("callback"), callback);
+	MojErrCheck(err);
+
+	MojObject params;
+	err = params.put(_T("activity"), activity);
+	MojErrCheck(err);
+	err = params.putBool(_T("start"), true);
+	MojErrCheck(err);
+	err = params.putBool(_T("replace"), true);
+	MojErrCheck(err);
+	err = params.putBool(_T("subscribe"), true);
+	MojErrCheck(err);
+
+	err = req->send(m_activityCreateSlot, "com.palm.activitymanager", "create", params, MojServiceRequest::Unlimited);
+	MojErrCheck(err);
+
+	return MojErrNone;
+}
+
+MojErr IMLoginStateHandler::activityCreateResult(MojObject& result, MojErr err)
+{
+	if (err != MojErrNone) {
+		MojString error;
+		MojErrToString(err, error);
+		MojLogError(IMServiceApp::s_log, _T("setWatch: activitymanager create failed: %d - %s"), err, error.data());
+		return MojErrNone;
+	}
+
+	MojInt64 activityId = -1;
+	if (result.get(_T("activityId"), activityId)) {
+		MojLogInfo(IMServiceApp::s_log, _T("setWatch: login-state watch activity is %lld"), activityId);
+	}
+
+	return MojErrNone;
 }
 
 // This is a callback from the LibpurpleAdapter for notification of login events (success, failed, disconnected)
