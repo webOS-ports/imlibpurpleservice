@@ -1125,16 +1125,32 @@ MojErr IMServiceHandler::IMSend(MojServiceMessage* serviceMsg, const MojObject p
 		return MojErrInvalidArg;
 	}
 
-	// check for returnValue = false in trigger parameter
+	// Reject the trigger only when it explicitly reports failure - which is what the comment
+	// above has always said: "check for returnValue = false". Requiring returnValue to be
+	// PRESENT is a stricter and different test, and it is wrong: what activitymanager delivers
+	// for a db8 watch carries the key the activity declared ("key": "fired" in
+	// /etc/palm/activities/com.palm.imlibpurple/com.palm.immessage.libpurple) and need not carry
+	// returnValue at all. So every outbound drain was thrown away with
+	//
+	//     IMSend failed: trigger does not have returnValue: true
+	//
+	// and the message sat in the outbox for ever. Measured on a MindPhone: putting a row with
+	// folder=outbox status=pending fired the activity, the callback arrived, this check
+	// discarded it and the activity went to state=failed; driving the same call by hand with
+	// returnValue:true sent that very row immediately (status pending -> successful).
 	MojObject trigger;
-	bool retVal = false;
-	found = activityObj.get(_T("trigger"), trigger);
-	if (found)
-		found = trigger.get(_T("returnValue"), retVal);
-	if (!found || !retVal) {
+	bool triggerFailed = false;
+	if (activityObj.get(_T("trigger"), trigger))
+	{
+		bool retVal = true;
+		if (trigger.get(_T("returnValue"), retVal) && !retVal)
+			triggerFailed = true;
+	}
+	if (triggerFailed) {
 		MojString msg;
-		msg.format(_T("IMSend failed: trigger does not have returnValue: true"));
+		msg.format(_T("IMSend failed: trigger reported returnValue: false"));
 		MojLogError(IMServiceApp::s_log, "%s", msg.data());
+		IMServiceHandler::logMojObjectJsonString(_T("IMSend trigger was: %s"), trigger);
 		// send error back to caller
 		serviceMsg->replyError(MojErrInvalidArg, msg);
 		return MojErrInvalidArg;
@@ -1199,16 +1215,32 @@ MojErr IMServiceHandler::IMSendCmd(MojServiceMessage* serviceMsg, const MojObjec
 		return MojErrInvalidArg;
 	}
 
-	// check for returnValue = false in trigger parameter
+	// Reject the trigger only when it explicitly reports failure - which is what the comment
+	// above has always said: "check for returnValue = false". Requiring returnValue to be
+	// PRESENT is a stricter and different test, and it is wrong: what activitymanager delivers
+	// for a db8 watch carries the key the activity declared ("key": "fired" in
+	// /etc/palm/activities/com.palm.imlibpurple/com.palm.immessage.libpurple) and need not carry
+	// returnValue at all. So every outbound drain was thrown away with
+	//
+	//     IMSendCmd failed: trigger does not have returnValue: true
+	//
+	// and the message sat in the outbox for ever. Measured on a MindPhone: putting a row with
+	// folder=outbox status=pending fired the activity, the callback arrived, this check
+	// discarded it and the activity went to state=failed; driving the same call by hand with
+	// returnValue:true sent that very row immediately (status pending -> successful).
 	MojObject trigger;
-	bool retVal = false;
-	found = activityObj.get(_T("trigger"), trigger);
-	if (found)
-		found = trigger.get(_T("returnValue"), retVal);
-	if (!found || !retVal) {
+	bool triggerFailed = false;
+	if (activityObj.get(_T("trigger"), trigger))
+	{
+		bool retVal = true;
+		if (trigger.get(_T("returnValue"), retVal) && !retVal)
+			triggerFailed = true;
+	}
+	if (triggerFailed) {
 		MojString msg;
-		msg.format(_T("IMSendCmd failed: trigger does not have returnValue: true"));
+		msg.format(_T("IMSendCmd failed: trigger reported returnValue: false"));
 		MojLogError(IMServiceApp::s_log, "%s", msg.data());
+		IMServiceHandler::logMojObjectJsonString(_T("IMSendCmd trigger was: %s"), trigger);
 		// send error back to caller
 		serviceMsg->replyError(MojErrInvalidArg, msg);
 		return MojErrInvalidArg;
