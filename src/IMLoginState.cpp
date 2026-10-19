@@ -326,7 +326,13 @@ MojErr IMLoginStateHandler::handleLoginStateChange(MojServiceMessage* serviceMsg
 		adoptActivity();
 	}
 
-	serviceMsg->replySuccess();
+	// NULL when this came from the direct db8 subscription rather than the activity callback:
+	// there is no request to answer. Dereferencing it unconditionally segfaulted the transport on
+	// the subscription's very first delivery, at startup, every time.
+	if (serviceMsg != NULL)
+	{
+		serviceMsg->replySuccess();
+	}
 	return MojErrNone;
 }
 
