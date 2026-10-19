@@ -67,6 +67,7 @@ IMServiceHandler::IMServiceHandler(MojService* service)
 : m_service(service),
   m_dbClient(service),
   m_tempdbClient(service, MojDbServiceDefs::TempServiceName),
+  m_loginStateWatchSlot(this, &IMServiceHandler::loginStateWatchResult),
   m_deleteConfigSlot(this, &IMServiceHandler::deleteConfigResult),
   m_putConfigSlot(this, &IMServiceHandler::putConfigResult),
   m_putRetainedDataSlot(this, &IMServiceHandler::putRetainedDataResult),
@@ -133,7 +134,71 @@ MojErr IMServiceHandler::init()
 	// consume a one-shot purge sentinel, if present (shell-driven service reset without luna-send)
 	checkPurgeSentinel();
 
+	// and watch the login states ourselves, rather than only through the activity
+	subscribeLoginStateDirect();
+
 	return MojErrNone;
+}
+
+/*
+ * Subscribe to the login-state kind directly, instead of relying solely on the activitymanager
+ * "Libpurple loginstate" activity to tell us a record changed.
+ *
+ * ConnectionStateHandler already made this move for connection state, and its comment says why:
+ * the activitymanager watch "can go stale ... and never report recovery", and a direct
+ * subscription "delivers the current status immediately on subscribe and on every change
+ * thereafter". The same applies here, and the stakes are higher - lose this watch and no account
+ * can ever log in again, because nothing else drives the login state machine.
+ *
+ * What the activity route needs, in order, every single time: the activity exists; it fires;
+ * activitymanager delivers the callback to us; we adopt it; we complete it with restart; the
+ * restart re-arms it. Miss any step and the watch is gone for good. Two ways it misses routinely,
+ * both measured on a MindPhone:
+ *
+ *   - the shipped config triggers on `_rev > 0`, already true the moment any login state exists,
+ *     so the activity fires at birth and expires before anything can adopt it. A probe identical
+ *     but for a trigger floored at the current revision stayed alive as "unsatisfied"; the
+ *     `_rev > 0` one went straight to "expired".
+ *   - activitymanager cannot deliver the callback to a transport it did not launch. Held by
+ *     systemd, the callback dies as a broken pipe, because the hub still starts its own instance
+ *     and that one exits on the name collision.
+ *
+ * A db8 subscription has none of those moving parts: db8 pushes to this process for as long as it
+ * is alive. Additive on purpose - the activity is untouched, so nothing that works today stops
+ * working, and handleLoginStateChange() already tolerates a payload with no $activity.
+ */
+MojErr IMServiceHandler::subscribeLoginStateDirect()
+{
+	MojDbQuery query;
+	MojErr err = query.from(_T("com.palm.imloginstate:1"));
+	MojErrCheck(err);
+	err = query.where(_T("_rev"), MojDbQuery::OpGreaterThan, 0);
+	MojErrCheck(err);
+
+	MojLogInfo(IMServiceApp::s_log, _T("subscribeLoginStateDirect - subscribing to the login states"));
+
+	// watch=true keeps it open: db8 answers now and again on every change.
+	err = m_dbClient.find(m_loginStateWatchSlot, query, true);
+	MojErrCheck(err);
+
+	return MojErrNone;
+}
+
+/*
+ * A login-state record changed (or this is the first answer). Drive the same machine the activity
+ * callback drives. The payload carries no "$activity", which handleLoginStateChange copes with.
+ */
+MojErr IMServiceHandler::loginStateWatchResult(MojObject& payload, MojErr err)
+{
+	if (err != MojErrNone) {
+		MojString error;
+		MojErrToString(err, error);
+		MojLogError(IMServiceApp::s_log, _T("loginStateWatchResult: subscription failed: %d - %s"), err, error.data());
+		return MojErrNone;
+	}
+
+	MojLogInfo(IMServiceApp::s_log, _T("loginStateWatchResult - login state changed, processing"));
+	return handleLoginStateChange(NULL, payload);
 }
 
 MojErr IMServiceHandler::onCreate(MojServiceMessage* serviceMsg, const MojObject payload)
