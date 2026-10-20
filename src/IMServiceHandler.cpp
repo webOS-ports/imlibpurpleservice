@@ -69,6 +69,7 @@ IMServiceHandler::IMServiceHandler(MojService* service)
 : m_service(service),
   m_dbClient(service),
   m_tempdbClient(service, MojDbServiceDefs::TempServiceName),
+  m_loginStateWatchSlot(this, &IMServiceHandler::loginStateWatchResult),
   m_deleteConfigSlot(this, &IMServiceHandler::deleteConfigResult),
   m_putConfigSlot(this, &IMServiceHandler::putConfigResult),
   m_putRetainedDataSlot(this, &IMServiceHandler::putRetainedDataResult),
@@ -135,7 +136,80 @@ MojErr IMServiceHandler::init()
 	// consume a one-shot purge sentinel, if present (shell-driven service reset without luna-send)
 	checkPurgeSentinel();
 
+	// Watch the login states directly, not only through the activity. Logged rather than fatal:
+	// the activity path, where it works, still drives logins.
+	MojErr subErr = subscribeLoginStateDirect();
+	if (subErr != MojErrNone)
+	{
+		MojString error;
+		MojErrToString(subErr, error);
+		MojLogError(IMServiceApp::s_log, _T("init: login-state subscription failed: %d - %s - no account will log in"),
+				subErr, error.data());
+	}
+
 	return MojErrNone;
+}
+
+/*
+ * Watch the login-state kind directly instead of relying on the activitymanager "Libpurple
+ * loginstate" activity. ConnectionStateHandler already made this move for connection state: a
+ * subscription delivers current state on subscribe and every change after, with none of the
+ * activity's moving parts (exists -> fires -> delivered -> adopted -> completed with restart).
+ *
+ * Two ways the activity misses routinely, both measured: its shipped trigger is `_rev > 0`, true
+ * as soon as any login state exists, so it fires at birth and expires unadopted; and
+ * activitymanager cannot deliver a callback to a transport it did not launch, which is the case
+ * under systemd.
+ *
+ * Additive: the activity is untouched, and handleLoginStateChange() tolerates no $activity.
+ */
+MojErr IMServiceHandler::subscribeLoginStateDirect()
+{
+	MojDbQuery query;
+	MojErr err = query.from(_T("com.palm.imloginstate:1"));
+	MojErrCheck(err);
+	err = query.where(_T("_rev"), MojDbQuery::OpGreaterThan, 0);
+	MojErrCheck(err);
+
+	MojLogInfo(IMServiceApp::s_log, _T("subscribeLoginStateDirect - subscribing to the login states"));
+
+	// watch=true keeps it open: db8 answers now and again on every change.
+	err = m_dbClient.find(m_loginStateWatchSlot, query, true);
+	MojErrCheck(err);
+
+	return MojErrNone;
+}
+
+/*
+ * A login-state record changed (or this is the first answer). Drive the same machine the activity
+ * callback drives. The payload carries no "$activity", which handleLoginStateChange copes with.
+ */
+MojErr IMServiceHandler::loginStateWatchResult(MojObject& payload, MojErr err)
+{
+	if (err != MojErrNone) {
+		MojString error;
+		MojErrToString(err, error);
+		MojLogError(IMServiceApp::s_log, _T("loginStateWatchResult: subscription failed: %d - %s"), err, error.data());
+		return MojErrNone;
+	}
+
+	MojLogInfo(IMServiceApp::s_log, _T("loginStateWatchResult - login state changed, processing"));
+	return handleLoginStateChange(NULL, payload);
+}
+
+/*
+ * True only when the activity's trigger explicitly reports failure. Absence of returnValue is not
+ * failure: a db8 watch callback carries just the key the activity declared ("fired"), so the old
+ * "returnValue must be present and true" test discarded every outbound drain and messages sat in
+ * the outbox for ever.
+ */
+bool IMServiceHandler::triggerReportedFailure(const MojObject& activityObj, MojObject& trigger)
+{
+	if (!activityObj.get(_T("trigger"), trigger))
+		return false;
+
+	bool retVal = true;
+	return trigger.get(_T("returnValue"), retVal) && !retVal;
 }
 
 MojErr IMServiceHandler::onCreate(MojServiceMessage* serviceMsg, const MojObject payload)
@@ -1062,16 +1136,13 @@ MojErr IMServiceHandler::IMSend(MojServiceMessage* serviceMsg, const MojObject p
 		return MojErrInvalidArg;
 	}
 
-	// check for returnValue = false in trigger parameter
+	// See triggerReportedFailure(): absence of returnValue is not failure.
 	MojObject trigger;
-	bool retVal = false;
-	found = activityObj.get(_T("trigger"), trigger);
-	if (found)
-		found = trigger.get(_T("returnValue"), retVal);
-	if (!found || !retVal) {
+	if (triggerReportedFailure(activityObj, trigger)) {
 		MojString msg;
-		msg.format(_T("IMSend failed: trigger does not have returnValue: true"));
+		msg.format(_T("IMSend failed: trigger reported returnValue: false"));
 		MojLogError(IMServiceApp::s_log, "%s", msg.data());
+		IMServiceHandler::logMojObjectJsonString(_T("IMSend trigger was: %s"), trigger);
 		// send error back to caller
 		serviceMsg->replyError(MojErrInvalidArg, msg);
 		return MojErrInvalidArg;
@@ -1136,16 +1207,13 @@ MojErr IMServiceHandler::IMSendCmd(MojServiceMessage* serviceMsg, const MojObjec
 		return MojErrInvalidArg;
 	}
 
-	// check for returnValue = false in trigger parameter
+	// See triggerReportedFailure(): absence of returnValue is not failure.
 	MojObject trigger;
-	bool retVal = false;
-	found = activityObj.get(_T("trigger"), trigger);
-	if (found)
-		found = trigger.get(_T("returnValue"), retVal);
-	if (!found || !retVal) {
+	if (triggerReportedFailure(activityObj, trigger)) {
 		MojString msg;
-		msg.format(_T("IMSendCmd failed: trigger does not have returnValue: true"));
+		msg.format(_T("IMSendCmd failed: trigger reported returnValue: false"));
 		MojLogError(IMServiceApp::s_log, "%s", msg.data());
+		IMServiceHandler::logMojObjectJsonString(_T("IMSendCmd trigger was: %s"), trigger);
 		// send error back to caller
 		serviceMsg->replyError(MojErrInvalidArg, msg);
 		return MojErrInvalidArg;

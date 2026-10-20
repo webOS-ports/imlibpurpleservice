@@ -3,6 +3,7 @@
         "imlibpurple-service.operation",
         "imlibpurple-call.operation",
         "accountsservice.management",
+        "accountsservice.operation",
         "luna-sysmgr.operation",
         "database.operation",
         "tempdatabase.operation",

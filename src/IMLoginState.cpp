@@ -325,7 +325,12 @@ MojErr IMLoginStateHandler::handleLoginStateChange(MojServiceMessage* serviceMsg
 		adoptActivity();
 	}
 
-	serviceMsg->replySuccess();
+	// NULL when this came from the direct db8 subscription: no request to answer. Dereferencing
+	// it segfaulted the transport on the subscription's first delivery.
+	if (serviceMsg != NULL)
+	{
+		serviceMsg->replySuccess();
+	}
 	return MojErrNone;
 }
 
@@ -481,7 +486,6 @@ MojErr IMLoginStateHandler::activityCompleteResult(MojObject& payload, MojErr re
 	MojLogInfo(IMServiceApp::s_log, _T("IMLoginStateHandler activity completed. err = %d"), resultErr);
 
 	m_activityAdoptSlot.cancel();
-	//setWatch();
 	return MojErrNone;
 }
 
@@ -1219,9 +1223,14 @@ MojErr IMLoginStateHandler::completeAndResetWatch()
 	}
 	else
 	{
-		// this can happen if we got logged out from libpurple because user logged in somewhere else in which case our watch never fired
-		MojLogWarning(IMServiceApp::s_log, _T("completeAndResetWatch - no activity id to complete"));
-//		setWatch();
+		// Normal with the direct db8 subscription (IMServiceHandler::subscribeLoginStateDirect):
+		// changes arrive on a persistent find(..., watch=true), so there is no activity to complete.
+		//
+		// This used to re-create the "Libpurple loginstate" activity here. That activity declared
+		// power:true, and since this runs after every login-state update the resident transport
+		// minted a power-holding activity each time and never released one - the device could not
+		// suspend (45 of 45 sleep attempts blocked) and the panel was left lit and blank.
+		MojLogInfo(IMServiceApp::s_log, _T("completeAndResetWatch - no activity to complete; direct subscription covers it"));
 	}
 
 	return err;

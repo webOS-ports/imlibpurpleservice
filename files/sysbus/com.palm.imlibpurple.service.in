@@ -1,3 +1,11 @@
 [D-BUS Service]
 Name=com.palm.imlibpurple
 Exec=@WEBOS_INSTALL_SBINDIR@/imlibpurpleservice -c {\"log\":{\"appender\":{\"type\":\"pmlog\"},\"levels\":{\"imlibpurple\":\"info\"}}} PalmPre Palm-Pre/1.5
+# Static: systemd owns the lifecycle (files/systemd/imlibpurpleservice.service); the hub must not
+# launch its own instance. Otherwise the two race for the name, the loser exits with "Attempted to
+# register for a service name that already exists", and a hub callback into it dies as a broken
+# pipe. com.webos.service.activitymanager is declared the same way.
+#
+# An IM transport cannot be on-demand anyway: it holds network connections to receive pushed
+# messages and must stay up while a human types a login code.
+Type=static

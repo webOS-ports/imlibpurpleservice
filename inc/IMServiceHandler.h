@@ -109,6 +109,13 @@ private:
 	// Temp DB client (com.palm.tempdb) - imbuddystatus lives there
 	MojDbServiceClient m_tempdbClient;
 
+    /* Live db8 subscription on the login-state kind, independent of the activity. */
+    MojErr subscribeLoginStateDirect();
+    MojDbClient::Signal::Slot<IMServiceHandler> m_loginStateWatchSlot;
+    MojErr loginStateWatchResult(MojObject& payload, MojErr err);
+
+    static bool triggerReportedFailure(const MojObject& activityObj, MojObject& trigger);
+
     MojDbClient::Signal::Slot<IMServiceHandler> m_deleteConfigSlot;
     MojErr deleteConfigResult(MojObject& payload, MojErr err);
     MojDbClient::Signal::Slot<IMServiceHandler> m_putConfigSlot;
