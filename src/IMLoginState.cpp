@@ -241,7 +241,6 @@ void IMLoginState::putLoginStateData(const MojString& key, LoginStateData& newSt
 IMLoginStateHandler::IMLoginStateHandler(MojService* service, MojInt64 loginStateRevision, IMLoginState* loginStateController)
 : m_activityAdoptSlot(this, &IMLoginStateHandler::activityAdoptResult),
   m_activityCompleteSlot(this, &IMLoginStateHandler::activityCompleteResult),
-  m_activityCreateSlot(this, &IMLoginStateHandler::activityCreateResult),
   m_loginStateQuerySlot(this, &IMLoginStateHandler::loginStateQueryResult),
   m_getCredentialsSlot(this, &IMLoginStateHandler::getCredentialsResult),
   m_updateLoginStateSlot(this, &IMLoginStateHandler::updateLoginStateResult),
@@ -488,7 +487,6 @@ MojErr IMLoginStateHandler::activityCompleteResult(MojObject& payload, MojErr re
 	MojLogInfo(IMServiceApp::s_log, _T("IMLoginStateHandler activity completed. err = %d"), resultErr);
 
 	m_activityAdoptSlot.cancel();
-	//setWatch();
 	return MojErrNone;
 }
 
@@ -1242,121 +1240,28 @@ MojErr IMLoginStateHandler::completeAndResetWatch()
 		// while the outbound message/command activities - whose queries match nothing yet, so
 		// they have never fired - sat correctly unsatisfied; and this very warning was the last
 		// thing logged.
-		MojLogWarning(IMServiceApp::s_log, _T("completeAndResetWatch - no activity id to complete, re-creating the watch"));
-		err = setWatch();
-		MojErrCheck(err);
+		// With the direct db8 subscription in place (IMServiceHandler::subscribeLoginStateDirect)
+		// this is the normal path, not a fault: login-state changes arrive on a persistent
+		// find(..., watch=true) rather than through an activity, so there is usually no activity
+		// to complete and nothing to restart.
+		//
+		// This used to call setWatch() to re-create the "Libpurple loginstate" activity. That
+		// activity declared power:true and foreground:true, and because this branch runs after
+		// every login-state update, the transport minted a fresh power-holding activity each time
+		// and - being resident under systemd - never let it go. The device could then never
+		// suspend. Measured on a MindPhone: 45 of 45 sleep attempts in a half hour were blocked by
+		// the same holder,
+		//
+		//   not suspended: wakeup source still active after 1000 ms:
+		//     WLAN AHB ISR,activity-am:com.palm.imlibpurple-113.17
+		//
+		// and with the panel never blanked, surface-manager answered the display-off with
+		// "Display power already off" and left the screen lit and empty - a white screen whenever
+		// the device tried to sleep, needing a power press and unlock to come back.
+		MojLogInfo(IMServiceApp::s_log, _T("completeAndResetWatch - no activity to complete; the direct login-state subscription covers this"));
 	}
 
 	return err;
-}
-
-/*
- * (Re)create the login-state watch activity.
- *
- * Declared years ago and left commented out with a TODO ("No activity, so query the activity
- * manager to see if we've got one. If not, create/start one."); this is that. The payload mirrors
- * the on-disk config exactly, and "replace":true makes it idempotent - if a good activity is
- * still there it is simply replaced by an identical one, and if it expired we get it back.
- *
- * We subscribe (Unlimited) so this process holds the activity rather than leaving it ownerless
- * the way a create-and-exit does.
- */
-MojErr IMLoginStateHandler::setWatch()
-{
-	MojLogInfo(IMServiceApp::s_log, _T("setWatch - (re)creating the login-state watch activity"));
-
-	MojRefCountedPtr<MojServiceRequest> req;
-	MojErr err = m_service->createRequest(req);
-	MojErrCheck(err);
-
-	MojObject trigger;
-	err = trigger.putString(_T("method"), _T("palm://com.palm.db/watch"));
-	MojErrCheck(err);
-	err = trigger.putString(_T("key"), _T("fired"));
-	MojErrCheck(err);
-
-	MojDbQuery dbQuery;
-	err = getLoginStateQuery(dbQuery);
-	MojErrCheck(err);
-	MojObject queryDetails;
-	err = dbQuery.toObject(queryDetails);
-	MojErrCheck(err);
-
-	MojObject triggerParams;
-	err = triggerParams.putBool(_T("subscribe"), true);
-	MojErrCheck(err);
-	err = triggerParams.put(_T("query"), queryDetails);
-	MojErrCheck(err);
-	err = trigger.put(_T("params"), triggerParams);
-	MojErrCheck(err);
-
-	MojObject callback;
-	err = callback.putString(_T("method"), _T("palm://com.palm.imlibpurple/loginStateChanged"));
-	MojErrCheck(err);
-
-	MojObject type;
-	err = type.putBool(_T("explicit"), true);
-	MojErrCheck(err);
-	err = type.putBool(_T("power"), true);
-	MojErrCheck(err);
-	err = type.putBool(_T("foreground"), true);
-	MojErrCheck(err);
-
-	MojObject requirements;
-	err = requirements.putBool(_T("internet"), true);
-	MojErrCheck(err);
-
-	MojObject activity;
-	err = activity.putString(_T("name"), _T("Libpurple loginstate"));
-	MojErrCheck(err);
-	err = activity.putString(_T("description"), _T("Watch for changes to the imloginstate"));
-	MojErrCheck(err);
-	err = activity.put(_T("type"), type);
-	MojErrCheck(err);
-	err = activity.put(_T("requirements"), requirements);
-	MojErrCheck(err);
-	err = activity.put(_T("trigger"), trigger);
-	MojErrCheck(err);
-	err = activity.put(_T("callback"), callback);
-	MojErrCheck(err);
-
-	MojObject params;
-	err = params.put(_T("activity"), activity);
-	MojErrCheck(err);
-	err = params.putBool(_T("start"), true);
-	MojErrCheck(err);
-	err = params.putBool(_T("replace"), true);
-	MojErrCheck(err);
-
-	// Deliberately NOT subscribing here. Subscribing on create makes this process the activity's
-	// holder, and then the adopt that adoptActivity() does when the callback arrives is refused:
-	//
-	//   method adopt {"activityId":273,"subscribe":true} -> "Resource temporarily unavailable" (11)
-	//
-	// which leaves the activity with no accepted owner and it expires. Create it unheld and let
-	// the usual fired-callback -> adoptActivity() path take ownership, which is the same sequence
-	// an activity created by the Configurator goes through.
-	err = req->send(m_activityCreateSlot, "com.palm.activitymanager", "create", params, 1);
-	MojErrCheck(err);
-
-	return MojErrNone;
-}
-
-MojErr IMLoginStateHandler::activityCreateResult(MojObject& result, MojErr err)
-{
-	if (err != MojErrNone) {
-		MojString error;
-		MojErrToString(err, error);
-		MojLogError(IMServiceApp::s_log, _T("setWatch: activitymanager create failed: %d - %s"), err, error.data());
-		return MojErrNone;
-	}
-
-	MojInt64 activityId = -1;
-	if (result.get(_T("activityId"), activityId)) {
-		MojLogInfo(IMServiceApp::s_log, _T("setWatch: login-state watch activity is %lld"), activityId);
-	}
-
-	return MojErrNone;
 }
 
 // This is a callback from the LibpurpleAdapter for notification of login events (success, failed, disconnected)

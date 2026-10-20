@@ -186,7 +186,6 @@ public:
 private:
 	MojErr adoptActivity();
 	MojErr completeAndResetWatch();
-	MojErr setWatch();
 	MojErr queryLoginState();
 	MojErr processLoginStates(MojObject& resultSet);
 	MojErr getLoginStateQuery(MojDbQuery& query);
@@ -205,10 +204,6 @@ private:
 
 	MojDbClient::Signal::Slot<IMLoginStateHandler> m_activityCompleteSlot;
 	MojErr activityCompleteResult(MojObject& result, MojErr err);
-
-	// setWatch() re-creates the login-state watch activity when we have lost it.
-	MojDbClient::Signal::Slot<IMLoginStateHandler> m_activityCreateSlot;
-	MojErr activityCreateResult(MojObject& result, MojErr err);
 
 	MojDbClient::Signal::Slot<IMLoginStateHandler> m_loginStateQuerySlot;
 	MojErr loginStateQueryResult(MojObject& result, MojErr err);
