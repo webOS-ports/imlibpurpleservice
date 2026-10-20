@@ -2,60 +2,46 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# Keep the IM transport resident on a systemd LuneOS device.
+# Keep the IM transport resident. com.palm.imlibpurple is normally an on-demand LS2 service that
+# the hub idle-reaps after 30s, which takes every connector with it: a pushed message in the
+# down-window is lost, and an interactive sign-in (Telegram asks for a code and waits for a human)
+# cannot finish. Measured: account enabled 15:59:43, "shutting down in 30 seconds" the same
+# second, stopped 16:00:13, login nowhere.
 #
-# This is the systemd half of what files/etc/event.d/imtransport does on the TouchPad, which is
-# upstart and so does not apply here. Same reasoning, repeated because it is the whole point:
-# com.palm.imlibpurple is normally an on-demand LS2 service, and the hub idle-reaps it. When it
-# goes, every connector goes with it, any message pushed during the down-window is lost, and an
-# interactive sign-in cannot finish - Telegram asks for a code through a chat and waits for a
-# human to type it, which takes rather longer than the idle timer allows.
-#
-# Measured on a MindPhone with no resident daemon: account enabled at 15:59:43, "ProcessDone -
-# shutting down in 30 seconds" the same second, "imlibpurpleservice stopped" at 16:00:13. The
-# login never got anywhere.
-#
-# Additive, like the upstart job: it does NOT replace the LS2 .service. It takes the
-# com.palm.imlibpurple name at boot so the hub routes to this instance instead of launching its
-# own, and worst case it simply fails to start and the on-demand path carries on as before.
+# The systemd half of files/etc/event.d/imtransport, which is upstart and so does not apply here.
 
 [Unit]
 Description=Keep the libpurple IM transport resident for pushed messages
 Requires=ls-hubd.service
 After=ls-hubd.service db8-maindb.service db8-tempdb.service activitymanager.service
-# The upstart job starts on ls-hubd_private-ready and lets respawn cover db8/activitymanager not
-# being up yet. After= here is ordering only, so keep the restart budget generous for the same
-# reason: 30 attempts an hour, matching "respawn limit 30 3600".
+# After= is ordering only, so keep the restart budget generous for db8/activitymanager not yet
+# being up - matching the upstart job's "respawn limit 30 3600".
 StartLimitIntervalSec=3600
 StartLimitBurst=30
 
 [Service]
 Type=simple
-# Root, as the hub launches it: the transport reads /etc/palm and writes the account stores.
+# Root, as the hub launches it: reads /etc/palm, writes the account stores.
 User=root
 
-# IM_RESIDENT is the switch IMServiceHandler::OkToShutdown() looks at. With it set the transport
-# never self-terminates on idle, so this unit's Restart= and the transport's own idle shutdown
-# cannot fight each other in a ~30s churn loop that reloads every prpl on each cycle.
+# The switch IMServiceHandler::OkToShutdown() reads. Without it this unit's Restart= and the
+# transport's own idle shutdown fight in a ~30s loop that reloads every prpl each cycle.
 Environment=IM_RESIDENT=1
 
 # libPmLogLib takes a one-time init lock on /dev/shm/sem.PmLogLib. A transport killed mid-init
-# leaves it LOCKED, and every later transport then blocks forever on its first PmLog call: one
-# thread, no log output, no hub connect, no accounts. Unlinking the name is harmless - sem_open
-# makes a fresh unlocked one and existing holders keep their handle - so clear it on every start.
+# leaves it locked and every later one blocks forever on its first PmLog call. Unlinking is safe:
+# sem_open makes a fresh one and existing holders keep their handle.
 ExecStartPre=-/bin/rm -f /dev/shm/sem.PmLogLib
 
-# The same invocation the LS2 .service uses (files/sysbus/com.palm.imlibpurple.service.in), so
-# the transport cannot tell which way it was started. pmlog rather than stdout: on this device
-# that is the journal, which is where the rest of LuneOS logs. Raise "info" to "debug" while
-# chasing a connector, and add Environment=IM_PURPLE_DEBUG=1 for the libpurple prpl debug too -
-# both are a flood on a resident daemon, so put them back afterwards.
+# The same invocation as files/sysbus/com.palm.imlibpurple.service.in, so the transport cannot
+# tell which way it started. Raise "info" to "debug", and add IM_PURPLE_DEBUG=1 for prpl debug,
+# while chasing a connector - both flood a resident daemon.
 ExecStart=/usr/sbin/imlibpurpleservice -c {\"log\":{\"appender\":{\"type\":\"pmlog\"},\"levels\":{\"imlibpurple\":\"info\"}}} PalmPre Palm-Pre/1.5
 
 Restart=always
 RestartSec=5
-# Slow connectors (Signal's in-process JVM, WhatsApp's contact sync) need a while before they are
-# usefully connected; do not let a restart land on top of one still settling.
+# Give connectors (Signal's in-process JVM, WhatsApp's contact sync) time to disconnect cleanly
+# before SIGKILL.
 TimeoutStopSec=20
 
 [Install]

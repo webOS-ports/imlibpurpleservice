@@ -134,38 +134,32 @@ MojErr IMServiceHandler::init()
 	// consume a one-shot purge sentinel, if present (shell-driven service reset without luna-send)
 	checkPurgeSentinel();
 
-	// and watch the login states ourselves, rather than only through the activity
-	subscribeLoginStateDirect();
+	// Watch the login states directly, not only through the activity. Logged rather than fatal:
+	// the activity path, where it works, still drives logins.
+	MojErr subErr = subscribeLoginStateDirect();
+	if (subErr != MojErrNone)
+	{
+		MojString error;
+		MojErrToString(subErr, error);
+		MojLogError(IMServiceApp::s_log, _T("init: login-state subscription failed: %d - %s - no account will log in"),
+				subErr, error.data());
+	}
 
 	return MojErrNone;
 }
 
 /*
- * Subscribe to the login-state kind directly, instead of relying solely on the activitymanager
- * "Libpurple loginstate" activity to tell us a record changed.
+ * Watch the login-state kind directly instead of relying on the activitymanager "Libpurple
+ * loginstate" activity. ConnectionStateHandler already made this move for connection state: a
+ * subscription delivers current state on subscribe and every change after, with none of the
+ * activity's moving parts (exists -> fires -> delivered -> adopted -> completed with restart).
  *
- * ConnectionStateHandler already made this move for connection state, and its comment says why:
- * the activitymanager watch "can go stale ... and never report recovery", and a direct
- * subscription "delivers the current status immediately on subscribe and on every change
- * thereafter". The same applies here, and the stakes are higher - lose this watch and no account
- * can ever log in again, because nothing else drives the login state machine.
+ * Two ways the activity misses routinely, both measured: its shipped trigger is `_rev > 0`, true
+ * as soon as any login state exists, so it fires at birth and expires unadopted; and
+ * activitymanager cannot deliver a callback to a transport it did not launch, which is the case
+ * under systemd.
  *
- * What the activity route needs, in order, every single time: the activity exists; it fires;
- * activitymanager delivers the callback to us; we adopt it; we complete it with restart; the
- * restart re-arms it. Miss any step and the watch is gone for good. Two ways it misses routinely,
- * both measured on a MindPhone:
- *
- *   - the shipped config triggers on `_rev > 0`, already true the moment any login state exists,
- *     so the activity fires at birth and expires before anything can adopt it. A probe identical
- *     but for a trigger floored at the current revision stayed alive as "unsatisfied"; the
- *     `_rev > 0` one went straight to "expired".
- *   - activitymanager cannot deliver the callback to a transport it did not launch. Held by
- *     systemd, the callback dies as a broken pipe, because the hub still starts its own instance
- *     and that one exits on the name collision.
- *
- * A db8 subscription has none of those moving parts: db8 pushes to this process for as long as it
- * is alive. Additive on purpose - the activity is untouched, so nothing that works today stops
- * working, and handleLoginStateChange() already tolerates a payload with no $activity.
+ * Additive: the activity is untouched, and handleLoginStateChange() tolerates no $activity.
  */
 MojErr IMServiceHandler::subscribeLoginStateDirect()
 {
@@ -199,6 +193,21 @@ MojErr IMServiceHandler::loginStateWatchResult(MojObject& payload, MojErr err)
 
 	MojLogInfo(IMServiceApp::s_log, _T("loginStateWatchResult - login state changed, processing"));
 	return handleLoginStateChange(NULL, payload);
+}
+
+/*
+ * True only when the activity's trigger explicitly reports failure. Absence of returnValue is not
+ * failure: a db8 watch callback carries just the key the activity declared ("fired"), so the old
+ * "returnValue must be present and true" test discarded every outbound drain and messages sat in
+ * the outbox for ever.
+ */
+bool IMServiceHandler::triggerReportedFailure(const MojObject& activityObj, MojObject& trigger)
+{
+	if (!activityObj.get(_T("trigger"), trigger))
+		return false;
+
+	bool retVal = true;
+	return trigger.get(_T("returnValue"), retVal) && !retVal;
 }
 
 MojErr IMServiceHandler::onCreate(MojServiceMessage* serviceMsg, const MojObject payload)
@@ -1125,28 +1134,9 @@ MojErr IMServiceHandler::IMSend(MojServiceMessage* serviceMsg, const MojObject p
 		return MojErrInvalidArg;
 	}
 
-	// Reject the trigger only when it explicitly reports failure - which is what the comment
-	// above has always said: "check for returnValue = false". Requiring returnValue to be
-	// PRESENT is a stricter and different test, and it is wrong: what activitymanager delivers
-	// for a db8 watch carries the key the activity declared ("key": "fired" in
-	// /etc/palm/activities/com.palm.imlibpurple/com.palm.immessage.libpurple) and need not carry
-	// returnValue at all. So every outbound drain was thrown away with
-	//
-	//     IMSend failed: trigger does not have returnValue: true
-	//
-	// and the message sat in the outbox for ever. Measured on a MindPhone: putting a row with
-	// folder=outbox status=pending fired the activity, the callback arrived, this check
-	// discarded it and the activity went to state=failed; driving the same call by hand with
-	// returnValue:true sent that very row immediately (status pending -> successful).
+	// See triggerReportedFailure(): absence of returnValue is not failure.
 	MojObject trigger;
-	bool triggerFailed = false;
-	if (activityObj.get(_T("trigger"), trigger))
-	{
-		bool retVal = true;
-		if (trigger.get(_T("returnValue"), retVal) && !retVal)
-			triggerFailed = true;
-	}
-	if (triggerFailed) {
+	if (triggerReportedFailure(activityObj, trigger)) {
 		MojString msg;
 		msg.format(_T("IMSend failed: trigger reported returnValue: false"));
 		MojLogError(IMServiceApp::s_log, "%s", msg.data());
@@ -1215,28 +1205,9 @@ MojErr IMServiceHandler::IMSendCmd(MojServiceMessage* serviceMsg, const MojObjec
 		return MojErrInvalidArg;
 	}
 
-	// Reject the trigger only when it explicitly reports failure - which is what the comment
-	// above has always said: "check for returnValue = false". Requiring returnValue to be
-	// PRESENT is a stricter and different test, and it is wrong: what activitymanager delivers
-	// for a db8 watch carries the key the activity declared ("key": "fired" in
-	// /etc/palm/activities/com.palm.imlibpurple/com.palm.immessage.libpurple) and need not carry
-	// returnValue at all. So every outbound drain was thrown away with
-	//
-	//     IMSendCmd failed: trigger does not have returnValue: true
-	//
-	// and the message sat in the outbox for ever. Measured on a MindPhone: putting a row with
-	// folder=outbox status=pending fired the activity, the callback arrived, this check
-	// discarded it and the activity went to state=failed; driving the same call by hand with
-	// returnValue:true sent that very row immediately (status pending -> successful).
+	// See triggerReportedFailure(): absence of returnValue is not failure.
 	MojObject trigger;
-	bool triggerFailed = false;
-	if (activityObj.get(_T("trigger"), trigger))
-	{
-		bool retVal = true;
-		if (trigger.get(_T("returnValue"), retVal) && !retVal)
-			triggerFailed = true;
-	}
-	if (triggerFailed) {
+	if (triggerReportedFailure(activityObj, trigger)) {
 		MojString msg;
 		msg.format(_T("IMSendCmd failed: trigger reported returnValue: false"));
 		MojLogError(IMServiceApp::s_log, "%s", msg.data());

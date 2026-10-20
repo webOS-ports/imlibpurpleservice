@@ -325,9 +325,8 @@ MojErr IMLoginStateHandler::handleLoginStateChange(MojServiceMessage* serviceMsg
 		adoptActivity();
 	}
 
-	// NULL when this came from the direct db8 subscription rather than the activity callback:
-	// there is no request to answer. Dereferencing it unconditionally segfaulted the transport on
-	// the subscription's very first delivery, at startup, every time.
+	// NULL when this came from the direct db8 subscription: no request to answer. Dereferencing
+	// it segfaulted the transport on the subscription's first delivery.
 	if (serviceMsg != NULL)
 	{
 		serviceMsg->replySuccess();
@@ -1224,41 +1223,14 @@ MojErr IMLoginStateHandler::completeAndResetWatch()
 	}
 	else
 	{
-		// No activity to complete, so there is nothing to restart - and without the call below
-		// that meant the login-state watch was simply gone, permanently.
+		// Normal with the direct db8 subscription (IMServiceHandler::subscribeLoginStateDirect):
+		// changes arrive on a persistent find(..., watch=true), so there is no activity to complete.
 		//
-		// How we get here: the "Libpurple loginstate" activity (declared in
-		// /etc/palm/activities/com.palm.imlibpurple/com.palm.imloginstate.libpurple) triggers on
-		// `_rev > 0`, which is satisfied the moment any login state exists. It therefore fires
-		// immediately on creation rather than waiting for a change, and if nobody adopts it at
-		// that instant - the transport not up yet at boot, or the callback not delivered - it
-		// expires with no owner. Nothing re-created it, so from then on no imloginstate change
-		// could reach us: accounts sat at availability ONLINE, state offline, and no login was
-		// ever attempted. Toggling availability did nothing at all.
-		//
-		// Observed on a MindPhone: activitymanager listed "Libpurple loginstate" state=expired
-		// while the outbound message/command activities - whose queries match nothing yet, so
-		// they have never fired - sat correctly unsatisfied; and this very warning was the last
-		// thing logged.
-		// With the direct db8 subscription in place (IMServiceHandler::subscribeLoginStateDirect)
-		// this is the normal path, not a fault: login-state changes arrive on a persistent
-		// find(..., watch=true) rather than through an activity, so there is usually no activity
-		// to complete and nothing to restart.
-		//
-		// This used to call setWatch() to re-create the "Libpurple loginstate" activity. That
-		// activity declared power:true and foreground:true, and because this branch runs after
-		// every login-state update, the transport minted a fresh power-holding activity each time
-		// and - being resident under systemd - never let it go. The device could then never
-		// suspend. Measured on a MindPhone: 45 of 45 sleep attempts in a half hour were blocked by
-		// the same holder,
-		//
-		//   not suspended: wakeup source still active after 1000 ms:
-		//     WLAN AHB ISR,activity-am:com.palm.imlibpurple-113.17
-		//
-		// and with the panel never blanked, surface-manager answered the display-off with
-		// "Display power already off" and left the screen lit and empty - a white screen whenever
-		// the device tried to sleep, needing a power press and unlock to come back.
-		MojLogInfo(IMServiceApp::s_log, _T("completeAndResetWatch - no activity to complete; the direct login-state subscription covers this"));
+		// This used to re-create the "Libpurple loginstate" activity here. That activity declared
+		// power:true, and since this runs after every login-state update the resident transport
+		// minted a power-holding activity each time and never released one - the device could not
+		// suspend (45 of 45 sleep attempts blocked) and the panel was left lit and blank.
+		MojLogInfo(IMServiceApp::s_log, _T("completeAndResetWatch - no activity to complete; direct subscription covers it"));
 	}
 
 	return err;
