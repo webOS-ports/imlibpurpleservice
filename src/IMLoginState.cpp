@@ -343,12 +343,10 @@ MojErr IMLoginStateHandler::handleConnectionChanged(const MojObject payload)
 	MojErr err;
 	// Things to check:
 	// + no connection - ensure all logged out
-	// + specific interface dropped - ensure all accounts on that interface are logged off
-	// + wifi is available - log out any accounts on wan so they switch to wifi
+	// + an interface dropped, or a better one came up - log off the accounts on any interface but
+	//   the best one (wired, then WiFi, then WAN); the re-drive below signs them in again from it
 
 	// If there's not internet connection, set all records to offline
-	bool wanConnected = ConnectionState::wanConnected();
-	bool wifiConnected = ConnectionState::wifiConnected();
 	if (!ConnectionState::hasInternetConnection())
 	{
 		MojLogInfo(IMServiceApp::s_log, _T("handleConnectionChanged no connection. setting all accounts offline"));
@@ -372,49 +370,37 @@ MojErr IMLoginStateHandler::handleConnectionChanged(const MojObject payload)
 		// Also tell libpurple to disconnect
 		LibpurpleAdapter::deviceConnectionClosed(true, NULL);
 	}
-	// Two reasons for disconnecting from WAN: it went down or WiFi came up.
-	// WiFi connection is preferred over WAN
-	else if (wanConnected == false || (wanConnected == true && wifiConnected == true))
+	else
 	{
-		//NOTE don't need to mark the buddies as offline since we're just switching to WiFi
+		// webOS: this used to be two cases - WAN down or WiFi up moved the WAN accounts to WiFi, WiFi
+		// down moved the WiFi accounts to WAN - and knew nothing of wired. An interface keeps its last
+		// address after it goes down, so the accounts still bound to it can be found here.
+		MojString bestIp = ConnectionState::bestIpAddress();
+		const MojString* interfaceIps[] = { &ConnectionState::wiredIpAddress(), &ConnectionState::wifiIpAddress(),
+		                                    &ConnectionState::wanIpAddress() };
+		for (const MojString* ip : interfaceIps)
+		{
+			if (ip->empty() || *ip == bestIp)
+				continue;
 
-		MojLogInfo(IMServiceApp::s_log, _T("handleConnectionChanged wan off, but wifi on. setting all wan accounts on ipAddress %s offline and switching to wifi"), ConnectionState::wanIpAddress().data() );
-		MojDbQuery query;
-		query.where("ipAddress", MojDbQuery::OpEq, ConnectionState::wanIpAddress());
-		query.from(IM_LOGINSTATE_KIND);
-		MojObject mergeProps;
-		mergeProps.putString("state", LOGIN_STATE_OFFLINE);
-		mergeProps.putString("ipAddress", "");
-		MojErr err = m_dbClient.merge(m_ignoreUpdateLoginStateSlot, query, mergeProps);
-		if (err) {
-			MojString error;
-			MojErrToString(err, error);
-			MojLogError(IMServiceApp::s_log, _T("handleConnectionChanged: merge login-states to offline failed: %d - %s"), err, error.data());
+			//NOTE don't need to mark the buddies as offline since we're just switching interface
+			MojLogInfo(IMServiceApp::s_log, _T("handleConnectionChanged: setting accounts on ipAddress %s offline and switching to %s"), ip->data(), bestIp.data());
+			MojDbQuery query;
+			query.where("ipAddress", MojDbQuery::OpEq, *ip);
+			query.from(IM_LOGINSTATE_KIND);
+			MojObject mergeProps;
+			mergeProps.putString("state", LOGIN_STATE_OFFLINE);
+			mergeProps.putString("ipAddress", "");
+			MojErr err = m_dbClient.merge(m_ignoreUpdateLoginStateSlot, query, mergeProps);
+			if (err) {
+				MojString error;
+				MojErrToString(err, error);
+				MojLogError(IMServiceApp::s_log, _T("handleConnectionChanged: merge login-states to offline failed: %d - %s"), err, error.data());
+			}
+
+			// Also tell libpurple to disconnect
+			LibpurpleAdapter::deviceConnectionClosed(false, ip->data());
 		}
-
-		// Also tell libpurple to disconnect
-		LibpurpleAdapter::deviceConnectionClosed(false, ConnectionState::wanIpAddress());
-	}
-	else if (wifiConnected == false)
-	{
-		//NOTE don't need to mark the buddies as offline since we're just switching to WAN
-
-		MojLogInfo(IMServiceApp::s_log, _T("handleConnectionChanged wifi off, setting all wifi accounts on ipAddress %s offline and switching to wan"),ConnectionState::wifiIpAddress().data() );
-		MojDbQuery query;
-		query.where("ipAddress", MojDbQuery::OpEq, ConnectionState::wifiIpAddress());
-		query.from(IM_LOGINSTATE_KIND);
-		MojObject mergeProps;
-		mergeProps.putString("state", LOGIN_STATE_OFFLINE);
-		mergeProps.putString("ipAddress", "");
-		MojErr err = m_dbClient.merge(m_ignoreUpdateLoginStateSlot, query, mergeProps);
-		if (err) {
-			MojString error;
-			MojErrToString(err, error);
-			MojLogError(IMServiceApp::s_log, _T("handleConnectionChanged: merge login-states to offline failed: %d - %s"), err, error.data());
-		}
-
-		// Also tell libpurple to disconnect
-		LibpurpleAdapter::deviceConnectionClosed(false, ConnectionState::wifiIpAddress());
 	}
 
 	// webOS: connection is (back) UP. Historically handleConnectionChanged ONLY ever set accounts
@@ -429,8 +415,7 @@ MojErr IMLoginStateHandler::handleConnectionChanged(const MojObject payload)
 	// the new interface. The empty query mirrors the "all records" merge used by the no-internet branch.
 	if (ConnectionState::hasInternetConnection())
 	{
-		MojString currentIp = ConnectionState::wifiConnected() ? ConnectionState::wifiIpAddress()
-		                                                       : ConnectionState::wanIpAddress();
+		MojString currentIp = ConnectionState::bestIpAddress();
 		MojLogInfo(IMServiceApp::s_log, _T("handleConnectionChanged: internet available - re-driving login for offline accounts (ip %s)"), currentIp.data());
 		MojDbQuery query; // intentionally empty query - all records; needsToLogin() filters to offline + want-online
 		query.from(IM_LOGINSTATE_KIND);
@@ -582,7 +567,7 @@ MojErr IMLoginStateHandler::handleBadCredentials(const MojString& serviceName, c
 
 MojErr IMLoginStateHandler::getCredentialsResult(MojObject& payload, MojErr resultErr)
 {
-	MojLogError(IMServiceApp::s_log, _T("getCredentialsResult:  resultErr:%d  wanConnected:%d  wifiConnected:%d"),resultErr, ConnectionState::wanConnected(),ConnectionState::wifiConnected());
+	MojLogError(IMServiceApp::s_log, _T("getCredentialsResult:  resultErr:%d  wiredConnected:%d  wanConnected:%d  wifiConnected:%d"),resultErr, ConnectionState::wiredConnected(), ConnectionState::wanConnected(),ConnectionState::wifiConnected());
 
 	// can't log this...
 	//IMServiceHandler::logMojObjectJsonString(_T("getCredentialsResult - payload: %s"), payload);

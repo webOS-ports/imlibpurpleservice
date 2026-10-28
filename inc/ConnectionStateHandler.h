@@ -31,6 +31,7 @@
 #include "db/MojDbServiceClient.h"
 #include "db/MojDb.h"
 #include "IMLoginState.h"
+#include "NetworkInterface.h"
 
 class ConnectionState {
 public:
@@ -102,15 +103,22 @@ public:
 
 	static void getBestConnection(MojString& connectionType, MojString& ipAddress);
 
+	// The address an account signs in from: wired, then WiFi, then WAN, whichever is up first.
+	static MojString bestIpAddress();
+
 	static bool hasInternetConnection();
+	static bool wiredConnected() { return ConnectionState::m_connState->m_wiredConnected == true; }
 	static bool wanConnected() { return ConnectionState::m_connState->m_wanConnected == true; }
 	static bool wifiConnected() { return ConnectionState::m_connState->m_wifiConnected == true; }
+	static MojString& wiredIpAddress() { return ConnectionState::m_connState->m_wiredIpAddress; }
 	static MojString& wanIpAddress() { return ConnectionState::m_connState->m_wanIpAddress; }
 	static MojString& wifiIpAddress() { return ConnectionState::m_connState->m_wifiIpAddress; }
 
 private:
 	void connectHandlerDied();
 	bool m_inetConnected;
+	bool m_wiredConnected;
+	MojString m_wiredIpAddress;
 	bool m_wanConnected;
 	MojString m_wanIpAddress;
 	bool m_wifiConnected;
