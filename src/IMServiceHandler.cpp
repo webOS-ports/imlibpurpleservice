@@ -70,6 +70,8 @@ IMServiceHandler::IMServiceHandler(MojService* service)
   m_dbClient(service),
   m_tempdbClient(service, MojDbServiceDefs::TempServiceName),
   m_loginStateWatchSlot(this, &IMServiceHandler::loginStateWatchResult),
+  m_loginStateWatchSlot2(this, &IMServiceHandler::loginStateWatchResult),
+  m_loginStateWatchOnSecond(false),
   m_deleteConfigSlot(this, &IMServiceHandler::deleteConfigResult),
   m_putConfigSlot(this, &IMServiceHandler::putConfigResult),
   m_putRetainedDataSlot(this, &IMServiceHandler::putRetainedDataResult),
@@ -152,9 +154,10 @@ MojErr IMServiceHandler::init()
 
 /*
  * Watch the login-state kind directly instead of relying on the activitymanager "Libpurple
- * loginstate" activity. ConnectionStateHandler already made this move for connection state: a
- * subscription delivers current state on subscribe and every change after, with none of the
- * activity's moving parts (exists -> fires -> delivered -> adopted -> completed with restart).
+ * loginstate" activity. ConnectionStateHandler already made this move for connection state. A db8
+ * watch answers with the current state and then fires once at the next change, so it is armed
+ * again each time (loginStateWatchResult) - still with none of the activity's moving parts
+ * (exists -> fires -> delivered -> adopted -> completed with restart).
  *
  * Two ways the activity misses routinely, both measured: its shipped trigger is `_rev > 0`, true
  * as soon as any login state exists, so it fires at birth and expires unadopted; and
@@ -173,8 +176,14 @@ MojErr IMServiceHandler::subscribeLoginStateDirect()
 
 	MojLogInfo(IMServiceApp::s_log, _T("subscribeLoginStateDirect - subscribing to the login states"));
 
-	// watch=true keeps it open: db8 answers now and again on every change.
-	err = m_dbClient.find(m_loginStateWatchSlot, query, true);
+	// watch=true: db8 answers now with the current records, then once more with "fired" at the
+	// next change, and that ends the request ("subscribe":false). loginStateWatchResult arms a new
+	// watch each time it fires. The new request goes on the other slot, never on the one whose
+	// callback is running.
+	MojDbClient::Signal::Slot<IMServiceHandler>& slot = m_loginStateWatchOnSecond ? m_loginStateWatchSlot2 : m_loginStateWatchSlot;
+	m_loginStateWatchOnSecond = !m_loginStateWatchOnSecond;
+	slot.cancel();
+	err = m_dbClient.find(slot, query, true);
 	MojErrCheck(err);
 
 	return MojErrNone;
@@ -191,6 +200,23 @@ MojErr IMServiceHandler::loginStateWatchResult(MojObject& payload, MojErr err)
 		MojErrToString(err, error);
 		MojLogError(IMServiceApp::s_log, _T("loginStateWatchResult: subscription failed: %d - %s"), err, error.data());
 		return MojErrNone;
+	}
+
+	// webOS: the watch has fired and is over. This used to be taken for a standing subscription:
+	// only the first change after start was ever seen, so an account set to available later never
+	// signed in. Arm a new watch instead of processing this one; its first answer is the current
+	// records, sent once it is watching, so a change made in between is not lost and none is
+	// handled twice.
+	bool fired = false;
+	if (payload.get(_T("fired"), fired) && fired)
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("loginStateWatchResult - login state changed, re-arming the watch"));
+		MojErr subErr = subscribeLoginStateDirect();
+		if (subErr == MojErrNone)
+			return MojErrNone;
+		MojString error;
+		MojErrToString(subErr, error);
+		MojLogError(IMServiceApp::s_log, _T("loginStateWatchResult: re-arming failed: %d - %s - processing this change only"), subErr, error.data());
 	}
 
 	MojLogInfo(IMServiceApp::s_log, _T("loginStateWatchResult - login state changed, processing"));

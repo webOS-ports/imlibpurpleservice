@@ -112,6 +112,9 @@ private:
     /* Live db8 subscription on the login-state kind, independent of the activity. */
     MojErr subscribeLoginStateDirect();
     MojDbClient::Signal::Slot<IMServiceHandler> m_loginStateWatchSlot;
+    // db8 watches are one-shot, so each change arms a new one; the two slots take turns.
+    MojDbClient::Signal::Slot<IMServiceHandler> m_loginStateWatchSlot2;
+    bool m_loginStateWatchOnSecond;
     MojErr loginStateWatchResult(MojObject& payload, MojErr err);
 
     static bool triggerReportedFailure(const MojObject& activityObj, MojObject& trigger);
