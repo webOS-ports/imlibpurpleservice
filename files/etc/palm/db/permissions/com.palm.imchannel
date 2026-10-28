@@ -70,6 +70,15 @@
     {
         "type": "db.kind",
         "object": "com.palm.imchannel:1",
+        "caller": "org.webosports.service.messaging",
+        "operations": {
+            "read": "allow",
+            "update": "allow"
+        }
+    },
+    {
+        "type": "db.kind",
+        "object": "com.palm.imchannel:1",
         "caller": "com.palm.messaging.chatthreader",
         "operations": {
             "create": "allow",
