@@ -33,6 +33,7 @@ IMLoginState* ConnectionState::m_loginState = NULL;
 
 ConnectionState::ConnectionState(MojService* service)
 : m_inetConnected(false),
+  m_wiredConnected(false),
   m_wanConnected(false),
   m_wifiConnected(false),
   m_service(service)
@@ -43,13 +44,18 @@ ConnectionState::ConnectionState(MojService* service)
 }
 
 bool ConnectionState::hasInternetConnection() {
-	MojLogInfo(IMServiceApp::s_log, _T("!!!!!!!!!wifi=%i, wan=%i, inet=%i"), ConnectionState::m_connState->m_wifiConnected, ConnectionState::m_connState->m_wanConnected,
+	MojLogInfo(IMServiceApp::s_log, _T("!!!!!!!!!wired=%i, wifi=%i, wan=%i, inet=%i"), ConnectionState::m_connState->m_wiredConnected,
+			ConnectionState::m_connState->m_wifiConnected, ConnectionState::m_connState->m_wanConnected,
 			ConnectionState::m_connState->m_inetConnected);
 	// we should look at m_inetConnected too... there are cases where connection manager says wan is connected but "unuseable" if it connection has not been torn down yet, but isInternetAvailable is false here
 	// {"internet":{"bridge":{"state":"disconnected"},"isInternetConnectionAvailable":false,"vpn":{"state":"disconnected"},
 	//    "wan":{"interfaceName":"wwan0","ipAddress":"10.13.118.115","network":"unusable","networkConfidenceLevel":"none","onInternet":"yes","state":"connected"},
 	//    "wifi":{"state":"disconnected"}}}}
-	return (ConnectionState::m_connState->m_inetConnected == true && (ConnectionState::m_connState->m_wifiConnected == true || ConnectionState::m_connState->m_wanConnected == true));
+	// webOS: wired counts too. Legacy webOS phones had only WiFi and WAN, but a LuneOS device on
+	// ethernet (a VM, a tablet in a dock) reports wired connected and both of those disconnected,
+	// and every account then stayed offline for want of a connection.
+	return (ConnectionState::m_connState->m_inetConnected == true && (ConnectionState::m_connState->m_wiredConnected == true ||
+			ConnectionState::m_connState->m_wifiConnected == true || ConnectionState::m_connState->m_wanConnected == true));
 }
 
 // This provides connectivity details when IMTransport has first launched and the
@@ -93,7 +99,12 @@ void ConnectionState::initConnectionStatesFromActivity(const MojObject& activity
 
 void ConnectionState::getBestConnection(MojString& connectionType, MojString& ipAddress)
 {
-	if (ConnectionState::m_connState->m_wifiConnected)
+	if (ConnectionState::m_connState->m_wiredConnected)
+	{
+		connectionType.assign("wired");
+		ipAddress = ConnectionState::m_connState->m_wiredIpAddress;
+	}
+	else if (ConnectionState::m_connState->m_wifiConnected)
 	{
 		connectionType.assign("wifi");
 		ipAddress = ConnectionState::m_connState->m_wifiIpAddress;
@@ -103,6 +114,13 @@ void ConnectionState::getBestConnection(MojString& connectionType, MojString& ip
 		connectionType.assign("wan");
 		ipAddress = ConnectionState::m_connState->m_wanIpAddress;
 	}
+}
+
+MojString ConnectionState::bestIpAddress()
+{
+	MojString connectionType, ipAddress;
+	getBestConnection(connectionType, ipAddress);
+	return ipAddress;
 }
 
 void ConnectionState::connectHandlerDied()
@@ -226,58 +244,21 @@ MojErr ConnectionState::ConnectionStateHandler::connectionManagerResult(MojObjec
 			bool prevInetConnected = m_connState->m_inetConnected;
 			internetRequirements.get("isInternetConnectionAvailable", m_connState->m_inetConnected);
 
+			bool prevWiredConnected = m_connState->m_wiredConnected;
 			bool prevWifiConnected = m_connState->m_wifiConnected;
-			bool found = false;
-			MojObject wifiObj;
-			internetRequirements.getRequired("wifi", wifiObj);
-			MojString wifiState;
-			err = wifiObj.getRequired("state", wifiState);
-			m_connState->m_wifiConnected = (err == MojErrNone && wifiState.compare("connected") == 0);
-			// If the connection was lost, keep the old ipAddress so it can be used to
-			// notify accounts that were using it
-			if (m_connState->m_wifiConnected == true)
-			{
-				err = wifiObj.get("ipAddress", m_connState->m_wifiIpAddress, found);
-				if (err != MojErrNone || found == false)
-				{
-					// It may claim to be connected, but there's no interface IP address
-					MojLogError(IMServiceApp::s_log, _T("Marking WiFi as disconnected because ipAddress is missing"));
-					m_connState->m_wifiConnected = false;
-				}
-				MojLogInfo(IMServiceApp::s_log, _T("ConnectionStateHandler::connectionManagerResult found=%i, wifi ipAddress=%s"), found, m_connState->m_wifiIpAddress.data());
-			}
-
 			bool prevWanConnected = m_connState->m_wanConnected;
-
-			MojObject wanObj;
-			err = internetRequirements.getRequired("wan", wanObj);
-			MojErrCheck(err);
-
-			MojString wanState;
-			err = wanObj.getRequired("state", wanState);
-			MojErrCheck(err);
-
-			m_connState->m_wanConnected = (err == MojErrNone && wanState.compare("connected") == 0);
-			// If the connection was lost, keep the old ipAddress so it can be used to
-			// notify accounts that were using it
-			if (m_connState->m_wanConnected == true)
-			{
-				err = wanObj.get("ipAddress", m_connState->m_wanIpAddress, found);
-				if (err != MojErrNone || found == false)
-				{
-					// It may claim to be connected, but there's no interface IP address
-					MojLogError(IMServiceApp::s_log, _T("Marking WAN as disconnected because ipAddress is missing"));
-					m_connState->m_wanConnected = false;
-				}
-				MojLogInfo(IMServiceApp::s_log, _T("ConnectionStateHandler::connectionManagerResult found=%i, wan ipAddress=%s"), found, m_connState->m_wanIpAddress.data());
-			}
+			// A missing or differently shaped interface is "not connected", never a reason to stop
+			// here: a wan object with no "state" used to return before any change was posted.
+			m_connState->m_wiredConnected = readNetworkInterface(internetRequirements, _T("wired"), m_connState->m_wiredIpAddress);
+			m_connState->m_wifiConnected = readNetworkInterface(internetRequirements, _T("wifi"), m_connState->m_wifiIpAddress);
+			m_connState->m_wanConnected = readNetworkInterface(internetRequirements, _T("wan"), m_connState->m_wanIpAddress);
 
 			// webOS: re-drive login once per process (see StartupLoginRedrive::start).
 			static bool s_startupRedriveDone = false;
 			if (!s_startupRedriveDone && ConnectionState::hasInternetConnection())
 			{
 				s_startupRedriveDone = true;
-				MojString ipAddress = m_connState->m_wifiConnected ? m_connState->m_wifiIpAddress : m_connState->m_wanIpAddress;
+				MojString ipAddress = ConnectionState::bestIpAddress();
 				MojRefCountedPtr<ConnectionState::StartupLoginRedrive> redrive(new ConnectionState::StartupLoginRedrive(m_service, ipAddress));
 				redrive->start();
 			}
@@ -286,6 +267,7 @@ MojErr ConnectionState::ConnectionStateHandler::connectionManagerResult(MojObjec
 			if (m_loginState != NULL)
 			{
 				if (prevInetConnected != m_connState->m_inetConnected ||
+					prevWiredConnected != m_connState->m_wiredConnected ||
 					prevWifiConnected != m_connState->m_wifiConnected ||
 					prevWanConnected != m_connState->m_wanConnected)
 				{
