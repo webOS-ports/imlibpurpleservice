@@ -96,7 +96,17 @@
                 "com.webos.service.audio",
                 "com.palm.mediad",
                 "com.palm.mediad.*",
-                "com.palm.display"
+                "com.palm.display",
+                "com.palm.app.phone",
+                "com.palm.app.phone-*",
+                "org.webosports.app.phone",
+                "org.webosports.app.phone-*",
+                "com.palm.app.messaging",
+                "com.palm.app.messaging-*",
+                "org.webosports.app.messaging",
+                "org.webosports.app.messaging-*",
+                "com.palm.app.telegram",
+                "com.palm.app.telegram-*"
             ]
         },
         {
@@ -124,7 +134,17 @@
                 "com.webos.service.audio",
                 "com.palm.mediad",
                 "com.palm.mediad.*",
-                "com.palm.display"
+                "com.palm.display",
+                "com.palm.app.phone",
+                "com.palm.app.phone-*",
+                "org.webosports.app.phone",
+                "org.webosports.app.phone-*",
+                "com.palm.app.messaging",
+                "com.palm.app.messaging-*",
+                "org.webosports.app.messaging",
+                "org.webosports.app.messaging-*",
+                "com.palm.app.signal",
+                "com.palm.app.signal-*"
             ]
         },
         {
@@ -152,7 +172,17 @@
                 "com.webos.service.audio",
                 "com.palm.mediad",
                 "com.palm.mediad.*",
-                "com.palm.display"
+                "com.palm.display",
+                "com.palm.app.phone",
+                "com.palm.app.phone-*",
+                "org.webosports.app.phone",
+                "org.webosports.app.phone-*",
+                "com.palm.app.messaging",
+                "com.palm.app.messaging-*",
+                "org.webosports.app.messaging",
+                "org.webosports.app.messaging-*",
+                "com.palm.app.teams",
+                "com.palm.app.teams-*"
             ]
         },
         {
@@ -180,7 +210,17 @@
                 "com.webos.service.audio",
                 "com.palm.mediad",
                 "com.palm.mediad.*",
-                "com.palm.display"
+                "com.palm.display",
+                "com.palm.app.phone",
+                "com.palm.app.phone-*",
+                "org.webosports.app.phone",
+                "org.webosports.app.phone-*",
+                "com.palm.app.messaging",
+                "com.palm.app.messaging-*",
+                "org.webosports.app.messaging",
+                "org.webosports.app.messaging-*",
+                "com.palm.app.whatsapp",
+                "com.palm.app.whatsapp-*"
             ]
         }
     ]
