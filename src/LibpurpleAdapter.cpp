@@ -56,6 +56,8 @@
 #include <signal.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <cstdio>
 #include <unordered_map>
@@ -171,6 +173,70 @@ struct AccountMetaData
     std::string account_key;
     std::string servicename;
 };
+
+/*
+ * webOS: the buddy-icon cache is something the UI has to read, not a private store.
+ *
+ * The path published into db8 (com.palm.person photos.squarePhotoPath) becomes an <img src> in
+ * Messaging, and WebAppMgr runs as "wam" while this transport runs as root. libpurple keeps the
+ * cache to itself: buddyicon.c creates the directory S_IRUSR|S_IWUSR|S_IXUSR (0700) and util.c
+ * fchmod()s every file it writes to S_IRUSR|S_IWUSR (0600), so each contact photo reached the app
+ * as a broken image. Widen what we hand out: the directory where it is set, with the icons
+ * already in it that db8 rows point at, and each file as its path goes out.
+ */
+static const char* const s_buddyIconCacheDir = "/var/luna/data/im-avatars";
+
+static void makeBuddyIconReadable(const char* path)
+{
+	if (path == NULL || path[0] == '\0')
+	{
+		return;
+	}
+	if (chmod(path, 0644) != 0 && errno != ENOENT)
+	{
+		MojLogWarning(IMServiceApp::s_log, _T("makeBuddyIconReadable: chmod %s: %s"), path, strerror(errno));
+	}
+}
+
+/**
+ * The buddy's icon path, readable by the UI that is about to draw it. The caller g_free()s it,
+ * as with purple_buddy_icon_get_full_path().
+ */
+static char* getReadableBuddyIconPath(PurpleBuddyIcon* icon)
+{
+	char* path = purple_buddy_icon_get_full_path(icon);
+	makeBuddyIconReadable(path);
+	return path;
+}
+
+static void prepareBuddyIconCacheDir()
+{
+	if (g_mkdir_with_parents(s_buddyIconCacheDir, 0755) != 0)
+	{
+		MojLogWarning(IMServiceApp::s_log, _T("prepareBuddyIconCacheDir: mkdir %s: %s"), s_buddyIconCacheDir,
+				strerror(errno));
+		return;
+	}
+	// An upgrade finds the directory libpurple made at 0700, with 0600 icons in it.
+	if (chmod(s_buddyIconCacheDir, 0755) != 0)
+	{
+		MojLogWarning(IMServiceApp::s_log, _T("prepareBuddyIconCacheDir: chmod %s: %s"), s_buddyIconCacheDir,
+				strerror(errno));
+	}
+	GDir* dir = g_dir_open(s_buddyIconCacheDir, 0, NULL);
+	if (dir == NULL)
+	{
+		return;
+	}
+	const char* name;
+	while ((name = g_dir_read_name(dir)) != NULL)
+	{
+		char* path = g_build_filename(s_buddyIconCacheDir, name, NULL);
+		makeBuddyIconReadable(path);
+		g_free(path);
+	}
+	g_dir_close(dir);
+}
 
 static void incoming_message_cb(PurpleConversation *conv, const char *who, const char *alias, const char *message,	PurpleMessageFlags flags, time_t mtime);
 // webOS reactions: handler for the "webos-im-reaction" signal a prpl emits; routes to the DB reaction merge.
@@ -1015,7 +1081,7 @@ static void buddy_signed_on_off_cb(PurpleBuddy* buddy, gpointer data)
 
 	if (icon != NULL)
 	{
-		buddyAvatarLocation = purple_buddy_icon_get_full_path(icon);
+		buddyAvatarLocation = getReadableBuddyIconPath(icon);
 	}
 
 	// Never store a string literal in buddy->alias: libpurple owns that field and g_free()s it when
@@ -1179,7 +1245,7 @@ static void buddy_status_changed_cb(PurpleBuddy* buddy, PurpleStatus* old_status
 	char* buddyAvatarLocation = NULL;
 	if (icon != NULL)
 	{
-		buddyAvatarLocation = purple_buddy_icon_get_full_path(icon);
+		buddyAvatarLocation = getReadableBuddyIconPath(icon);
 	}
 
 	PurpleGroup* group = purple_buddy_get_group(buddy);
@@ -2826,7 +2892,8 @@ static void initializeLibpurple()
 	purple_set_blist(purple_blist_new());
 	purple_blist_load();
 
-	purple_buddy_icons_set_cache_dir("/var/luna/data/im-avatars");
+	prepareBuddyIconCacheDir();
+	purple_buddy_icons_set_cache_dir(s_buddyIconCacheDir);
 
 	s_libpurpleInitialized = TRUE;
 	MojLogInfo(IMServiceApp::s_log, _T("libpurple initialized.\n"));
@@ -4149,7 +4216,7 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 			PurpleBuddyIcon* icon = purple_buddy_get_icon(buddyToBeAdded);
 			if (icon != NULL)
 			{
-				buddyAvatarLocation = purple_buddy_icon_get_full_path(icon);
+				buddyAvatarLocation = getReadableBuddyIconPath(icon);
 				buddyObj.putString("avatar", buddyAvatarLocation);
 				MojLogInfo(IMServiceApp::s_log, _T("getFullBuddyList: buddy %s avatar %s."), buddyToBeAdded->name, buddyAvatarLocation);
 			}
