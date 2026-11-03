@@ -54,6 +54,7 @@
         "audio.operation",
         "audio.query",
         "media.operation",
-        "media.query"
+        "media.query",
+        "rtc.operation"
     ]
 }
