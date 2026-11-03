@@ -5,6 +5,7 @@
                   "com.palm.whatsapp.call",
                   "com.palm.teams.call"],
  "imlibpurple-service.operation": ["dev"],
+ "imlibpurple-channel.operation": ["dev"],
  "imlibpurple-call.operation": ["dev"],
  "imlibpurple-call.debug": ["oem"]
 }
