@@ -11,7 +11,9 @@
         "com.palm.imlibpurple/sendCommand",
         "com.palm.imlibpurple/startQRLogin",
         "com.palm.imlibpurple/getAuthChallenge",
-        "com.palm.imlibpurple/submitAuthInput",
+        "com.palm.imlibpurple/submitAuthInput"
+    ],
+    "imlibpurple-channel.operation": [
         "com.palm.imlibpurple/openChannel"
     ],
     "imlibpurple-call.operation": [
