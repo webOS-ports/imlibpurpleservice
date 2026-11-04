@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -88,6 +89,13 @@ bool wav_to_opus_voicenote(const char* wavPath, const char* oggPath, float gain)
 
 	std::vector<int16_t> pcm; int rate = 0, channels = 0;
 	if (!parse_wav(raw.data(), raw.size(), pcm, rate, channels)) return false;
+
+	return pcm_to_opus_voicenote(std::move(pcm), rate, channels, oggPath, gain);
+}
+
+bool pcm_to_opus_voicenote(std::vector<int16_t> pcm, int rate, int channels, const char* oggPath, float gain)
+{
+	if (channels < 1 || channels > 2 || pcm.empty()) return false;
 
 	// libopus only accepts 8/12/16/24/48 kHz; the native capture is 8 kHz which is fine.
 	if (rate != 8000 && rate != 12000 && rate != 16000 && rate != 24000 && rate != 48000) return false;

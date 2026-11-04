@@ -11,9 +11,16 @@
 #ifndef OPUSENCODER_H_
 #define OPUSENCODER_H_
 
+#include <cstdint>
+#include <vector>
+
 // Transcode wavPath -> oggPath (Ogg/Opus, VOIP). gain is a linear amplitude multiplier applied to the
 // PCM before encoding (the native capture is quiet ~23% peak, so ~3.0 lifts it; samples are clamped to
 // int16). Returns true on success. On failure oggPath is not left as a valid file.
 bool wav_to_opus_voicenote(const char* wavPath, const char* oggPath, float gain);
+
+// The same for PCM already in memory: interleaved int16, 1 or 2 channels, at 8/12/16/24/48 kHz.
+// gain as above (a cap on the boost; 1.0 or less leaves the level alone).
+bool pcm_to_opus_voicenote(std::vector<int16_t> pcm, int rate, int channels, const char* oggPath, float gain);
 
 #endif /* OPUSENCODER_H_ */

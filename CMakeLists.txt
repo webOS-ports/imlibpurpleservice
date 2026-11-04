@@ -32,6 +32,11 @@ pkg_check_modules(PURPLE REQUIRED purple)
 include_directories(${PURPLE_INCUDE_DIRS})
 webos_add_compiler_flags(ALL ${PURPLE_CFLAGS})
 
+# Decodes the Messaging app's M4A voice recordings (src/VoiceNote.cpp).
+pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0 gstreamer-app-1.0)
+include_directories(${GSTREAMER_INCLUDE_DIRS})
+webos_add_compiler_flags(ALL ${GSTREAMER_CFLAGS_OTHER} -DHAVE_GSTREAMER)
+
 webos_add_compiler_flags(ALL "-DMOJ_LINUX -fno-rtti -std=c++17")
 
 # Legacy db8 (e.g. webOS 3.0.5) has no com.palm.config.libpurple:1 kind, so the
@@ -53,7 +58,7 @@ add_executable(imlibpurpleservice ${SOURCES})
 target_link_libraries(imlibpurpleservice
     ${GLIB2_LDFLAGS} ${LUNASERVICE2_LDFLAGS}
     ${GIO2_LDFLAGS} ${GIO-UNIX_LDFLAGS}
-    ${MOJODB_LDFLAGS} ${PURPLE_LDFLAGS} tidy rt pthread)
+    ${MOJODB_LDFLAGS} ${PURPLE_LDFLAGS} ${GSTREAMER_LDFLAGS} tidy rt pthread)
 
 webos_build_daemon()
 webos_build_system_bus_files()

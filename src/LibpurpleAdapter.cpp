@@ -75,6 +75,7 @@
 #include "IMServiceApp.h"
 #include "entities.h"       // decode_html_entities_utf8 - decode the app's &#NNNNN; emoji to UTF-8 for sendReaction
 #include "OpusEncoder.h"    // wav_to_opus_voicenote - transcode a recorded WAV to an Ogg/Opus voice note
+#include "VoiceNote.h"      // m4a_to_opus_voicenote - the same for the Messaging app's M4A recordings
 
 
 static const guint PURPLE_GLIB_READ_COND  = (G_IO_IN | G_IO_HUP | G_IO_ERR);
@@ -4756,19 +4757,29 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendFile(const char* serviceName,
 		return LibpurpleAdapter::SEND_FAILED;
 	}
 
-	// webOS voice messages: a recorded voice note arrives as a WAV (the native MediaCaptureV3 output;
-	// the file picker is image-only, so a .wav here is always our recorder). Transcode it to Ogg/Opus
-	// so the prpl sends it as a proper voice note (PTT) instead of a raw WAV document - Opus is the
-	// voice-note format for WhatsApp/Telegram/Discord/FB-E2EE. The .ogg is written next to the WAV and
-	// used for the rest of sendFile; `transcoded` must outlive the function so filePath stays valid.
+	// webOS voice messages. A recorded voice note arrives as a WAV (the legacy MediaCaptureV3 output)
+	// or, from the Messaging app's com.webos.service.mediarecorder, as an M4A in the recording
+	// folder. Transcode either to Ogg/Opus so the prpl sends it as a proper voice note (PTT) instead
+	// of a raw WAV document or an M4A the services take for a video - Opus is the voice-note format
+	// for WhatsApp/Telegram/Discord/FB-E2EE. The .ogg is written next to the recording and used for
+	// the rest of sendFile; `transcoded` must outlive the function so filePath stays valid. An M4A
+	// from anywhere else (a music file picked to send) goes out as it is. So does a recorded M4A to
+	// Signal: Signal's own voice notes are AAC, so the M4A stays in the codec its clients are built
+	// for, and purple-presage labels it as audio and marks it as a voice note instead.
 	std::string transcoded;
 	{
 		size_t plen = strlen(filePath);
-		if (plen > 4 && g_ascii_strcasecmp(filePath + plen - 4, ".wav") == 0)
+		bool wav = plen > 4 && g_ascii_strcasecmp(filePath + plen - 4, ".wav") == 0;
+		bool m4a = !wav && strcmp(serviceName, "type_signal") != 0 && is_recorded_voicenote(filePath);
+		if (wav || m4a)
 		{
 			transcoded.assign(filePath, plen - 4);
 			transcoded += ".ogg";
-			if (wav_to_opus_voicenote(filePath, transcoded.c_str(), 6.0f))
+			// The legacy capture is quiet, so a WAV may be lifted up to 6x; the mediarecorder's M4A
+			// already comes at a normal level and is left as it is.
+			bool done = wav ? wav_to_opus_voicenote(filePath, transcoded.c_str(), 6.0f)
+					: m4a_to_opus_voicenote(filePath, transcoded.c_str(), 1.0f);
+			if (done)
 			{
 				MojLogInfo(IMServiceApp::s_log, _T("sendFile: voice note transcoded %s -> %s"), filePath, transcoded.c_str());
 				filePath = transcoded.c_str();
