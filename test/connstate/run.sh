@@ -25,7 +25,7 @@ mkdir -p "$OUT"
 	-DMOJ_LINUX -DUSE_PMLOG_DECLARATION ${EXTRA_CXXFLAGS:-} \
 	-I"$ROOT/inc" -I"$SYSROOT/usr/include/mojodb" \
 	$(PKG_CONFIG_SYSROOT_DIR=$SYSROOT PKG_CONFIG_LIBDIR=$SYSROOT/usr/lib/pkgconfig pkg-config --cflags glib-2.0) \
-	"$HERE/readinterface_test.cpp" "$ROOT/src/NetworkInterface.cpp" \
+	"$HERE/readinterface_test.cpp" "$HERE/accountconfig_test.cpp" "$ROOT/src/NetworkInterface.cpp" \
 	-L"$SYSROOT/usr/lib" -lgtest_main -lgtest -lmojocore -lpthread \
 	-Wl,--dynamic-linker="$SYSROOT/usr/lib/ld-linux-x86-64.so.2" -Wl,-rpath,"$SYSROOT/usr/lib:$SYSROOT/lib" \
 	-o "$OUT/readinterface_test"

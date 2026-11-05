@@ -77,6 +77,7 @@
 #include "entities.h"       // decode_html_entities_utf8 - decode the app's &#NNNNN; emoji to UTF-8 for sendReaction
 #include "OpusEncoder.h"    // wav_to_opus_voicenote - transcode a recorded WAV to an Ogg/Opus voice note
 #include "VoiceNote.h"      // m4a_to_opus_voicenote - the same for the Messaging app's M4A recordings
+#include "AccountConfig.h"  // accountSettings - the sign-in app's settings out of their stored row
 
 
 static const guint PURPLE_GLIB_READ_COND  = (G_IO_IN | G_IO_HUP | G_IO_ERR);
@@ -3323,7 +3324,7 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 				 * account, not just this one). Catch it and fail only THIS account's login. */
 				try
 				{
-					account = Util::createPurpleAccount(purpleUsername.c_str(), prplProtocolId.c_str(), params.config);
+					account = Util::createPurpleAccount(purpleUsername.c_str(), prplProtocolId.c_str(), accountSettings(params.config));
 				}
 				catch (const Util::MojoException& e)
 				{
@@ -3401,7 +3402,7 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 		{
 			try
 			{
-				Util::applyProtocolOptions(account, params.config);
+				Util::applyProtocolOptions(account, accountSettings(params.config));
 			}
 			catch (const Util::MojoException& e)
 			{
@@ -3409,7 +3410,7 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 			}
 			MojString channels;
 			bool haveChannels = false;
-			params.config.get(_T("channels"), channels, haveChannels);
+			accountSettings(params.config).get(_T("channels"), channels, haveChannels);
 			Irc::seedChannels(account, haveChannels ? channels.data() : "");
 		}
 
