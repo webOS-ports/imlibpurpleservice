@@ -87,7 +87,8 @@
                 "com.palm.app.telegram-*",
                 "com.palm.systemmanager",
                 "com.palm.luna",
-                "com.webos.lunasend-*"
+                "com.webos.lunasend-*",
+                "org.webosports.rtcengine"
             ],
             "outbound":[
                 "com.palm.imlibpurple",
@@ -106,7 +107,8 @@
                 "org.webosports.app.messaging",
                 "org.webosports.app.messaging-*",
                 "com.palm.app.telegram",
-                "com.palm.app.telegram-*"
+                "com.palm.app.telegram-*",
+                "org.webosports.rtcengine"
             ]
         },
         {
