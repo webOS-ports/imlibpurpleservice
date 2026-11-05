@@ -3381,6 +3381,10 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 				// but no file is ever written and nothing renders. (WhatsApp worked only because it was
 				// in this list.)
 				attachDir = "/media/internal/.im-attachments/facebook";
+			else if (svc == "type_matrix")
+				// prpl-matrix (in the combined plugin) saves incoming media into this template's
+				// directory itself and shows it as a file:// link.
+				attachDir = "/media/internal/.im-attachments/matrix";
 			if (!attachDir.empty())
 			{
 				purple_build_dir(attachDir.c_str(), 0755);
@@ -3522,12 +3526,14 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
          * AcctMgr_Bad_Authentication — i.e. the user sees "wrong username and password"
          * even though the credentials were fine. Other protocols keep the normal timeout.
          * (Note: the retired plain purple-facebook was "prpl-facebook"; the current E2EE
-         * plugin registers as "prpl-gometa".) */
+         * plugin registers as "prpl-gometa".) Matrix (prpl-matrix) without a password waits
+         * for the user to approve the sign-in in a browser (OAuth 2.0 device code). */
         const char* protoId = purple_account_get_protocol_id(account);
         bool interactiveAuth = (protoId != NULL &&
                                 (strcmp(protoId, "prpl-discord") == 0 ||
                                  strcmp(protoId, "prpl-telegram") == 0 ||
                                  strcmp(protoId, "prpl-gometa") == 0 ||
+                                 strcmp(protoId, "prpl-matrix") == 0 ||
                                  strcmp(protoId, "prpl-hehoe-presage") == 0));
         guint connectTimeout = interactiveAuth ? QR_CONNECT_TIMEOUT_SECONDS : CONNECT_TIMEOUT_SECONDS;
         guint timerHandle = purple_timeout_add_seconds(connectTimeout, connectTimeoutCallback, new std::string(accountKey));

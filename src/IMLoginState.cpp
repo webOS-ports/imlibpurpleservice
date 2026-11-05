@@ -845,143 +845,164 @@ void IMLoginStateHandler::logLoginStates(const LoginStateData& cachedState, cons
 
 
 // resultArray should be an array of db objects of the form
-// {_id, _rev, username, serviceName, state, availability, customMessage}
+// {_id, _rev, username, serviceName, state, availability, customMessage}, in ascending _rev.
+//
+// webOS: this used to take only the first record and leave the rest to later watch fires. Each
+// change fires the watch once, so that only kept up while no two handlers overlapped. When they
+// did (several accounts signing in at start-up), both were built with the same revision, both took
+// the same record, and one change was never handled: from then on every fire handled an older,
+// settled record, and a record changed later (a new account) waited behind them until enough
+// unrelated changes came by. Now records the revision has passed are skipped, as another handler
+// took them, and records that need nothing, or only a synchronous call, are all handled here. The
+// first one that starts asynchronous work (sign-in, sign-off, buddy sync) ends the pass: that work
+// writes the record again, so the watch fires again for the records after it.
 MojErr IMLoginStateHandler::processLoginStates(MojObject& loginStateArray)
 {
-	MojErr err = MojErrNone;
-
-	MojObject loginStateEntry;
 	MojObject::ConstArrayIterator loginStateItr = loginStateArray.arrayBegin();
 	// This shouldn't happen, but check if there's nothing to do.
 	if (loginStateItr == loginStateArray.arrayEnd())
 	{
 		MojLogError(IMServiceApp::s_log, _T("processLoginStates had empty result set"));
 		completeAndResetWatch();
+		return MojErrNone;
 	}
-	else
+
+	for (; loginStateItr != loginStateArray.arrayEnd(); ++loginStateItr)
 	{
-		// Just grab the first change and deal with it. If other records have changed, we'll
-		// pick that up when the watch is reset. This works because the query is on _rev in
-		// ascending order.
-		loginStateEntry = *loginStateItr;
-		LoginStateData newState;
-		newState.assignFromDbRecord(loginStateEntry);
-
-		// Update the revision number so this change is removed from the next query.
-		m_loginStateController->setLoginStateRevision(newState.getRevision());
-		//m_loginStateRevision = newState.getRevision();
-
-		LoginStateData cachedState;
-		bool found = m_loginStateController->getLoginStateData(newState.getKey(), cachedState);
-		if (!found)
+		MojInt64 rev = 0;
+		if (loginStateItr->get("_rev", rev) && rev <= m_loginStateController->getLoginStateRevision())
 		{
-			 // Key not found - we must set the state of offline in this case, since this indicates the process just started
-			 // then let it proceed as normal for login
-			 // needed for the case of a crash, reboot or battery pull while the service is logged in. We will need to go through the
-			 // login process again when service comes back up even though state may have been saved as online
-			 MojString offlineState;
-			 offlineState.assign(LOGIN_STATE_OFFLINE);
-			 MojLogWarning(IMServiceApp::s_log, _T("processLoginStates Key not found, so assign the cache state to offline"));
-			 cachedState = newState;
-			 cachedState.setState(offlineState);
-
-			 // There are 3 possible cases here. We need to make sure something happens in each case.
-			 // if the system crashed, rebooted or powered off while we were online, then system will reboot and our watch will fire because the watch revision number
-			 // gets set back to zero on reboot. In this case availability is online, DB state is online and we want to go through login, so set state to offline.
-			 // If im service crashes, there is no reboot and then our watch never fires, so user will have to toggle availability to offline and then back online to get back in sync. In
-			 // this case availability first comes in as offline, DB state is online and we need to go through logoff, so leave state online
-			 // In the normal case where we shut down because all the accounts were logged off and now are being launched to change availability, the DB state will already be offline
-			 if (newState.getAvailability() != PalmAvailability::OFFLINE) {
-				 // set newstate offline to force login
-				 newState.setState(offlineState);
-			 }
-
+			MojLogInfo(IMServiceApp::s_log, _T("processLoginStates: rev %lld already handled"), (long long)rev);
+			continue;
 		}
+		MojObject loginStateEntry = *loginStateItr;
+		if (processLoginState(loginStateEntry))
+			return MojErrNone;
+	}
 
-		logLoginStates(cachedState, newState);
-		m_workingLoginState = newState;
-		if (newState.needsToLogin(cachedState))
-		{
-			// Get account info & password then start the login process.
-			bool found = false;
-			MojString accountId;
-			err = loginStateEntry.get("accountId", accountId, found);
-			if (err != MojErrNone || !found)
-			{
-				MojString error;
-				MojErrToString(err, error);
-				MojLogError(IMServiceApp::s_log, _T("ERROR accountId missing from imloginstate. error %d - %s"), err, error.data());
-				// TODO: fail the record and ...
-				completeAndResetWatch();
-			}
-			else
-			{
-				MojRefCountedPtr<MojServiceRequest> req;
-				err = m_service->createRequest(req);
-				if (err) {
-					MojString error;
-					MojErrToString(err, error);
-					MojLogError(IMServiceApp::s_log, _T("processLoginStates: createRequest for readCredentials failed: %d - %s"), err, error.data());
-				}
-				else {
-					MojObject params;
-					params.put("accountId", accountId);
-					params.putString("name", "common");
-					err = req->send(m_getCredentialsSlot, "com.palm.service.accounts","readCredentials", params, 1);
-					if (err) {
-						MojString error;
-						MojErrToString(err, error);
-						MojLogError(IMServiceApp::s_log, _T("processLoginStates: readCredentials send failed: %d - %s"), err, error.data());
-					}
-				}
-			}
-		}
-		else if (newState.needsToLogoff(cachedState))
-		{
-			// Now log out. The result will come in loginResult() with type=SIGNED_OFF
-			if (LibpurpleAdapter::logout(newState.getServiceName(), newState.getUsername(), m_loginStateController))
-			{
-				// Update state to show we're in the process of logging off
-				updateLoginStateNoResponse(newState.getServiceName(), newState.getUsername(), LOGIN_STATE_LOGGING_OFF, NULL);
-			}
-			else
-			{
-				// Logout returns false if the account is already logged out.
-				// update newState to offline to reflect the changed state
-				updateLoginStateNoResponse(newState.getServiceName(), newState.getUsername(), LOGIN_STATE_OFFLINE, NULL);
-				// Make the buddies for this account look offline to us
-				markBuddiesAsOffline(newState.getAccountId());
-				completeAndResetWatch();
-			}
-		}
-		else if (newState.needsToGetBuddies(cachedState))
-		{
-			getBuddyLists(newState.getServiceName(), newState.getUsername(), newState.getAccountId());
-		}
-		else if (newState.hasAvailabilityChanged(cachedState) || newState.hasCustomMessageChanged(cachedState))
-		{
-			if (newState.hasAvailabilityChanged(cachedState))
-			{
-				LibpurpleAdapter::setMyAvailability(newState.getServiceName().data(), newState.getUsername().data(), newState.getAvailability());
-			}
+	// Nothing asynchronous was started, so reset the watch for the next change.
+	completeAndResetWatch();
+	return MojErrNone;
+}
 
-			if (newState.hasCustomMessageChanged(cachedState))
-			{
-				LibpurpleAdapter::setMyCustomMessage(newState.getServiceName().data(), newState.getUsername().data(), newState.getCustomMessage().data());
-			}
+// Handle one login-state record. Returns true when it started asynchronous work, which completes
+// the watch itself when it finishes.
+bool IMLoginStateHandler::processLoginState(MojObject& loginStateEntry)
+{
+	MojErr err = MojErrNone;
+	bool started = false;
+	LoginStateData newState;
+	newState.assignFromDbRecord(loginStateEntry);
 
-			completeAndResetWatch();
+	// Update the revision number so this change is removed from the next query.
+	m_loginStateController->setLoginStateRevision(newState.getRevision());
+
+	LoginStateData cachedState;
+	bool found = m_loginStateController->getLoginStateData(newState.getKey(), cachedState);
+	if (!found)
+	{
+		 // Key not found - we must set the state of offline in this case, since this indicates the process just started
+		 // then let it proceed as normal for login
+		 // needed for the case of a crash, reboot or battery pull while the service is logged in. We will need to go through the
+		 // login process again when service comes back up even though state may have been saved as online
+		 MojString offlineState;
+		 offlineState.assign(LOGIN_STATE_OFFLINE);
+		 MojLogWarning(IMServiceApp::s_log, _T("processLoginStates Key not found, so assign the cache state to offline"));
+		 cachedState = newState;
+		 cachedState.setState(offlineState);
+
+		 // There are 3 possible cases here. We need to make sure something happens in each case.
+		 // if the system crashed, rebooted or powered off while we were online, then system will reboot and our watch will fire because the watch revision number
+		 // gets set back to zero on reboot. In this case availability is online, DB state is online and we want to go through login, so set state to offline.
+		 // If im service crashes, there is no reboot and then our watch never fires, so user will have to toggle availability to offline and then back online to get back in sync. In
+		 // this case availability first comes in as offline, DB state is online and we need to go through logoff, so leave state online
+		 // In the normal case where we shut down because all the accounts were logged off and now are being launched to change availability, the DB state will already be offline
+		 if (newState.getAvailability() != PalmAvailability::OFFLINE) {
+			 // set newstate offline to force login
+			 newState.setState(offlineState);
+		 }
+
+	}
+
+	logLoginStates(cachedState, newState);
+	m_workingLoginState = newState;
+	if (newState.needsToLogin(cachedState))
+	{
+		// Get account info & password then start the login process.
+		bool hasAccountId = false;
+		MojString accountId;
+		err = loginStateEntry.get("accountId", accountId, hasAccountId);
+		if (err != MojErrNone || !hasAccountId)
+		{
+			MojString error;
+			MojErrToString(err, error);
+			MojLogError(IMServiceApp::s_log, _T("ERROR accountId missing from imloginstate. error %d - %s"), err, error.data());
+			// TODO: fail the record and ...
 		}
 		else
 		{
-			// Nothing needed to be done so just reset the watch.
-			completeAndResetWatch();
+			MojRefCountedPtr<MojServiceRequest> req;
+			err = m_service->createRequest(req);
+			if (err) {
+				MojString error;
+				MojErrToString(err, error);
+				MojLogError(IMServiceApp::s_log, _T("processLoginStates: createRequest for readCredentials failed: %d - %s"), err, error.data());
+			}
+			else {
+				MojObject params;
+				params.put("accountId", accountId);
+				params.putString("name", "common");
+				err = req->send(m_getCredentialsSlot, "com.palm.service.accounts","readCredentials", params, 1);
+				if (err) {
+					MojString error;
+					MojErrToString(err, error);
+					MojLogError(IMServiceApp::s_log, _T("processLoginStates: readCredentials send failed: %d - %s"), err, error.data());
+				}
+				else {
+					started = true;
+				}
+			}
+		}
+	}
+	else if (newState.needsToLogoff(cachedState))
+	{
+		// Now log out. The result will come in loginResult() with type=SIGNED_OFF
+		if (LibpurpleAdapter::logout(newState.getServiceName(), newState.getUsername(), m_loginStateController))
+		{
+			// Update state to show we're in the process of logging off
+			updateLoginStateNoResponse(newState.getServiceName(), newState.getUsername(), LOGIN_STATE_LOGGING_OFF, NULL);
+			started = true;
+		}
+		else
+		{
+			// Logout returns false if the account is already logged out.
+			// update newState to offline to reflect the changed state
+			updateLoginStateNoResponse(newState.getServiceName(), newState.getUsername(), LOGIN_STATE_OFFLINE, NULL);
+			// Make the buddies for this account look offline to us
+			markBuddiesAsOffline(newState.getAccountId());
+		}
+	}
+	else if (newState.needsToGetBuddies(cachedState))
+	{
+		getBuddyLists(newState.getServiceName(), newState.getUsername(), newState.getAccountId());
+		started = true;
+	}
+	else if (newState.hasAvailabilityChanged(cachedState) || newState.hasCustomMessageChanged(cachedState))
+	{
+		if (newState.hasAvailabilityChanged(cachedState))
+		{
+			LibpurpleAdapter::setMyAvailability(newState.getServiceName().data(), newState.getUsername().data(), newState.getAvailability());
 		}
 
-		// Finally, add or update the cached entry to reflect whatever changed
-		m_loginStateController->putLoginStateData(newState.getKey(), newState);
+		if (newState.hasCustomMessageChanged(cachedState))
+		{
+			LibpurpleAdapter::setMyCustomMessage(newState.getServiceName().data(), newState.getUsername().data(), newState.getCustomMessage().data());
+		}
 	}
-	return err;
+
+	// Finally, add or update the cached entry to reflect whatever changed
+	m_loginStateController->putLoginStateData(newState.getKey(), newState);
+	return started;
 }
 
 

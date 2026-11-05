@@ -31,6 +31,8 @@
                 "com.palm.app.discord-*",
                 "com.palm.app.gometa",
                 "com.palm.app.gometa-*",
+                "com.palm.app.matrix",
+                "com.palm.app.matrix-*",
                 "com.palm.app.facebookim",
                 "com.palm.app.facebookim-*",
                 "com.palm.app.googlechat",
