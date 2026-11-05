@@ -126,6 +126,7 @@ public:
 	void putLoginStateData(const MojString& key, LoginStateData& state);
 
 	void setLoginStateRevision(const MojInt64 revision) { m_loginStateRevision = revision; }
+	MojInt64 getLoginStateRevision() const { return m_loginStateRevision; }
 
 	// tell listener we are starting a process
 	void ProcessStarting();
@@ -188,6 +189,7 @@ private:
 	MojErr completeAndResetWatch();
 	MojErr queryLoginState();
 	MojErr processLoginStates(MojObject& resultSet);
+	bool processLoginState(MojObject& loginStateEntry);
 	MojErr getLoginStateQuery(MojDbQuery& query);
 	MojErr handleBadCredentials(const MojString& serviceName, const MojString& username, const char* err);
 	MojErr updateLoginStateNoResponse(const MojString& serviceName, const MojString& username, const char* state, const char* ipAddress);
