@@ -26,6 +26,7 @@
         "com.palm.app.teams",
         "com.palm.service.accounts",
         "com.palm.app.gometa",
+        "com.palm.app.matrix",
         "com.palm.app.googlechat",
         "com.palm.app.phone",
         "org.webosports.app.messaging",
