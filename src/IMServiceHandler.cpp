@@ -63,6 +63,7 @@ const IMServiceHandler::Method IMServiceHandler::s_methods[] = {
 	{_T("getAuthChallenge"), (Callback) &IMServiceHandler::getAuthChallenge},
 	{_T("submitAuthInput"), (Callback) &IMServiceHandler::submitAuthInput},
 	{_T("openChannel"), (Callback) &IMServiceHandler::openChannel},
+	{_T("leaveChannel"), (Callback) &IMServiceHandler::leaveChannel},
 	{NULL, NULL} };
 
 IMServiceHandler::IMServiceHandler(MojService* service)
@@ -92,6 +93,7 @@ IMServiceHandler::IMServiceHandler(MojService* service)
   m_syncMergeChannelsSlot(this, &IMServiceHandler::syncMergeChannelsResult),
   m_syncDelGoneServersSlot(this, &IMServiceHandler::syncDelGoneServersResult),
   m_syncDelGoneChannelsSlot(this, &IMServiceHandler::syncDelGoneChannelsResult),
+  m_removeChannelSlot(this, &IMServiceHandler::removeChannelResult),
   m_connectionState(service)
 {
 	MojLogTrace(IMServiceApp::s_log);
@@ -757,10 +759,13 @@ bool IMServiceHandler::syncServersChannels(const char* serviceName, const char* 
 	// account's records in a never-converging churn. If a sync is already in flight, skip this one -
 	// the blist-changed trigger / next login re-enumerates, and the roster-signature guard means an
 	// unchanged roster won't re-sync anyway.
+	// Returns false, so the caller knows this roster did not land and can offer it again: two
+	// accounts signing in together (two IRC networks) would otherwise leave the second one's
+	// roster out until something in it changed.
 	if (m_syncInFlight)
 	{
 		MojLogInfo(IMServiceApp::s_log, _T("syncServersChannels: a sync is already in flight; skipping %s"), serviceName);
-		return true;
+		return false;
 	}
 	m_syncInFlight = true;
 
@@ -1101,6 +1106,74 @@ MojErr IMServiceHandler::openChannel(MojServiceMessage* serviceMsg, const MojObj
 	LibpurpleAdapter::openChannel(serviceName.data(), username.empty() ? NULL : username.data(), channel.data());
 
 	serviceMsg->replySuccess();
+	return MojErrNone;
+}
+
+/*
+ * webOS IRC: leaveChannel - the Messaging app's Leave Channel. The transport leaves the channel
+ * (PART), forgets it so it is not joined at the next sign-in, and removes its Servers-tab row.
+ *   { "serviceName": "type_irc", "channel": "#chan@network", "username": "<optional>" }
+ */
+MojErr IMServiceHandler::leaveChannel(MojServiceMessage* serviceMsg, const MojObject& payload)
+{
+	MojLogTrace(IMServiceApp::s_log);
+
+	MojString serviceName, channel, username;
+	bool found = false;
+	payload.get(_T("serviceName"), serviceName, found);
+	bool haveChannel = false;
+	payload.get(_T("channel"), channel, haveChannel);
+	payload.get(_T("username"), username, found);   // optional
+
+	if (serviceName.empty() || !haveChannel || channel.empty())
+	{
+		MojLogError(IMServiceApp::s_log, _T("leaveChannel: serviceName and channel are required"));
+		serviceMsg->replyError(MojErrInvalidArg);
+		return MojErrNone;
+	}
+
+	MojLogInfo(IMServiceApp::s_log, _T("leaveChannel: serviceName=%s channel=%s"), serviceName.data(), channel.data());
+	if (!LibpurpleAdapter::leaveChannel(serviceName.data(), username.empty() ? NULL : username.data(), channel.data()))
+	{
+		serviceMsg->replyError(MojErrNotFound, _T("no such channel on any signed-in account"));
+		return MojErrNone;
+	}
+
+	serviceMsg->replySuccess();
+	return MojErrNone;
+}
+
+/*
+ * webOS IRC: drop a left channel's imchannel row. Roster syncs are additive, so nothing else would.
+ * Its chatthread is left alone.
+ */
+bool IMServiceHandler::removeChannel(const char* serviceName, const char* remoteId)
+{
+	if (serviceName == NULL || *serviceName == '\0' || remoteId == NULL || *remoteId == '\0')
+		return false;
+	MojString svc, rid;
+	svc.assign(serviceName);
+	rid.assign(remoteId);
+	MojDbQuery query;
+	MojErr err = query.from(_T("com.palm.imchannel:1"));
+	if (err == MojErrNone)
+		err = query.where(_T("serviceName"), MojDbQuery::OpEq, svc);
+	if (err == MojErrNone)
+		err = query.where(_T("remoteId"), MojDbQuery::OpEq, rid);
+	if (err == MojErrNone)
+		err = m_dbClient.del(m_removeChannelSlot, query);
+	if (err != MojErrNone)
+	{
+		MojLogError(IMServiceApp::s_log, _T("removeChannel: del(imchannel %s) failed: %d"), remoteId, err);
+		return false;
+	}
+	return true;
+}
+
+MojErr IMServiceHandler::removeChannelResult(MojObject& /*payload*/, MojErr err)
+{
+	if (err != MojErrNone)
+		MojLogError(IMServiceApp::s_log, _T("removeChannel: del(imchannel) failed: %d"), err);
 	return MojErrNone;
 }
 

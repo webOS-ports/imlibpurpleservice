@@ -86,6 +86,7 @@ public:
 	virtual bool buddyInviteDeclined(const char* serviceName, const char* username, const char* usernameFrom);
 	// webOS Servers/Rooms M3: upsert the enumerated guild->channel roster into db8 (see .cpp).
 	virtual bool syncServersChannels(const char* serviceName, const char* username, MojObject& serversObj);
+	virtual bool removeChannel(const char* serviceName, const char* remoteId);
 
 	static MojErr logMojObjectJsonString(const MojChar* format, const MojObject mojObject);
 	// strip message body to protect private data
@@ -205,6 +206,9 @@ private:
     MojErr syncDelGoneServersResult(MojObject& payload, MojErr err);
     MojDbClient::Signal::Slot<IMServiceHandler> m_syncDelGoneChannelsSlot;
     MojErr syncDelGoneChannelsResult(MojObject& payload, MojErr err);
+    // webOS IRC: removeChannel's delete of a left channel's imchannel row.
+    MojDbClient::Signal::Slot<IMServiceHandler> m_removeChannelSlot;
+    MojErr removeChannelResult(MojObject& payload, MojErr err);
 
 	IMLoginState* m_loginState;
 	ConnectionState m_connectionState;
@@ -244,6 +248,9 @@ private:
 	MojErr submitAuthInput(MojServiceMessage* msg, const MojObject payload);
 	// webOS Servers/Rooms M3: join a channel on open so its history is fetched (see .cpp).
 	MojErr openChannel(MojServiceMessage* msg, const MojObject payload);
+	// Takes the payload by reference: the method table calls every handler as
+	// (MojServiceMessage*, const MojObject&).
+	MojErr leaveChannel(MojServiceMessage* serviceMsg, const MojObject& payload);
 
 	// Kicks off the send process. Queries DB for outgoing messages and sends them.
 	MojErr IMSend(MojServiceMessage* msg, const MojObject payload);

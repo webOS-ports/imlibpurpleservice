@@ -117,12 +117,20 @@ namespace Util
 
     PurpleAccount* createPurpleAccount(const char* username, const char* prpl_id, MojObject prefs)
     {
-        PurplePluginProtocolInfo* info = getProtocolInfo(prpl_id);
+        // Throws, as before, for a prpl that is not there - before the account is made.
+        getProtocolInfo(prpl_id);
 
         // TODO: Strip off possible junk here!
         //       The Username Split API might be useful, as soon as I have
         //       understood it ...
         PurpleAccount* account = purple_account_new(username, prpl_id);
+        applyProtocolOptions(account, prefs);
+        return account;
+    }
+
+    void applyProtocolOptions(PurpleAccount* account, const MojObject& prefs)
+    {
+        PurplePluginProtocolInfo* info = getProtocolInfo(purple_account_get_protocol_id(account));
 
         for(GList* l = info->protocol_options; l != NULL; l = l->next)
         {
@@ -166,7 +174,5 @@ namespace Util
                 continue;
             }
         }
-
-        return account;
     }
 }

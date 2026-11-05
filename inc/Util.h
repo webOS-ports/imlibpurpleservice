@@ -27,6 +27,9 @@ namespace Util
 
     MojObject getProtocolOptions(MojString prpl);
     PurpleAccount* createPurpleAccount(const char* username, const char* prpl_id, MojObject config);
+    // Set each of the account's protocol options that prefs holds (createPurpleAccount does this
+    // for a new account; this is the same for one that exists already).
+    void applyProtocolOptions(PurpleAccount* account, const MojObject& prefs);
 
 }
 

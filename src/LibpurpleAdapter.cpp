@@ -68,6 +68,7 @@
 #include "LibpurpleAdapter.h"
 #include "PalmImCommon.h"
 #include "AuthChannel.h"
+#include "IrcSupport.h"
 
 //#include <cjson/json.h>
 //#include <lunaservice.h>
@@ -76,6 +77,7 @@
 #include "entities.h"       // decode_html_entities_utf8 - decode the app's &#NNNNN; emoji to UTF-8 for sendReaction
 #include "OpusEncoder.h"    // wav_to_opus_voicenote - transcode a recorded WAV to an Ogg/Opus voice note
 #include "VoiceNote.h"      // m4a_to_opus_voicenote - the same for the Messaging app's M4A recordings
+#include "AccountConfig.h"  // accountSettings - the sign-in app's settings out of their stored row
 
 
 static const guint PURPLE_GLIB_READ_COND  = (G_IO_IN | G_IO_HUP | G_IO_ERR);
@@ -259,6 +261,7 @@ static void im_receipt_hwm_cb(PurpleAccount* account, const char* scope, const c
 static void registerWebosReactionSignals();
 static void im_reaction_set_cb(PurpleAccount* account, const char* targetServiceMessageId, const char* serialized, const char* unused, void* data);
 static std::string getServiceNameFromPurpleAccount(PurpleAccount* account);
+static void ircChannelsChanged(PurpleAccount* account);
 // human-friendly WhatsApp display name (push-name, else "+<phone>"); defined lower, used in incoming_message_cb
 static std::string whatsAppDisplayName(const char* alias, const char* username);
 // true if s is a bare Signal ACI UUID (8-4-4-4-12 hex); defined lower, used in incoming_message_cb
@@ -1731,6 +1734,13 @@ static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 	}
 
 	registerPresenceUpdateSignals(loginState);
+
+	// webOS IRC: back into every channel the account was in, and the Servers tab brought up to date.
+	if (Irc::isAccount(loggedInAccount))
+	{
+		Irc::joinRemembered(loggedInAccount);
+		ircChannelsChanged(loggedInAccount);
+	}
 }
 
 static void account_signed_off_cb(PurpleConnection* gc, gpointer loginState)
@@ -2088,6 +2098,9 @@ static std::string deriveServerName(PurpleAccount* account, const char* groupNam
 		const char* net = purple_account_get_protocol_name(account);
 		return (net != NULL && *net != '\0') ? std::string(net) : std::string("Telegram");
 	}
+	// webOS IRC: one server per network, whatever group a channel's chat sits in.
+	if (Irc::isAccount(account))
+		return Irc::network(account);
 	if (groupName == NULL || *groupName == '\0')
 		return std::string();
 	std::string g = groupName;
@@ -2120,6 +2133,20 @@ static PurpleConversation* joinChannelChat(PurpleAccount* account, const char* c
 	PurpleConnection* gc = purple_account_get_connection(account);
 	if (gc == NULL)
 		return NULL;
+
+	// webOS IRC: the channel comes as its key, "#chan@network" (Irc::channelKey). Join it by name and
+	// keep it in the buddy list, so it is joined again at the next sign-in and listed under its
+	// network straight away. The server lets the account in later, so the conversation may not be
+	// there yet when this returns.
+	if (Irc::isAccount(account))
+	{
+		std::string ircChannel;
+		if (!Irc::splitChannelKey(channel, &ircChannel, NULL))
+			ircChannel = channel;
+		Irc::joinChannel(account, ircChannel);
+		ircChannelsChanged(account);
+		return purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, ircChannel.c_str(), account);
+	}
 
 	// webOS: do NOT permanently early-return when the conversation already exists. Re-invoking
 	// serv_join_chat is how a RE-opened channel backfills messages that arrived while it wasn't open --
@@ -2352,6 +2379,7 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 	const char* channelName = NULL;
 	const char* channelDisplayName = NULL;   // human room title (Telegram group name); channelName stays the key
 	std::string serverNameStr;   // resolved guild/team/network server (via deriveServerName)
+	std::string ircChannelKey, ircChannelTitle;   // IRC: the channel's key and its name as the server spells it
 	std::string parentGroupName; // raw blist group of the chat, fed to deriveServerName
 	// Muted-conversation support: the prpl (e.g. tdlib-purple) records a chat's server-side mute
 	// state as a "muted" bool on the buddy (1:1) / chat (group) blist node. Read it here and forward
@@ -2411,6 +2439,16 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 		// flat Telegram (whose blist group is meaningless). Sharing deriveServerName makes a channel's
 		// message-driven and enumerated records dedup to the same imserver instead of duplicating.
 		serverNameStr = deriveServerName(account, parentGroupName.empty() ? NULL : parentGroupName.c_str(), NULL);
+		// webOS IRC: a channel is keyed with its network ("#linux@irc.libera.chat"), so the same channel
+		// on two networks is two threads, and the key alone says which account answers in it. The
+		// title is the channel as the server spells it.
+		if (Irc::isAccount(account) && channelName != NULL && *channelName != '\0')
+		{
+			ircChannelTitle = channelName;
+			ircChannelKey = Irc::channelKey(ircChannelTitle, Irc::network(account));
+			channelName = ircChannelKey.c_str();
+			channelDisplayName = ircChannelTitle.c_str();
+		}
 		MojLogInfo(IMServiceApp::s_log,
 			_T("incoming_message_cb: group-chat message. channel: %s title: %s server(guild): %s sender: %s muted: %d"),
 			channelName ? channelName : "", channelDisplayName ? channelDisplayName : "", serverNameStr.c_str(), usernameFromStripped.c_str(), muted);
@@ -2872,6 +2910,11 @@ static void initializeLibpurple()
 	// its login handler without racing the (previously per-first-login) registration.
 	registerWebosReactionSignals();
 
+	// webOS IRC: a channel joined by any path - the Servers tab, a /join, a join the server made - is
+	// remembered under the spelling the server gave it and listed in the Servers tab.
+	static int ircHandle = 0x1EC;
+	Irc::watchJoins(&ircHandle, ircChannelsChanged);
+
 	/* webOS: /var is a small partition (~62MB). libpurple's per-conversation logging duplicates
 	 * what db8 already stores and grows unbounded under /var/preferences/com.palm.purple/transport/logs.
 	 * Disable it (and system logging) so nothing accumulates there. Must be set after purple_core_init
@@ -3281,7 +3324,7 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 				 * account, not just this one). Catch it and fail only THIS account's login. */
 				try
 				{
-					account = Util::createPurpleAccount(purpleUsername.c_str(), prplProtocolId.c_str(), params.config);
+					account = Util::createPurpleAccount(purpleUsername.c_str(), prplProtocolId.c_str(), accountSettings(params.config));
 				}
 				catch (const Util::MojoException& e)
 				{
@@ -3350,16 +3393,44 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 			}
 		}
 
+		/* webOS IRC: the sign-in app's settings (port, TLS, SASL, real name), which reach this service
+		 * through the template's onCreate when the account is made, are put on the libpurple account
+		 * at every login rather than only when it is first created, so a libpurple account that was
+		 * already in accounts.xml takes them too. Its channel
+		 * list becomes the account's channels the first time (Irc::seedChannels). */
+		if (Irc::isAccount(account))
+		{
+			try
+			{
+				Util::applyProtocolOptions(account, accountSettings(params.config));
+			}
+			catch (const Util::MojoException& e)
+			{
+				MojLogError(IMServiceApp::s_log, _T("LibpurpleAdapter::login: IRC options not applied: %s"), e.what().c_str());
+			}
+			MojString channels;
+			bool haveChannels = false;
+			accountSettings(params.config).get(_T("channels"), channels, haveChannels);
+			Irc::seedChannels(account, haveChannels ? channels.data() : "");
+		}
+
 		MojLogInfo(IMServiceApp::s_log, _T("Logging in..."));
 
 		/* Don't clobber a persisted refresh_token (stored as the password by the prpl
 		 * on a previous successful login) with the initial webOS credential. Set the
 		 * password from the webOS credential only when the account has none yet — first
 		 * login, or after an invalid_grant cleared it — so steady-state logins take the
-		 * silent-refresh path instead of restarting the device-code flow every time. */
+		 * silent-refresh path instead of restarting the device-code flow every time.
+		 * webOS IRC: no token to keep; the credential is the server (or SASL) password and is
+		 * always taken, and the sign-in app's stand-in for "none" means none. */
 		{
 			const char* existingPw = purple_account_get_password(account);
-			if (existingPw == NULL || *existingPw == '\0')
+			if (Irc::isAccount(account))
+			{
+				bool none = strcmp(params.password.data(), Irc::NO_PASSWORD) == 0;
+				purple_account_set_password(account, none ? NULL : params.password.data());
+			}
+			else if (existingPw == NULL || *existingPw == '\0')
 			{
 				purple_account_set_password(account, params.password.data());
 			}
@@ -3405,6 +3476,12 @@ LibpurpleAdapter::LoginResult LibpurpleAdapter::login(LoginParams const& params,
 		if (loginState)
 			((LoginCallbackInterface*)loginState)->loginResult(params.serviceName.data(), params.username.data(),
 			    LoginCallbackInterface::LOGIN_SUCCESS, false, ERROR_NO_ERROR, true);
+		// ...and, for IRC, what account_logged_in_cb does after it: the channels and the Servers tab.
+		if (Irc::isAccount(account))
+		{
+			Irc::joinRemembered(account);
+			ircChannelsChanged(account);
+		}
 		return OK;
 	}
 
@@ -4280,6 +4357,30 @@ bool LibpurpleAdapter::getFullBuddyList(const char* serviceName, const char* use
 // last-enumerated roster signature per account, to skip a no-op delete+recreate (churn guard).
 static std::unordered_map<std::string, std::string> s_lastServerChannelSig;
 
+// enumerateServersChannels again a few seconds after a roster sync was turned away.
+#define ROSTER_RETRY_SECONDS 3
+struct RosterRetry
+{
+	std::string serviceName;
+	std::string username;
+};
+
+static gboolean rosterRetryCallback(gpointer data)
+{
+	RosterRetry* retry = (RosterRetry*)data;
+	LibpurpleAdapter::enumerateServersChannels(retry->serviceName.c_str(), retry->username.c_str());
+	delete retry;
+	return FALSE;
+}
+
+static void scheduleRosterRetry(const char* serviceName, const char* username)
+{
+	RosterRetry* retry = new RosterRetry;
+	retry->serviceName = serviceName;
+	retry->username = username;
+	purple_timeout_add_seconds(ROSTER_RETRY_SECONDS, rosterRetryCallback, retry);
+}
+
 bool LibpurpleAdapter::enumerateServersChannels(const char* serviceName, const char* username)
 {
 	if (!serviceName || !username || s_imServiceHandler == NULL)
@@ -4303,6 +4404,22 @@ bool LibpurpleAdapter::enumerateServersChannels(const char* serviceName, const c
 	// (alphabetical) server order in the output.
 	std::map<std::string, MojObject> serverByGuild;
 	std::set<std::string> sigSet;   // order-independent roster signature ("server\x1f channelId")
+
+	// webOS IRC: the network is a server even before it has a channel, so the Servers tab always
+	// has it to join channels from. Its channels are keyed "#chan@network", as incoming_message_cb
+	// keys their messages.
+	const bool irc = Irc::isAccount(account);
+	const std::string ircNetwork = irc ? Irc::network(account) : std::string();
+	if (irc && !ircNetwork.empty())
+	{
+		MojObject server;
+		server.putString(_T("remoteId"), ircNetwork.c_str());
+		server.putString(_T("name"), ircNetwork.c_str());
+		MojObject emptyChannels(MojObject::TypeArray);
+		server.put(_T("channels"), emptyChannels);
+		serverByGuild[ircNetwork] = server;
+		sigSet.insert(ircNetwork);
+	}
 
 	for (PurpleBlistNode* node = purple_blist_get_root(); node != NULL; node = node->next)
 	{
@@ -4341,6 +4458,15 @@ bool LibpurpleAdapter::enumerateServersChannels(const char* serviceName, const c
 			const char* chanName = (const char*)g_hash_table_lookup(comps, "name");
 			if (chanName == NULL || *chanName == '\0')
 				chanName = purple_chat_get_name(chat);
+			std::string ircKey;
+			if (irc)
+			{
+				chanName = (const char*)g_hash_table_lookup(comps, "channel");
+				if (chanName == NULL || *chanName == '\0')
+					continue;
+				ircKey = Irc::channelKey(chanName, ircNetwork);
+				chanId = ircKey.c_str();
+			}
 			if (chanId == NULL || *chanId == '\0')
 				continue;   // no stable key -> skip
 
@@ -4456,7 +4582,13 @@ bool LibpurpleAdapter::enumerateServersChannels(const char* serviceName, const c
 	MojLogInfo(IMServiceApp::s_log, _T("enumerateServersChannels: %s -> %d servers, %d channels"),
 		serviceName, (int)serverByGuild.size(), totalChannels);
 
-	s_imServiceHandler->syncServersChannels(serviceName, username, serversObj);
+	if (!s_imServiceHandler->syncServersChannels(serviceName, username, serversObj))
+	{
+		// It did not land (another account's sync was in flight). Forget the signature, so the
+		// roster is not taken as synced, and offer it again shortly.
+		s_lastServerChannelSig.erase(accountKey);
+		scheduleRosterRetry(serviceName, username);
+	}
 	return true;
 }
 
@@ -4472,7 +4604,18 @@ bool LibpurpleAdapter::openChannel(const char* serviceName, const char* username
 		return false;
 
 	PurpleAccount* account = NULL;
-	if (username && *username)
+	// webOS IRC: the channel key names its network, and so the account to join it from.
+	std::string ircChannel, ircNetwork;
+	if (strcmp(serviceName, Irc::SERVICE_NAME) == 0 && Irc::splitChannelKey(channel, &ircChannel, &ircNetwork))
+	{
+		account = Irc::accountForNetwork(ircNetwork);
+		if (account == NULL || !purple_account_is_connected(account))
+		{
+			MojLogInfo(IMServiceApp::s_log, _T("openChannel: no account signed in to %s"), ircNetwork.c_str());
+			return false;
+		}
+	}
+	if (account == NULL && username && *username)
 	{
 		std::string accountKey = getAccountKey(username, serviceName);
 		if (s_onlineAccountData.count(accountKey))
@@ -4520,6 +4663,79 @@ bool LibpurpleAdapter::openChannel(const char* serviceName, const char* username
 	return joinChannelChat(account, channel) != NULL;
 }
 
+/*
+ * webOS IRC: the account's channels changed (joined, left, signed in). Bring the Servers tab up to
+ * date now rather than on the buddy-list debounce, which IRC - having no buddies - would not set
+ * off, and which would keep a channel just joined out of the list for most of a minute.
+ */
+static void ircChannelsChanged(PurpleAccount* account)
+{
+	if (account == NULL || !purple_account_is_connected(account))
+		return;
+	std::string const serviceName = getServiceNameFromPurpleAccount(account);
+	std::string const username = getWebosUsername(account->username, serviceName, account);
+	if (serviceName.empty() || username.empty())
+		return;
+	LibpurpleAdapter::enumerateServersChannels(serviceName.c_str(), username.c_str());
+}
+
+/*
+ * webOS IRC: channels the account left. Their rows go from db8 (roster syncs only ever add), and the
+ * roster signature is dropped, so joining one again lists it again.
+ */
+static void ircChannelsLeft(PurpleAccount* account, const std::vector<std::string>& channels)
+{
+	if (account == NULL || channels.empty())
+		return;
+	std::string const serviceName = getServiceNameFromPurpleAccount(account);
+	std::string const net = Irc::network(account);
+	for (size_t i = 0; i < channels.size(); ++i)
+	{
+		std::string key = Irc::channelKey(channels[i], net);
+		MojLogInfo(IMServiceApp::s_log, _T("IRC: left %s"), key.c_str());
+		if (s_imServiceHandler != NULL)
+			s_imServiceHandler->removeChannel(serviceName.c_str(), key.c_str());
+	}
+	s_lastServerChannelSig.erase(getAccountKeyFromPurpleAccount(account));
+	ircChannelsChanged(account);
+}
+
+/*
+ * webOS IRC: leave a channel (the Messaging app's Leave Channel). The channel is its key,
+ * "#chan@network"; a bare channel name is taken as on the account named by username. Works signed
+ * out too: the channel is forgotten, so it is not joined at the next sign-in.
+ */
+bool LibpurpleAdapter::leaveChannel(const char* serviceName, const char* username, const char* channel)
+{
+	if (!serviceName || !channel || !*channel)
+		return false;
+	if (strcmp(serviceName, Irc::SERVICE_NAME) != 0)
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("leaveChannel: not supported for %s"), serviceName);
+		return false;
+	}
+
+	PurpleAccount* account = NULL;
+	std::string ircChannel, ircNetwork;
+	if (Irc::splitChannelKey(channel, &ircChannel, &ircNetwork))
+		account = Irc::accountForNetwork(ircNetwork);
+	else if (username && *username && Irc::isChannelName(channel))
+	{
+		ircChannel = channel;
+		account = purple_accounts_find(getPurpleUsername(username, serviceName).c_str(), Irc::PRPL_ID);
+	}
+	if (account == NULL)
+	{
+		MojLogInfo(IMServiceApp::s_log, _T("leaveChannel: no IRC account for %s"), channel);
+		return false;
+	}
+
+	MojLogInfo(IMServiceApp::s_log, _T("leaveChannel: leaving %s"), channel);
+	Irc::leaveChannel(account, ircChannel);
+	ircChannelsLeft(account, std::vector<std::string>(1, ircChannel));
+	return true;
+}
+
 LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceName, const char* username, const char* usernameTo, const char* messageText, const char* quotedMessageId)
 {
 	if (!serviceName || !username || !usernameTo || !messageText)
@@ -4560,6 +4776,30 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceNa
 	{
 		retVal = LibpurpleAdapter::USER_NOT_LOGGED_IN;
 		MojLogError(IMServiceApp::s_log, _T("sendMessage: Trying to send from an account that is not logged in. service name %s"), serviceName);
+	}
+	else if (Irc::isAccount(accountToSendFrom))
+	{
+		// webOS IRC: a channel is its key ("#chan@network"), whose network names the account that
+		// sends; a "/command" runs as one; and the text goes out as typed (Irc::send escapes it for
+		// prpl-irc, which reads HTML).
+		PurpleAccount* ircAccount = accountToSendFrom;
+		std::string ircChannel, ircNetwork;
+		if (Irc::splitChannelKey(usernameTo, &ircChannel, &ircNetwork))
+		{
+			PurpleAccount* byNetwork = Irc::accountForNetwork(ircNetwork);
+			if (byNetwork != NULL)
+				ircAccount = byNetwork;
+		}
+		gchar* text = g_strcompress(messageText);
+		Irc::SendOutcome sent = Irc::send(ircAccount, usernameTo, text ? text : "");
+		g_free(text);
+		if (!sent.left.empty())
+			ircChannelsLeft(ircAccount, sent.left);
+		if (!sent.sent)
+		{
+			MojLogError(IMServiceApp::s_log, _T("sendMessage: IRC message to %s not sent: %s"), usernameTo, sent.error.c_str());
+			retVal = LibpurpleAdapter::SEND_FAILED;
+		}
 	}
 	else
 	{
