@@ -138,6 +138,9 @@ public:
 	// message. serversObj is an array of { remoteId, name, channels:[{ remoteId, name, parentId,
 	// position }] }. Default no-op so non-db8 implementors need not override.
 	virtual bool syncServersChannels(const char* serviceName, const char* username, MojObject& serversObj) { return true; }
+	// webOS IRC: a channel the account left. Roster syncs only ever add rows, so a left channel's
+	// imchannel (serviceName + remoteId) is deleted here. Default no-op, as above.
+	virtual bool removeChannel(const char* /*serviceName*/, const char* /*remoteId*/) { return true; }
 };
 
 class LibpurpleAdapter
@@ -193,6 +196,9 @@ public:
 	// webOS Servers/Rooms M3: join a channel on demand (Servers-tab open) so the prpl fetches its
 	// history and a later send routes to the chat. username may be NULL (resolve by serviceName).
 	static bool openChannel(const char* serviceName, const char* username, const char* channel);
+	// webOS IRC: leave a channel (PART) and forget it, so it is not joined at the next sign-in, and
+	// drop its row from the Servers tab. channel is its key, "#chan@network". IRC only for now.
+	static bool leaveChannel(const char* serviceName, const char* username, const char* channel);
 	static bool setMyAvailability(const char* serviceName, const char* username, int availability);
 	static bool setMyCustomMessage(const char* serviceName, const char* username, const char* customMessage);
 	static SendResult blockBuddy(const char* serviceName, const char* username, const char* buddyUsername, bool block);

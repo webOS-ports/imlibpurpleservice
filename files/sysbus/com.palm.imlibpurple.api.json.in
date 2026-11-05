@@ -14,7 +14,8 @@
         "com.palm.imlibpurple/submitAuthInput"
     ],
     "imlibpurple-channel.operation": [
-        "com.palm.imlibpurple/openChannel"
+        "com.palm.imlibpurple/openChannel",
+        "com.palm.imlibpurple/leaveChannel"
     ],
     "imlibpurple-call.operation": [
         "com.palm.telegram.call/callStateQuery",
