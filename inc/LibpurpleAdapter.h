@@ -203,6 +203,19 @@ public:
 	// webOS IRC: leave a channel (PART) and forget it, so it is not joined at the next sign-in, and
 	// drop its row from the Servers tab. channel is its key, "#chan@network". IRC only for now.
 	static bool leaveChannel(const char* serviceName, const char* username, const char* channel);
+	// webOS Servers tab: mute a server or channel, or choose whether its messages arrive while it is
+	// not open (ChannelOptions.h). channel (an id) picks a channel; without one, server (its name)
+	// picks a server. muted and background are each NULL to leave that setting as it is.
+	enum ChannelOptionsResult
+	{
+		CHANNEL_OPTIONS_OK,
+		CHANNEL_OPTIONS_INVALID,      // nothing to set, or nothing named to set it on
+		CHANNEL_OPTIONS_OFFLINE,      // no signed-in account of the service
+		CHANNEL_OPTIONS_UNSUPPORTED,  // the service has no such settings
+		CHANNEL_OPTIONS_NOT_FOUND     // no such server or channel on the account
+	};
+	static ChannelOptionsResult setChannelOptions(const char* serviceName, const char* username,
+		const char* server, const char* channel, const bool* muted, const bool* background);
 	static bool setMyAvailability(const char* serviceName, const char* username, int availability);
 	static bool setMyCustomMessage(const char* serviceName, const char* username, const char* customMessage);
 	static SendResult blockBuddy(const char* serviceName, const char* username, const char* buddyUsername, bool block);

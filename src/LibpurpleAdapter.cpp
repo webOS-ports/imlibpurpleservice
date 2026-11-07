@@ -71,6 +71,7 @@
 #include "TypingChannel.h"
 #include "WebosSendSignals.h"
 #include "IrcSupport.h"
+#include "ChannelOptions.h"
 
 //#include <cjson/json.h>
 //#include <lunaservice.h>
@@ -2151,6 +2152,12 @@ static std::string deriveServerName(PurpleAccount* account, const char* groupNam
 		return htmlUnescape(g.substr(0, sep));
 	}
 	return htmlUnescape(g);
+}
+
+// deriveServerName as a ChannelOptions::ServerOf.
+static std::string serverOfGroup(PurpleAccount* account, const char* groupName)
+{
+	return deriveServerName(account, groupName, NULL);
 }
 
 /*
@@ -4519,8 +4526,19 @@ bool LibpurpleAdapter::enumerateServersChannels(const char* serviceName, const c
 			if (chanId == NULL || *chanId == '\0')
 				continue;   // no stable key -> skip
 
-			// churn-guard signature: server + channel key (the set makes it order-independent).
-			sigSet.insert(guildName + std::string("\x1f") + chanId);
+			// webOS Servers tab: mute and background delivery, where the prpl offers them.
+			const bool hasOptions = ChannelOptions::supports(account);
+			const ChannelOptions::Flags flags = hasOptions ? ChannelOptions::flagsOf(chat) : ChannelOptions::Flags();
+
+			// churn-guard signature: server + channel key (the set makes it order-independent), and
+			// the options, so changing one syncs.
+			std::string sigEntry = guildName + std::string("\x1f") + chanId;
+			if (hasOptions)
+			{
+				sigEntry += std::string("\x1f") + (flags.muted ? "m" : "-") + (flags.background ? "b" : "-")
+					+ (flags.serverMuted ? "M" : "-") + (flags.serverBackground ? "B" : "-");
+			}
+			sigSet.insert(sigEntry);
 
 			if (serverByGuild.find(guildName) == serverByGuild.end())
 			{
@@ -4543,6 +4561,13 @@ bool LibpurpleAdapter::enumerateServersChannels(const char* serviceName, const c
 			channel.putInt(_T("position"), position++);
 
 			MojObject& server = serverByGuild[guildName];
+			if (hasOptions)
+			{
+				channel.putBool(_T("muted"), flags.muted);
+				channel.putBool(_T("background"), flags.background);
+				server.putBool(_T("muted"), flags.serverMuted);
+				server.putBool(_T("background"), flags.serverBackground);
+			}
 			MojObject channels;
 			server.get(_T("channels"), channels);
 			channels.push(channel);
@@ -4642,29 +4667,13 @@ bool LibpurpleAdapter::enumerateServersChannels(const char* serviceName, const c
 }
 
 /*
- * webOS Servers/Rooms M3: join a channel on demand (called when the user opens it in the Servers tab)
- * so the prpl fetches + delivers its history. username may be NULL - the account is then resolved by
- * serviceName (first online account of that service). Joining also lands the channel in the buddy
- * list, so a subsequent send finds it instead of falling back to a 1:1 IM ("<snowflake> is offline").
+ * The signed-in account a Servers-tab call is for: the one named by username, else the first online
+ * account of the service. username may be NULL.
  */
-bool LibpurpleAdapter::openChannel(const char* serviceName, const char* username, const char* channel)
+static PurpleAccount* findRoomAccount(const char* serviceName, const char* username)
 {
-	if (!serviceName || !channel || !*channel)
-		return false;
-
 	PurpleAccount* account = NULL;
-	// webOS IRC: the channel key names its network, and so the account to join it from.
-	std::string ircChannel, ircNetwork;
-	if (strcmp(serviceName, Irc::SERVICE_NAME) == 0 && Irc::splitChannelKey(channel, &ircChannel, &ircNetwork))
-	{
-		account = Irc::accountForNetwork(ircNetwork);
-		if (account == NULL || !purple_account_is_connected(account))
-		{
-			MojLogInfo(IMServiceApp::s_log, _T("openChannel: no account signed in to %s"), ircNetwork.c_str());
-			return false;
-		}
-	}
-	if (account == NULL && username && *username)
+	if (username && *username)
 	{
 		std::string accountKey = getAccountKey(username, serviceName);
 		if (s_onlineAccountData.count(accountKey))
@@ -4702,6 +4711,34 @@ bool LibpurpleAdapter::openChannel(const char* serviceName, const char* username
 			}
 		}
 	}
+	return account;
+}
+
+/*
+ * webOS Servers/Rooms M3: join a channel on demand (called when the user opens it in the Servers tab)
+ * so the prpl fetches + delivers its history. username may be NULL - the account is then resolved by
+ * serviceName (first online account of that service). Joining also lands the channel in the buddy
+ * list, so a subsequent send finds it instead of falling back to a 1:1 IM ("<snowflake> is offline").
+ */
+bool LibpurpleAdapter::openChannel(const char* serviceName, const char* username, const char* channel)
+{
+	if (!serviceName || !channel || !*channel)
+		return false;
+
+	PurpleAccount* account = NULL;
+	// webOS IRC: the channel key names its network, and so the account to join it from.
+	std::string ircChannel, ircNetwork;
+	if (strcmp(serviceName, Irc::SERVICE_NAME) == 0 && Irc::splitChannelKey(channel, &ircChannel, &ircNetwork))
+	{
+		account = Irc::accountForNetwork(ircNetwork);
+		if (account == NULL || !purple_account_is_connected(account))
+		{
+			MojLogInfo(IMServiceApp::s_log, _T("openChannel: no account signed in to %s"), ircNetwork.c_str());
+			return false;
+		}
+	}
+	if (account == NULL)
+		account = findRoomAccount(serviceName, username);
 	if (account == NULL)
 	{
 		MojLogInfo(IMServiceApp::s_log, _T("openChannel: no online account for %s"), serviceName);
@@ -4710,6 +4747,58 @@ bool LibpurpleAdapter::openChannel(const char* serviceName, const char* username
 
 	MojLogInfo(IMServiceApp::s_log, _T("openChannel: joining %s on %s"), channel, serviceName);
 	return joinChannelChat(account, channel) != NULL;
+}
+
+/*
+ * webOS Servers tab: mute a server or channel, or choose whether its messages arrive while it is not
+ * open (see ChannelOptions.h). channel, the channel's id, picks a channel; with no channel, server picks
+ * a server by its name as the Servers tab shows it. muted and background are each NULL to leave it.
+ */
+LibpurpleAdapter::ChannelOptionsResult LibpurpleAdapter::setChannelOptions(const char* serviceName,
+		const char* username, const char* server, const char* channel, const bool* muted, const bool* background)
+{
+	if (serviceName == NULL || (muted == NULL && background == NULL))
+		return CHANNEL_OPTIONS_INVALID;
+	const bool forChannel = channel != NULL && *channel != '\0';
+	if (!forChannel && (server == NULL || *server == '\0'))
+		return CHANNEL_OPTIONS_INVALID;
+
+	PurpleAccount* account = findRoomAccount(serviceName, username);
+	if (account == NULL)
+		return CHANNEL_OPTIONS_OFFLINE;
+	if (!ChannelOptions::supports(account))
+		return CHANNEL_OPTIONS_UNSUPPORTED;
+
+	PurpleChat* chat = forChannel ? ChannelOptions::findChannel(account, channel)
+		: ChannelOptions::findServerChat(account, server, serverOfGroup);
+	if (chat == NULL)
+		return CHANNEL_OPTIONS_NOT_FOUND;
+
+	const ChannelOptions::Scope scope = forChannel ? ChannelOptions::CHANNEL : ChannelOptions::SERVER;
+	MojLogInfo(IMServiceApp::s_log, _T("setChannelOptions: %s %s%s%s"), forChannel ? "channel" : "server",
+		forChannel ? channel : server, muted ? (*muted ? " muted" : " unmuted") : "",
+		background ? (*background ? " background" : " foreground") : "");
+	if (muted != NULL)
+		ChannelOptions::set(account, chat, scope, "muted", *muted);
+	if (background != NULL)
+		ChannelOptions::set(account, chat, scope, "background", *background);
+	return CHANNEL_OPTIONS_OK;
+}
+
+/*
+ * webOS Servers tab: a prpl changed what ChannelOptions shows (here, or the user did it on another
+ * client). Copy it into the Servers tab; the roster signature carries the flags, so this syncs.
+ */
+static void channelsChangedCb(PurpleAccount* account, void* data)
+{
+	(void)data;
+	if (account == NULL || !purple_account_is_connected(account))
+		return;
+	std::string const serviceName = getServiceNameFromPurpleAccount(account);
+	std::string const username = getWebosUsername(account->username, serviceName, account);
+	if (serviceName.empty() || username.empty())
+		return;
+	LibpurpleAdapter::enumerateServersChannels(serviceName.c_str(), username.c_str());
 }
 
 /*
@@ -5626,7 +5715,12 @@ static void registerWebosReactionSignals()
 	// SEND (B3, B4): edit, delete, and the groups (WebosSendSignals.h).
 	WebosSendSignals::registerSignals(convHandle);
 
-	MojLogInfo(IMServiceApp::s_log, _T("registered webos-im-reaction + webos-im-reaction-set + webos-im-outbox-id + webos-im-send-reaction + webos-im-send-poll-vote + edit/delete/group signals (early)"));
+	// Servers tab: (account, channelId, scope, setting, value) to the prpl, (account) back from it.
+	ChannelOptions::registerSignals();
+	purple_signal_connect(convHandle, ChannelOptions::CHANGED_SIGNAL, &webosHandle,
+			PURPLE_CALLBACK(channelsChangedCb), NULL);
+
+	MojLogInfo(IMServiceApp::s_log, _T("registered webos-im-reaction + webos-im-reaction-set + webos-im-outbox-id + webos-im-send-reaction + webos-im-send-poll-vote + edit/delete/group + channel option signals (early)"));
 }
 
 void LibpurpleAdapter::assignIMLoginState(LoginCallbackInterface* loginState)

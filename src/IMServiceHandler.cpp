@@ -67,6 +67,7 @@ const IMServiceHandler::Method IMServiceHandler::s_methods[] = {
 	{_T("sendTyping"), (Callback) &IMServiceHandler::sendTyping},
 	{_T("watchTyping"), (Callback) &IMServiceHandler::watchTyping},
 	{_T("markRead"), (Callback) &IMServiceHandler::markRead},
+	{_T("setChannelOptions"), (Callback) &IMServiceHandler::setChannelOptions},
 	{NULL, NULL} };
 
 IMServiceHandler::IMServiceHandler(MojService* service)
@@ -848,6 +849,10 @@ MojErr IMServiceHandler::syncFindServersResult(MojObject& payload, MojErr err)
 		bool f = false;
 		sIt->get(_T("remoteId"), remoteId, f);
 		sIt->get(_T("name"), name, f);
+		// Servers tab options (ChannelOptions.h), on protocols that have them
+		bool muted = false, background = false;
+		const bool hasMuted = sIt->get(_T("muted"), muted);
+		const bool hasBackground = sIt->get(_T("background"), background);
 		if (remoteId.empty())
 			continue;
 		incoming.insert(std::string(remoteId.data()));
@@ -861,6 +866,10 @@ MojErr IMServiceHandler::syncFindServersResult(MojObject& payload, MojErr err)
 			MojErrCheck(m.put(_T("_id"), e->second));
 			MojErrCheck(m.putString(_T("displayName"), name));
 			MojErrCheck(m.putString(_T("name"), name));
+			if (hasMuted)
+				MojErrCheck(m.putBool(_T("muted"), muted));
+			if (hasBackground)
+				MojErrCheck(m.putBool(_T("background"), background));
 			MojErrCheck(mergeServers.push(m));
 			m_syncServerIdByRemote[std::string(remoteId.data())] = e->second; // _id known now
 		}
@@ -873,6 +882,10 @@ MojErr IMServiceHandler::syncFindServersResult(MojObject& payload, MojErr err)
 			MojErrCheck(s.putString(_T("remoteId"), remoteId));
 			MojErrCheck(s.putString(_T("displayName"), name));
 			MojErrCheck(s.putString(_T("name"), name));
+			if (hasMuted)
+				MojErrCheck(s.putBool(_T("muted"), muted));
+			if (hasBackground)
+				MojErrCheck(s.putBool(_T("background"), background));
 			MojErrCheck(putServers.push(s));
 			m_syncNewServerRemotes.push_back(std::string(remoteId.data()));
 		}
@@ -993,6 +1006,9 @@ MojErr IMServiceHandler::syncFindChannelsResult(MojObject& payload, MojErr err)
 			cIt->get(_T("parentId"), parentId, hasParent);
 			MojInt64 position = 0;
 			cIt->get(_T("position"), position);
+			bool muted = false, background = false;
+			const bool hasMuted = cIt->get(_T("muted"), muted);
+			const bool hasBackground = cIt->get(_T("background"), background);
 			if (remoteId.empty())
 				continue;
 			incoming.insert(std::string(remoteId.data()));
@@ -1011,6 +1027,10 @@ MojErr IMServiceHandler::syncFindChannelsResult(MojObject& payload, MojErr err)
 				if (hasParent)
 					MojErrCheck(m.putString(_T("parentId"), parentId));
 				MojErrCheck(m.putInt(_T("position"), position));
+				if (hasMuted)
+					MojErrCheck(m.putBool(_T("muted"), muted));
+				if (hasBackground)
+					MojErrCheck(m.putBool(_T("background"), background));
 				MojErrCheck(mergeChannels.push(m));
 			}
 			else
@@ -1026,6 +1046,10 @@ MojErr IMServiceHandler::syncFindChannelsResult(MojObject& payload, MojErr err)
 				if (hasParent)
 					MojErrCheck(channel.putString(_T("parentId"), parentId));
 				MojErrCheck(channel.putInt(_T("position"), position));
+				if (hasMuted)
+					MojErrCheck(channel.putBool(_T("muted"), muted));
+				if (hasBackground)
+					MojErrCheck(channel.putBool(_T("background"), background));
 				MojErrCheck(putChannels.push(channel));
 			}
 		}
@@ -1227,6 +1251,59 @@ MojErr IMServiceHandler::markRead(MojServiceMessage* serviceMsg, const MojObject
 		return MojErrNone;
 	return replySendResult(serviceMsg, LibpurpleAdapter::markRead(serviceName.data(), username.data(),
 			usernameTo.data()));
+}
+
+/*
+ * webOS Servers tab: setChannelOptions - mute or unmute a server or a channel, and choose whether its
+ * messages arrive while it is not open. Discord only for now (ChannelOptions.h).
+ *   { "serviceName": "type_discord", "username": "<optional>",
+ *     "channel": "<channel id>" | "server": "<server name>",
+ *     "muted": true|false (optional), "background": true|false (optional) }
+ * The answer comes before the prpl has done it; the imserver/imchannel rows change once it has.
+ */
+MojErr IMServiceHandler::setChannelOptions(MojServiceMessage* serviceMsg, const MojObject& payload)
+{
+	MojLogTrace(IMServiceApp::s_log);
+
+	MojString serviceName, username, server, channel;
+	bool found = false;
+	payload.get(_T("serviceName"), serviceName, found);
+	payload.get(_T("username"), username, found);   // optional
+	payload.get(_T("server"), server, found);
+	payload.get(_T("channel"), channel, found);
+	bool muted = false, background = false;
+	const bool haveMuted = payload.get(_T("muted"), muted);
+	const bool haveBackground = payload.get(_T("background"), background);
+
+	if (serviceName.empty() || (server.empty() && channel.empty()) || (!haveMuted && !haveBackground))
+	{
+		MojLogError(IMServiceApp::s_log, _T("setChannelOptions: serviceName, server or channel, and muted or background are required"));
+		serviceMsg->replyError(MojErrInvalidArg);
+		return MojErrNone;
+	}
+
+	switch (LibpurpleAdapter::setChannelOptions(serviceName.data(), username.empty() ? NULL : username.data(),
+		server.empty() ? NULL : server.data(), channel.empty() ? NULL : channel.data(),
+		haveMuted ? &muted : NULL, haveBackground ? &background : NULL))
+	{
+	case LibpurpleAdapter::CHANNEL_OPTIONS_OK:
+		serviceMsg->replySuccess();
+		break;
+	case LibpurpleAdapter::CHANNEL_OPTIONS_OFFLINE:
+		serviceMsg->replyError(MojErrNotOpen, _T("no signed-in account of this service"));
+		break;
+	case LibpurpleAdapter::CHANNEL_OPTIONS_UNSUPPORTED:
+		serviceMsg->replyError(MojErrNotImpl, _T("this service has no such settings"));
+		break;
+	case LibpurpleAdapter::CHANNEL_OPTIONS_NOT_FOUND:
+		serviceMsg->replyError(MojErrNotFound, _T("no such server or channel on the account"));
+		break;
+	case LibpurpleAdapter::CHANNEL_OPTIONS_INVALID:
+	default:
+		serviceMsg->replyError(MojErrInvalidArg);
+		break;
+	}
+	return MojErrNone;
 }
 
 /*
