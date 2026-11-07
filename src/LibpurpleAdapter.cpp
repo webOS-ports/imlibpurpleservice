@@ -68,6 +68,7 @@
 #include "LibpurpleAdapter.h"
 #include "PalmImCommon.h"
 #include "AuthChannel.h"
+#include "TypingChannel.h"
 #include "IrcSupport.h"
 
 //#include <cjson/json.h>
@@ -97,6 +98,8 @@ static IMServiceCallbackInterface* s_imServiceHandler = NULL;
 // login is a disposable QR-preview (create-after-confirm). Preview logins route
 // their connect callbacks to the AuthChannel, NOT to the webOS login-state machine.
 static AuthChannel* s_authChannel = NULL;
+// Who is typing to us, for the app's watchTyping (see TypingChannel). Set by IMServiceHandler.
+static TypingChannel* s_typingChannel = NULL;
 static std::set<std::string> s_qrPreviewKeys;
 
 // Pending Discord remote-auth captcha requests. The prpl raised purple_request_fields
@@ -365,10 +368,32 @@ static PurpleEventLoopUiOps adapterEventLoopUIOps =
 	g_timeout_add, g_source_remove, adapterIOAdd, g_source_remove, NULL, g_timeout_add_seconds, NULL, NULL, NULL
 };
 
+// Read receipts (B2): how long a chat counts as in front of the user after the app marked it
+// read. tdlib-purple looks 500 ms after the update it is sent; the rest is slack.
+static const gint64 READ_FOCUS_SECONDS = 3;
+
+static gint64 monotonicSeconds()
+{
+	return g_get_monotonic_time() / G_USEC_PER_SEC;
+}
+
+// has_focus ui-op: whether the user is reading the conversation, which a prpl asks before it sends
+// read receipts (tdlib-purple; purple_conversation_has_focus for the rest). True only for a while
+// after the app marked it read (LibpurpleAdapter::markRead). Without the op tdlib-purple took
+// every conversation for focused, and sent a read receipt for each message as it arrived.
+static gboolean conversation_has_focus(PurpleConversation* conv)
+{
+	if (conv == NULL)
+		return FALSE;
+	// Seconds since boot, as an int: it fits a pointer on 32-bit armv7 too.
+	gint64 const until = GPOINTER_TO_INT(purple_conversation_get_data(conv, "webos-read-until"));
+	return (until > 0 && monotonicSeconds() <= until) ? TRUE : FALSE;
+}
+
 static PurpleConversationUiOps adapterConversationUIOps  =
 {
-	NULL, NULL, NULL, NULL, incoming_message_cb, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-	NULL, NULL
+	NULL, NULL, NULL, NULL, incoming_message_cb, NULL, NULL, NULL, NULL, NULL, conversation_has_focus, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL
 };
 
 /* webOS: Discord's remote-auth (QR) login raises the QR through purple_request_fields
@@ -1775,6 +1800,14 @@ static void account_signed_off_cb(PurpleConnection* gc, gpointer loginState)
 	//g_hash_table_remove(connectionTypeData, accountKey);
 
 	MojLogInfo(IMServiceApp::s_log, _T("Account disconnected..."));
+
+	// Nobody is typing on an account that is not signed in.
+	if (s_typingChannel != NULL)
+	{
+		std::string const typingService = getServiceNameFromPurpleAccount(account);
+		s_typingChannel->clearAccount(typingService.c_str(),
+				getWebosUsername(account->username, typingService, account).c_str());
+	}
 
 	if (s_offlineAccountData.count(accountKey))
 	{
@@ -4889,6 +4922,93 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceNa
 	return retVal;
 }
 
+// The signed-in account for (serviceName, username), or NULL.
+static PurpleAccount* onlineAccount(const char* serviceName, const char* username)
+{
+	if (!serviceName || !username)
+		return NULL;
+	std::string const accountKey = getAccountKey(username, serviceName);
+	std::unordered_map<std::string, PurpleAccount*>::iterator it = s_onlineAccountData.find(accountKey);
+	return (it == s_onlineAccountData.end()) ? NULL : it->second;
+}
+
+// The open conversation with purpleName: a chat matched as sendMessage matches one (its "id"
+// component, or its name), else a 1:1 conversation, made when there is none and makeIm is set.
+static PurpleConversation* conversationFor(PurpleAccount* account, const char* purpleName, bool makeIm)
+{
+	PurpleChat* chat = findChatByIdComponent(account, purpleName);
+	if (chat == NULL)
+		chat = purple_blist_find_chat(account, purpleName);
+	if (chat != NULL) {
+		PurpleConversation* conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, purpleName, account);
+		if (conv == NULL) {
+			// The conversation is named by the chat's own name, which a Discord channel's id is not.
+			const char* name = purple_chat_get_name(chat);
+			if (name != NULL)
+				conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, name, account);
+		}
+		return conv;
+	}
+	PurpleConversation* conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_IM, purpleName, account);
+	if (conv == NULL && makeIm)
+		conv = purple_conversation_new(PURPLE_CONV_TYPE_IM, account, purpleName);
+	return conv;
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::sendTyping(const char* serviceName, const char* username, const char* usernameTo, const char* state)
+{
+	if (!serviceName || !username || !usernameTo || !*usernameTo)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	PurpleConnection* gc = purple_account_get_connection(account);
+	if (gc == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+
+	std::string const purpleName = getPurpleUsername(usernameTo, serviceName);
+	PurpleTypingState typing = PURPLE_NOT_TYPING;
+	switch (TypingState::parse(state)) {
+	case TypingState::Typing: typing = PURPLE_TYPING; break;
+	case TypingState::Paused: typing = PURPLE_TYPED; break;
+	default:                  typing = PURPLE_NOT_TYPING; break;
+	}
+	// A chat has no typing state in libpurple 2: serv_send_typing is for a buddy.
+	const PurpleChat* chat = findChatByIdComponent(account, purpleName.c_str());
+	if (chat != NULL || purple_blist_find_chat(account, purpleName.c_str()) != NULL)
+		return LibpurpleAdapter::SENT;
+	serv_send_typing(gc, purpleName.c_str(), typing);
+	return LibpurpleAdapter::SENT;
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::markRead(const char* serviceName, const char* username, const char* usernameTo)
+{
+	if (!serviceName || !username || !usernameTo || !*usernameTo)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+
+	std::string const purpleName = getPurpleUsername(usernameTo, serviceName);
+	PurpleConversation* conv = conversationFor(account, purpleName.c_str(), true);
+	if (conv == NULL) {
+		MojLogInfo(IMServiceApp::s_log, _T("markRead: no open conversation for %s on %s"), usernameTo, serviceName);
+		return LibpurpleAdapter::SEND_FAILED;
+	}
+
+	// In focus for a while, for a prpl that asks (tdlib-purple, after 500 ms).
+	purple_conversation_set_data(conv, "webos-read-until",
+			GINT_TO_POINTER((int)(monotonicSeconds() + READ_FOCUS_SECONDS)));
+	// Pidgin counts what arrived unseen and sets "unseen-count" to 0 once the chat is looked at;
+	// gowhatsapp sends its receipts when the count drops to 0 from more, Discord and Telegram on
+	// any "unseen" update. So: one unseen, then none, each announced.
+	purple_conversation_set_data(conv, "unseen-count", GINT_TO_POINTER(1));
+	purple_conversation_update(conv, PURPLE_CONV_UPDATE_UNSEEN);
+	purple_conversation_set_data(conv, "unseen-count", GINT_TO_POINTER(0));
+	purple_conversation_update(conv, PURPLE_CONV_UPDATE_UNSEEN);
+	return LibpurpleAdapter::SENT;
+}
+
 /*
  * webOS reactions (SEND): the user reacted (or removed a reaction) to a message from the TouchPad.
  * Resolve the owning account and emit "webos-im-send-reaction" so the owning prpl transmits it over
@@ -5230,6 +5350,40 @@ bool LibpurpleAdapter::deviceConnectionClosed(bool all, const char* ipAddress)
 	return TRUE;
 }
 
+// Typing (B1): a prpl's serv_got_typing / serv_got_typing_stopped raise these for a 1:1
+// conversation, with the buddy's purple name. TypingChannel passes them to the app under the
+// names the app knows the account and the buddy by.
+static void typingChanged(PurpleAccount* account, const char* name, TypingState::State state)
+{
+	if (s_typingChannel == NULL || account == NULL || name == NULL || *name == '\0')
+		return;
+	std::string const serviceName = getServiceNameFromPurpleAccount(account);
+	if (serviceName.empty())
+		return;
+	std::string const stripped = stripResourceFromJabberUsername(name, serviceName);
+	std::string const from = getWebosUsername(stripped.c_str(), serviceName, account);
+	std::string const username = getWebosUsername(account->username, serviceName, account);
+	s_typingChannel->publish(serviceName.c_str(), username.c_str(), from.c_str(), state);
+}
+
+static void buddy_typing_cb(PurpleAccount* account, const char* name, gpointer data)
+{
+	(void)data;
+	typingChanged(account, name, TypingState::Typing);
+}
+
+static void buddy_typed_cb(PurpleAccount* account, const char* name, gpointer data)
+{
+	(void)data;
+	typingChanged(account, name, TypingState::Paused);
+}
+
+static void buddy_typing_stopped_cb(PurpleAccount* account, const char* name, gpointer data)
+{
+	(void)data;
+	typingChanged(account, name, TypingState::None);
+}
+
 // Register + connect the webOS cross-prpl reaction signals ONCE. Called from initializeLibpurple
 // (right after purple_core_init, BEFORE any prpl logs in) so a prpl that reconnects instantly from a
 // saved session (e.g. whatsmeow) can connect to "webos-im-send-reaction" in its login handler without
@@ -5245,6 +5399,12 @@ static void registerWebosReactionSignals()
 
 	static int webosHandle = 0x1AD6;
 	void* convHandle = purple_conversations_get_handle();
+
+	// Typing (B1): libpurple's own conversation signals, (account, buddy name).
+	purple_signal_connect(convHandle, "buddy-typing", &webosHandle, PURPLE_CALLBACK(buddy_typing_cb), NULL);
+	purple_signal_connect(convHandle, "buddy-typed", &webosHandle, PURPLE_CALLBACK(buddy_typed_cb), NULL);
+	purple_signal_connect(convHandle, "buddy-typing-stopped", &webosHandle,
+			PURPLE_CALLBACK(buddy_typing_stopped_cb), NULL);
 
 	// RECV per-sender merge (WhatsApp/Facebook/Signal): (account, targetServiceMessageId, emoji, sender).
 	purple_signal_register(convHandle, "webos-im-reaction",
@@ -5405,6 +5565,11 @@ void LibpurpleAdapter::assignAuthChannel(AuthChannel* authChannel)
 {
 	MojLogInfo(IMServiceApp::s_log, _T("%s called."), __FUNCTION__);
 	s_authChannel = authChannel;
+}
+
+void LibpurpleAdapter::assignTypingChannel(TypingChannel* typingChannel)
+{
+	s_typingChannel = typingChannel;
 }
 
 /* QR-preview token poll. prpl-discord persists the obtained token on the account

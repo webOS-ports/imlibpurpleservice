@@ -15,7 +15,10 @@
     ],
     "imlibpurple-channel.operation": [
         "com.palm.imlibpurple/openChannel",
-        "com.palm.imlibpurple/leaveChannel"
+        "com.palm.imlibpurple/leaveChannel",
+        "com.palm.imlibpurple/sendTyping",
+        "com.palm.imlibpurple/watchTyping",
+        "com.palm.imlibpurple/markRead"
     ],
     "imlibpurple-call.operation": [
         "com.palm.telegram.call/callStateQuery",

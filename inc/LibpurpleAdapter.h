@@ -41,6 +41,7 @@
 #define UI_ID                  "adapter"
 
 class AuthChannel;
+class TypingChannel;
 
 
 /*
@@ -166,6 +167,8 @@ public:
 	static void assignIMServiceHandler(IMServiceCallbackInterface* incomingIMHandler);
 	// Interactive-login (Discord QR) challenge channel. See AuthChannel.
 	static void assignAuthChannel(AuthChannel* authChannel);
+	// Who is typing to us, for the app's watchTyping. See TypingChannel.
+	static void assignTypingChannel(TypingChannel* typingChannel);
 	// Start a disposable, not-yet-persisted remote-auth login purely to obtain a QR /
 	// token (create-after-confirm). The QR is surfaced through the AuthChannel; on
 	// remote-auth success the obtained token is pushed as the confirmed credential.
@@ -217,6 +220,13 @@ public:
 	// targetSender, so whatsmeow can build+encrypt the vote without a live in-memory message-cache
 	// entry (survives a transport restart, or a poll older than the cache).
 	static SendResult sendPollVote(const char *serviceName, const char *username, const char *usernameTo, const char *pollMessageId, const char *optionNamesJoined, const char *senderJid = NULL);
+	// Typing (B1): tell usernameTo (a 1:1 chat) that we are typing, paused or not typing any more:
+	// state is "typing", "paused" or "none". libpurple sends nothing for a group chat.
+	static SendResult sendTyping(const char *serviceName, const char *username, const char *usernameTo, const char *state);
+	// Read receipts (B2): the user has read the chat with usernameTo (a buddy, or a channel's id or
+	// name). Raises the "unseen" update Pidgin raises when a chat is looked at, which is what the
+	// prpls send their read receipts on, with the chat in focus for a moment.
+	static SendResult markRead(const char *serviceName, const char *username, const char *usernameTo);
 	// webOS attachment send: transmit a local file (absolute path, must exist and be readable in the
 	// transport process) to usernameTo. Mirrors sendMessage's account resolution + channel detection:
 	// a group-channel target routes through serv_chat_send_file, a 1:1 IM through serv_send_file. All

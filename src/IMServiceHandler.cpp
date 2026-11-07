@@ -64,6 +64,9 @@ const IMServiceHandler::Method IMServiceHandler::s_methods[] = {
 	{_T("submitAuthInput"), (Callback) &IMServiceHandler::submitAuthInput},
 	{_T("openChannel"), (Callback) &IMServiceHandler::openChannel},
 	{_T("leaveChannel"), (Callback) &IMServiceHandler::leaveChannel},
+	{_T("sendTyping"), (Callback) &IMServiceHandler::sendTyping},
+	{_T("watchTyping"), (Callback) &IMServiceHandler::watchTyping},
+	{_T("markRead"), (Callback) &IMServiceHandler::markRead},
 	{NULL, NULL} };
 
 IMServiceHandler::IMServiceHandler(MojService* service)
@@ -102,6 +105,7 @@ IMServiceHandler::IMServiceHandler(MojService* service)
 	m_shutdownCallbackId = 0;
 	m_displayController = NULL;
 	m_authChannel = NULL;
+	m_typingChannel = NULL;
 	m_syncInFlight = false;
 }
 
@@ -111,6 +115,8 @@ IMServiceHandler::~IMServiceHandler()
 	delete m_loginState;
 	delete m_displayController;
 	delete m_authChannel;
+	LibpurpleAdapter::assignTypingChannel(NULL);
+	delete m_typingChannel;
 }
 
 
@@ -136,6 +142,10 @@ MojErr IMServiceHandler::init()
 	// create the interactive-login (QR) challenge channel and hand it to the adapter
 	m_authChannel = new AuthChannel(m_service);
 	LibpurpleAdapter::assignAuthChannel(m_authChannel);
+
+	// who is typing to us, for the Messaging app's watchTyping
+	m_typingChannel = new TypingChannel(m_service);
+	LibpurpleAdapter::assignTypingChannel(m_typingChannel);
 
 	// consume a one-shot purge sentinel, if present (shell-driven service reset without luna-send)
 	checkPurgeSentinel();
@@ -1141,6 +1151,82 @@ MojErr IMServiceHandler::leaveChannel(MojServiceMessage* serviceMsg, const MojOb
 
 	serviceMsg->replySuccess();
 	return MojErrNone;
+}
+
+// The (serviceName, username, usernameTo) every chat call takes; false, with an error sent, when
+// one is missing.
+static bool chatTarget(MojServiceMessage* serviceMsg, const MojObject& payload, const char* method,
+		MojString& serviceName, MojString& username, MojString& usernameTo)
+{
+	bool found = false;
+	payload.get(_T("serviceName"), serviceName, found);
+	payload.get(_T("username"), username, found);
+	payload.get(_T("usernameTo"), usernameTo, found);
+	if (serviceName.empty() || username.empty() || usernameTo.empty())
+	{
+		MojLogError(IMServiceApp::s_log, _T("%s: serviceName, username and usernameTo are required"), method);
+		serviceMsg->replyError(MojErrInvalidArg);
+		return false;
+	}
+	return true;
+}
+
+// A SendResult as the reply: success, or why not.
+static MojErr replySendResult(MojServiceMessage* serviceMsg, LibpurpleAdapter::SendResult result)
+{
+	switch (result)
+	{
+	case LibpurpleAdapter::SENT:
+		return serviceMsg->replySuccess();
+	case LibpurpleAdapter::USER_NOT_LOGGED_IN:
+		return serviceMsg->replyError(MojErrNotFound, _T("the account is not signed in"));
+	case LibpurpleAdapter::INVALID_PARAMS:
+		return serviceMsg->replyError(MojErrInvalidArg);
+	default:
+		return serviceMsg->replyError(MojErrNotFound, _T("no conversation to act on"));
+	}
+}
+
+/*
+ * Typing (B1): the Messaging app's composer, while the user types to a buddy.
+ *   { "serviceName": "type_telegram", "username": "<ours>", "usernameTo": "<buddy>",
+ *     "state": "typing" | "paused" | "none" }
+ */
+MojErr IMServiceHandler::sendTyping(MojServiceMessage* serviceMsg, const MojObject& payload)
+{
+	MojString serviceName, username, usernameTo, state;
+	if (!chatTarget(serviceMsg, payload, "sendTyping", serviceName, username, usernameTo))
+		return MojErrNone;
+	bool found = false;
+	payload.get(_T("state"), state, found);
+	return replySendResult(serviceMsg, LibpurpleAdapter::sendTyping(serviceName.data(), username.data(),
+			usernameTo.data(), state.empty() ? "none" : state.data()));
+}
+
+/*
+ * Typing (B1): who is typing to us. A subscription: the typers there are now first,
+ * { "typing": [ {serviceName, username, from, state}, ... ] }, then one event per change,
+ * { serviceName, username, from, state }.
+ */
+MojErr IMServiceHandler::watchTyping(MojServiceMessage* serviceMsg, const MojObject& payload)
+{
+	(void)payload;
+	if (m_typingChannel == NULL)
+		return serviceMsg->replyError(MojErrNotInitialized);
+	return m_typingChannel->subscribe(serviceMsg);
+}
+
+/*
+ * Read receipts (B2): the user has read the chat; the prpl sends its read receipts.
+ *   { "serviceName": "type_whatsapp", "username": "<ours>", "usernameTo": "<buddy or chat>" }
+ */
+MojErr IMServiceHandler::markRead(MojServiceMessage* serviceMsg, const MojObject& payload)
+{
+	MojString serviceName, username, usernameTo;
+	if (!chatTarget(serviceMsg, payload, "markRead", serviceName, username, usernameTo))
+		return MojErrNone;
+	return replySendResult(serviceMsg, LibpurpleAdapter::markRead(serviceName.data(), username.data(),
+			usernameTo.data()));
 }
 
 /*
