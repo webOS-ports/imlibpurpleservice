@@ -5,7 +5,7 @@
  * (e.g. WhatsApp's ProtocolMessage/EditedMessage), it emits the "webos-im-edit" signal with the edited
  * message's server id (serviceMessageId) + the new (already HTML-escaped) text. This handler finds the
  * matching immessage row by the (serviceName, username, serviceMessageId) index and merges the new
- * messageText onto it -- so the conversation updates the ORIGINAL bubble in place instead of showing a
+ * messageText and edited: true onto it (MessageChanges::edited; not onto a deleted one) -- so the conversation updates the ORIGINAL bubble in place instead of showing a
  * separate "[EDIT] ..." message. Self-retained through the async DB ops (mirrors OutboxIdHandler).
  */
 #ifndef EDITHANDLER_H_

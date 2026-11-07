@@ -2,6 +2,7 @@
  * EditHandler.cpp  - see EditHandler.h
  */
 #include "EditHandler.h"
+#include "MessageChanges.h"
 #include "IMMessage.h"          // PALM_DB_IMMESSAGE_KIND, MOJDB_* field names
 #include "db/MojDbQuery.h"
 #include "IMServiceApp.h"
@@ -75,9 +76,14 @@ MojErr EditHandler::findResult(MojObject& result, MojErr err)
 		return MojErrNone;
 	}
 
+	if (!MessageChanges::editApplies(row)) {
+		MojLogInfo(IMServiceApp::s_log, _T("EditHandler::findResult: serviceMessageId %s was deleted; edit not applied"),
+				m_serviceMessageId.data());
+		return MojErrNone;
+	}
+
 	MojObject mergeProps;
-	err = mergeProps.putString(MOJDB_MSG_TEXT, m_newText); MojErrCheck(err);
-	err = mergeProps.putString(MOJDB_ID, dbId);           MojErrCheck(err);
+	err = MessageChanges::edited(dbId, m_newText, mergeProps); MojErrCheck(err);
 	err = m_dbClient.merge(m_mergeSlot, mergeProps);
 	MojErrCheck(err);
 	return MojErrNone;
