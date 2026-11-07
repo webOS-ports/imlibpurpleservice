@@ -69,6 +69,7 @@
 #include "PalmImCommon.h"
 #include "AuthChannel.h"
 #include "TypingChannel.h"
+#include "WebosSendSignals.h"
 #include "IrcSupport.h"
 
 //#include <cjson/json.h>
@@ -4784,7 +4785,35 @@ bool LibpurpleAdapter::leaveChannel(const char* serviceName, const char* usernam
 	return true;
 }
 
-LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceName, const char* username, const char* usernameTo, const char* messageText, const char* quotedMessageId)
+/*
+ * B5/B6: what a message carries besides its text, on the conversation for the length of the
+ * prpl's send (SendExtras.h). The prpl reads them in its send_im/chat_send and leaves them; they
+ * are taken off and freed here once the send returns, so none is left for the next message.
+ */
+// The conversation's data, as SendExtras::set/clear use it.
+struct PurpleConvData {
+	PurpleConversation* conv;
+	gpointer get(const char* key) const { return purple_conversation_get_data(conv, key); }
+	void set(const char* key, gpointer value) { purple_conversation_set_data(conv, key, value); }
+};
+
+static void setSendExtras(PurpleConversation* conv, const SendExtras::Extras* extras)
+{
+	if (conv == NULL)
+		return;
+	PurpleConvData data = { conv };
+	SendExtras::set(data, extras);
+}
+
+static void clearSendExtras(PurpleConversation* conv)
+{
+	if (conv == NULL)
+		return;
+	PurpleConvData data = { conv };
+	SendExtras::clear(data);
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceName, const char* username, const char* usernameTo, const char* messageText, const char* quotedMessageId, const SendExtras::Extras* extras)
 {
 	if (!serviceName || !username || !usernameTo || !messageText)
 	{
@@ -4877,9 +4906,11 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceNa
 				if (quotedMessageId && *quotedMessageId)
 					purple_conversation_set_data(chatConv, "webos-reply-to", g_strdup(quotedMessageId));
 				char* chatMsg = g_strcompress(messageText);
+				setSendExtras(chatConv, extras);
 				int cerr = serv_chat_send(gc, purple_conv_chat_get_id(purple_conversation_get_chat_data(chatConv)),
 						chatMsg, (PurpleMessageFlags)0);
-				free(chatMsg);
+				clearSendExtras(chatConv);
+				g_free(chatMsg);
 				if (cerr < 0)
 				{
 					retVal = LibpurpleAdapter::SEND_FAILED;
@@ -4910,13 +4941,15 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceNa
 		// real reply_to on the tdlib sendMessage (the prpl clears it after use). No-op for non-replies.
 		if (quotedMessageId && *quotedMessageId)
 			purple_conversation_set_data(purpleConversation, "webos-reply-to", g_strdup(quotedMessageId));
+		setSendExtras(purpleConversation, extras);
 		int err = serv_send_im(purple_conversation_get_gc(purpleConversation), purple_conversation_get_name(purpleConversation), messageTextUnescaped, (PurpleMessageFlags)0);
+		clearSendExtras(purpleConversation);
 		if (err < 0) {
 			retVal = LibpurpleAdapter::SEND_FAILED;
 			MojLogError(IMServiceApp::s_log, _T("sendMessage: serv_send_im returned err %d"), err);
 		}
 
-		free(messageTextUnescaped);
+		g_free(messageTextUnescaped);
 	}
 
 	return retVal;
@@ -5007,6 +5040,102 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::markRead(const char* serviceName,
 	purple_conversation_set_data(conv, "unseen-count", GINT_TO_POINTER(0));
 	purple_conversation_update(conv, PURPLE_CONV_UPDATE_UNSEEN);
 	return LibpurpleAdapter::SENT;
+}
+
+/*
+ * B3/B4: what the app does to a message or a group besides sending to it. Each goes to the prpls
+ * as a signal that returns TRUE from the prpl that owns the account and took it; none taking it
+ * (a prpl without the feature) fails the command. The names are the prpl's, as for a send.
+ */
+static LibpurpleAdapter::SendResult actionResult(const char* what, const char* serviceName, bool taken)
+{
+	if (!taken) {
+		MojLogWarning(IMServiceApp::s_log, _T("%s: no plugin took it for %s"), what, serviceName);
+		return LibpurpleAdapter::SEND_FAILED;
+	}
+	MojLogInfo(IMServiceApp::s_log, _T("%s: sent for %s"), what, serviceName);
+	return LibpurpleAdapter::SENT;
+}
+
+// The prpl's names for a "\x1f"-joined list of the app's, joined the same way.
+static std::string purpleMembers(const char* membersJoined, const char* serviceName)
+{
+	std::vector<std::string> members = SendExtras::splitMembers(membersJoined ? membersJoined : "");
+	for (std::vector<std::string>::iterator it = members.begin(); it != members.end(); ++it)
+		*it = getPurpleUsername(*it, serviceName);
+	return SendExtras::joinMembers(members);
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::sendEdit(const char* serviceName, const char* username, const char* chat, const char* serviceMessageId, const char* text)
+{
+	if (!serviceName || !username || !chat || !*chat || !serviceMessageId || !*serviceMessageId || !text || !*text)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	std::string const purpleName = getPurpleUsername(chat, serviceName);
+	gchar* unescaped = g_strcompress(text);   // as sendMessage hands a text to the prpl
+	bool const taken = WebosSendSignals::edit(purple_conversations_get_handle(), account,
+			purpleName.c_str(), serviceMessageId, unescaped);
+	g_free(unescaped);
+	return actionResult("sendEdit", serviceName, taken);
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::sendDelete(const char* serviceName, const char* username, const char* chat, const char* serviceMessageId)
+{
+	if (!serviceName || !username || !chat || !*chat || !serviceMessageId || !*serviceMessageId)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	std::string const purpleName = getPurpleUsername(chat, serviceName);
+	bool const taken = WebosSendSignals::deleteMessage(purple_conversations_get_handle(), account,
+			purpleName.c_str(), serviceMessageId);
+	return actionResult("sendDelete", serviceName, taken);
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::createGroup(const char* serviceName, const char* username, const char* name, const char* membersJoined)
+{
+	if (!serviceName || !username || !name || !*name)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	std::string const members = purpleMembers(membersJoined, serviceName);
+	if (members.empty())
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	bool const taken = WebosSendSignals::createGroup(purple_conversations_get_handle(), account,
+			name, members.c_str());
+	return actionResult("createGroup", serviceName, taken);
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::inviteToGroup(const char* serviceName, const char* username, const char* chat, const char* membersJoined)
+{
+	if (!serviceName || !username || !chat || !*chat)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	std::string const members = purpleMembers(membersJoined, serviceName);
+	if (members.empty())
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	std::string const purpleName = getPurpleUsername(chat, serviceName);
+	bool const taken = WebosSendSignals::inviteToGroup(purple_conversations_get_handle(), account,
+			purpleName.c_str(), members.c_str());
+	return actionResult("inviteToGroup", serviceName, taken);
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::leaveGroup(const char* serviceName, const char* username, const char* chat)
+{
+	if (!serviceName || !username || !chat || !*chat)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	std::string const purpleName = getPurpleUsername(chat, serviceName);
+	bool const taken = WebosSendSignals::leaveGroup(purple_conversations_get_handle(), account,
+			purpleName.c_str());
+	return actionResult("leaveGroup", serviceName, taken);
 }
 
 /*
@@ -5494,7 +5623,10 @@ static void registerWebosReactionSignals()
 			purple_value_new(PURPLE_TYPE_STRING),
 			purple_value_new(PURPLE_TYPE_STRING));
 
-	MojLogInfo(IMServiceApp::s_log, _T("registered webos-im-reaction + webos-im-reaction-set + webos-im-outbox-id + webos-im-send-reaction + webos-im-send-poll-vote signals (early)"));
+	// SEND (B3, B4): edit, delete, and the groups (WebosSendSignals.h).
+	WebosSendSignals::registerSignals(convHandle);
+
+	MojLogInfo(IMServiceApp::s_log, _T("registered webos-im-reaction + webos-im-reaction-set + webos-im-outbox-id + webos-im-send-reaction + webos-im-send-poll-vote + edit/delete/group signals (early)"));
 }
 
 void LibpurpleAdapter::assignIMLoginState(LoginCallbackInterface* loginState)

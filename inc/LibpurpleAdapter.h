@@ -32,6 +32,7 @@
 #include <syslog.h>
 #include <string>
 #include "PalmImCommon.h"
+#include "SendExtras.h"
 #include "core/MojService.h"
 #include "db/MojDb.h"
 
@@ -209,7 +210,9 @@ public:
 	static SendResult addBuddy(const char* serviceName, const char* username, const char* buddyUsername, const char* groupname);
 	static SendResult authorizeBuddy(const char* serviceName, const char* username, const char* buddyUsername);
 	static SendResult declineBuddy(const char* serviceName, const char* username, const char* buddyUsername);
-	static SendResult sendMessage(const char *serviceName, const char *username, const char *usernameTo, const char *messageText, const char *quotedMessageId = NULL);
+	// extras: what the message carries besides its text (SendExtras.h), set on the conversation for
+	// the prpl's send and taken off again after it; NULL for none.
+	static SendResult sendMessage(const char *serviceName, const char *username, const char *usernameTo, const char *messageText, const char *quotedMessageId = NULL, const SendExtras::Extras* extras = NULL);
 	// webOS reactions (SEND): transmit a reaction the user placed from the device. emoji "" = remove.
 	// targetSender = the reacted-to message's original sender (from the app's db8 row). It is stashed on
 	// the account right before the send-reaction signal so a backend (whatsmeow) can build the reaction
@@ -227,6 +230,18 @@ public:
 	// name). Raises the "unseen" update Pidgin raises when a chat is looked at, which is what the
 	// prpls send their read receipts on, with the chat in focus for a moment.
 	static SendResult markRead(const char *serviceName, const char *username, const char *usernameTo);
+	// Editing and deleting (for everyone) a message we sent (B3): chat is the conversation it is in,
+	// serviceMessageId the prpl's id for it (the outbox row's serviceMessageId); text is the new text,
+	// as sendMessage takes it. Emits "webos-im-send-edit" / "webos-im-send-delete"; SEND_FAILED when
+	// no prpl took it, as one that has no editing does not.
+	static SendResult sendEdit(const char *serviceName, const char *username, const char *chat, const char *serviceMessageId, const char *text);
+	static SendResult sendDelete(const char *serviceName, const char *username, const char *chat, const char *serviceMessageId);
+	// Groups (B4): create one with a name and members, add members to one, leave one. Members are
+	// "\x1f"-joined buddy names as the app has them. Emits "webos-im-group-create", "-invite" and
+	// "-leave"; SEND_FAILED when no prpl took it. A new group appears as messages into it do.
+	static SendResult createGroup(const char *serviceName, const char *username, const char *name, const char *membersJoined);
+	static SendResult inviteToGroup(const char *serviceName, const char *username, const char *chat, const char *membersJoined);
+	static SendResult leaveGroup(const char *serviceName, const char *username, const char *chat);
 	// webOS attachment send: transmit a local file (absolute path, must exist and be readable in the
 	// transport process) to usernameTo. Mirrors sendMessage's account resolution + channel detection:
 	// a group-channel target routes through serv_chat_send_file, a 1:1 IM through serv_send_file. All

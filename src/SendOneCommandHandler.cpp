@@ -137,6 +137,21 @@ MojErr SendOneCommandHandler::doSend(const MojObject imCmd) {
 	else if (0 == command.compare(_T("sendPollVote"))) {
 		retVal = sendPollVote(imCmd);
 	}
+	else if (0 == command.compare(_T("editMessage"))) {
+		retVal = editMessage(imCmd);
+	}
+	else if (0 == command.compare(_T("deleteMessage"))) {
+		retVal = deleteMessage(imCmd);
+	}
+	else if (0 == command.compare(_T("createGroup"))) {
+		retVal = createGroup(imCmd);
+	}
+	else if (0 == command.compare(_T("inviteToGroup"))) {
+		retVal = inviteToGroup(imCmd);
+	}
+	else if (0 == command.compare(_T("leaveGroup"))) {
+		retVal = leaveGroup(imCmd);
+	}
 	else if (0 == command.compare(_T("receivedBuddyInvite"))) {
 		retVal = receivedBuddyInvite(imCmd);
 	}
@@ -183,7 +198,7 @@ MojErr SendOneCommandHandler::doSend(const MojObject imCmd) {
 		m_outgoingIMHandler->messageFinished();
 
 	}
-	else if (0 == command.compare(_T("sendReaction")) || 0 == command.compare(_T("sendPollVote"))) {
+	else if (isSynchronous(command)) {
 		// sendReaction/sendPollVote complete SYNCHRONOUSLY (unlike the buddy verbs, which call
 		// messageFinished from their own async DB callbacks). Without this, messageFinished() is never
 		// reached on success, so the OutgoingIMHandler queue never advances and
@@ -291,6 +306,72 @@ LibpurpleAdapter::SendResult SendOneCommandHandler::sendPollVote(const MojObject
 
 	return LibpurpleAdapter::sendPollVote(m_serviceName.data(), m_username.data(), m_buddyName.data(),
 			pollMessageId.data(), optionNames.data(), senderJid.data());
+}
+
+/*
+ * The commands that are done once LibpurpleAdapter returns, with no DB callback of their own to
+ * call messageFinished from.
+ */
+bool SendOneCommandHandler::isSynchronous(const MojString& command)
+{
+	static const MojChar* const names[] = {
+		_T("sendReaction"), _T("sendPollVote"), _T("editMessage"), _T("deleteMessage"),
+		_T("createGroup"), _T("inviteToGroup"), _T("leaveGroup")
+	};
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+		if (0 == command.compare(names[i]))
+			return true;
+	}
+	return false;
+}
+
+namespace {
+MojString paramString(const MojObject& imCmd, const MojChar* key)
+{
+	MojObject params;
+	imCmd.get(MOJDB_PARAMS, params);
+	MojString value;
+	bool found = false;
+	params.get(key, value, found);
+	return value;
+}
+}
+
+/*
+ * B3: edit or delete (for everyone) a message we sent. params: targetServiceMessageId, and text
+ * for an edit. m_buddyName is the chat it is in (set in doSend).
+ */
+LibpurpleAdapter::SendResult SendOneCommandHandler::editMessage(const MojObject imCmd) {
+	MojString const target = paramString(imCmd, XPORT_TARGET_MSG_ID);
+	MojString const text = paramString(imCmd, XPORT_TEXT);
+	return LibpurpleAdapter::sendEdit(m_serviceName.data(), m_username.data(), m_buddyName.data(),
+			target.data(), text.data());
+}
+
+LibpurpleAdapter::SendResult SendOneCommandHandler::deleteMessage(const MojObject imCmd) {
+	MojString const target = paramString(imCmd, XPORT_TARGET_MSG_ID);
+	return LibpurpleAdapter::sendDelete(m_serviceName.data(), m_username.data(), m_buddyName.data(),
+			target.data());
+}
+
+/*
+ * B4: params name and members ("\x1f"-joined buddy names) to create a group; members to add to
+ * the group m_buddyName; nothing to leave it.
+ */
+LibpurpleAdapter::SendResult SendOneCommandHandler::createGroup(const MojObject imCmd) {
+	MojString const name = paramString(imCmd, XPORT_GROUP_NAME);
+	MojString const members = paramString(imCmd, XPORT_MEMBERS);
+	return LibpurpleAdapter::createGroup(m_serviceName.data(), m_username.data(), name.data(), members.data());
+}
+
+LibpurpleAdapter::SendResult SendOneCommandHandler::inviteToGroup(const MojObject imCmd) {
+	MojString const members = paramString(imCmd, XPORT_MEMBERS);
+	return LibpurpleAdapter::inviteToGroup(m_serviceName.data(), m_username.data(), m_buddyName.data(), members.data());
+}
+
+LibpurpleAdapter::SendResult SendOneCommandHandler::leaveGroup(const MojObject imCmd) {
+	(void)imCmd;
+	return LibpurpleAdapter::leaveGroup(m_serviceName.data(), m_username.data(), m_buddyName.data());
 }
 
 LibpurpleAdapter::SendResult SendOneCommandHandler::blockBuddy(const MojObject imCmd) {

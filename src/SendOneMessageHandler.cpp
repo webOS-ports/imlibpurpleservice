@@ -83,6 +83,10 @@ MojErr SendOneMessageHandler::doSend(const MojObject imMsg) {
 	err = imMsg.get(MOJDB_QUOTED_MSG_ID, m_quotedMessageId, found);
 	MojErrCheck(err);
 
+	// B5/B6: a location, a contact card or mentions, for a prpl that sends them natively (the text
+	// is their plain form, for one that does not).
+	m_extras = SendExtras::fromMessage(imMsg);
+
 	// userNameTo - use "to" address
 	MojObject addrArray; // array
 	found = imMsg.get(MOJDB_TO, addrArray);
@@ -443,13 +447,13 @@ MojErr SendOneMessageHandler::sendToTransport()
 		if (LibpurpleAdapter::SENT == retVal && !m_messageText.empty())
 		{
 			LibpurpleAdapter::sendMessage(m_serviceName.data(), m_username.data(), m_usernameTo.data(), m_messageText.data(),
-					m_quotedMessageId.empty() ? NULL : m_quotedMessageId.data());
+					m_quotedMessageId.empty() ? NULL : m_quotedMessageId.data(), m_extras.empty() ? NULL : &m_extras);
 		}
 	}
 	else
 	{
 		retVal = LibpurpleAdapter::sendMessage(m_serviceName.data(), m_username.data(), m_usernameTo.data(), m_messageText.data(),
-				m_quotedMessageId.empty() ? NULL : m_quotedMessageId.data());
+				m_quotedMessageId.empty() ? NULL : m_quotedMessageId.data(), m_extras.empty() ? NULL : &m_extras);
 	}
 
 	// Now save the status
