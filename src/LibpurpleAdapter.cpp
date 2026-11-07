@@ -2463,6 +2463,15 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 			        || purple_blist_node_get_bool((PurpleBlistNode*)buddy, "archived");
 	}
 
+	// A system line the prpl writes into the conversation itself - tdlib-purple's "Message from
+	// 04:44:12 has been deleted", a topic change, a member joining - is kept in the thread but is
+	// nobody's message to be alerted about: it comes with who=" " and no sender, so its banner had
+	// no name, and a sender deleting several messages raised one identical banner per message.
+	// Stored like a muted chat's message (flags.noNotification). A prpl asking for input (the
+	// Telegram sign-in prompt) sends a plain PURPLE_MESSAGE_RECV and still notifies.
+	if (flags & PURPLE_MESSAGE_SYSTEM)
+		muted = true;
+
 	// webOS WhatsApp Channels: whatsmeow delivers a followed Channel (newsletter) as a 1:1 IM whose
 	// peer JID is "<id>@newsletter" (it leaves IsGroup=false for the newsletter server), so it lands in
 	// the else-branch above with channelName==NULL and would be stored as an ordinary chatthread. Route
