@@ -5310,6 +5310,9 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::chatMembers(const char* serviceNa
 		ChatMembers::Member m;
 		m.address = getWebosUsername(stripped.c_str(), serviceStr, account);
 		m.name = chatMemberName(account, serviceStr, stripped.c_str(), cb->alias);
+		const char* phone = purple_conv_chat_cb_get_attribute(cb, ChatMembers::PHONE_ATTRIBUTE);
+		if (phone != NULL)
+			m.phone = phone;
 		found.push_back(m);
 	}
 	members = ChatMembers::clean(found, getWebosUsername(account->username, serviceStr, account));

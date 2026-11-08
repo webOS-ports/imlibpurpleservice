@@ -18,6 +18,16 @@ namespace ChatMembers {
 
 namespace {
 
+std::string trim(const std::string& s)
+{
+	static const char* const space = " \t\r\n";
+	size_t const first = s.find_first_not_of(space);
+	if (first == std::string::npos)
+		return std::string();
+	size_t const last = s.find_last_not_of(space);
+	return s.substr(first, last - first + 1);
+}
+
 std::string tidy(const std::string& s)
 {
 	std::string out;
@@ -26,15 +36,21 @@ std::string tidy(const std::string& s)
 		if (s[i] != '\x1e' && s[i] != '\x1f')
 			out += s[i];
 	}
-	static const char* const space = " \t\r\n";
-	size_t const first = out.find_first_not_of(space);
-	if (first == std::string::npos)
+	return trim(out);
+}
+
+// "+<digits>" (trimmed), else empty.
+std::string phoneNumber(const std::string& s)
+{
+	std::string p = trim(s);
+	if (p.size() < 2 || p[0] != '+' || p.find_first_not_of("0123456789", 1) != std::string::npos)
 		return std::string();
-	size_t const last = out.find_last_not_of(space);
-	return out.substr(first, last - first + 1);
+	return p;
 }
 
 } // namespace
+
+const char* const PHONE_ATTRIBUTE = "phone";
 
 std::vector<Member> clean(const std::vector<Member>& members, const std::string& own)
 {
@@ -45,11 +61,16 @@ std::vector<Member> clean(const std::vector<Member>& members, const std::string&
 		if (address.empty() || (!own.empty() && address == own))
 			continue;
 		std::string const name = tidy(members[i].name);
+		std::string const phone = phoneNumber(members[i].phone);
 		if (seen.count(address)) {
-			// Seen without a name: take this one's.
+			// Seen without a name or a phone: take this one's.
 			for (size_t j = 0; j < out.size(); ++j) {
-				if (out[j].address == address && out[j].name == address && !name.empty())
+				if (out[j].address != address)
+					continue;
+				if (out[j].name == address && !name.empty())
 					out[j].name = name;
+				if (out[j].phone.empty())
+					out[j].phone = phone;
 			}
 			continue;
 		}
@@ -57,6 +78,7 @@ std::vector<Member> clean(const std::vector<Member>& members, const std::string&
 		Member m;
 		m.address = address;
 		m.name = name.empty() ? address : name;
+		m.phone = phone;
 		out.push_back(m);
 	}
 	return out;
@@ -75,6 +97,10 @@ MojErr toPayload(const std::vector<Member>& members, bool inChat, MojObject& out
 		MojErrCheck(err);
 		err = one.putString(_T("name"), members[i].name.c_str());
 		MojErrCheck(err);
+		if (!members[i].phone.empty()) {
+			err = one.putString(_T("phone"), members[i].phone.c_str());
+			MojErrCheck(err);
+		}
 		err = list.push(one);
 		MojErrCheck(err);
 	}
