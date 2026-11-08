@@ -5227,6 +5227,79 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::leaveGroup(const char* serviceNam
 	return actionResult("leaveGroup", serviceName, taken);
 }
 
+// The name a chat member is shown with, as incoming_message_cb names a group message's sender: the
+// prpl's alias for them in the chat, else their buddy's alias; for WhatsApp the push-name or
+// "+<phone>", never the raw JID; for Signal never the raw UUID. "" leaves the address as the name.
+static std::string chatMemberName(PurpleAccount* account, const std::string& serviceName,
+		const char* who, const char* chatAlias)
+{
+	const char* alias = (chatAlias != NULL && *chatAlias != '\0') ? chatAlias : NULL;
+	if (alias == NULL) {
+		PurpleBuddy* buddy = purple_find_buddy(account, who);
+		const char* buddyAlias = buddy ? purple_buddy_get_alias_only(buddy) : NULL;
+		if (buddyAlias != NULL && *buddyAlias != '\0')
+			alias = buddyAlias;
+	}
+	if (serviceName == "type_whatsapp")
+		return whatsAppDisplayName(alias, who);
+	if (serviceName == "type_signal") {
+		if (alias != NULL && !isSignalUuid(alias))
+			return alias;
+		return isSignalUuid(who) ? "Signal user" : "";
+	}
+	return alias != NULL ? alias : "";
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::chatMembers(const char* serviceName, const char* username, const char* chat,
+		std::vector<ChatMembers::Member>& members, bool& inChat)
+{
+	members.clear();
+	inChat = false;
+	if (!serviceName || !username || !chat || !*chat)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+
+	std::string purpleName = getPurpleUsername(chat, serviceName);
+	// webOS IRC: the app names a channel by its key, "#chan@network"; libpurple by "#chan".
+	if (Irc::isAccount(account)) {
+		std::string ircChannel;
+		if (Irc::splitChannelKey(purpleName, &ircChannel, NULL))
+			purpleName = ircChannel;
+	}
+	// A chat in the buddy list is found as sendMessage finds it (its "id" component, or its name);
+	// a WhatsApp group that is not in it by the conversation's own name, "<id>@g.us".
+	PurpleConversation* conv = conversationFor(account, purpleName.c_str(), false);
+	if (conv == NULL || purple_conversation_get_type(conv) != PURPLE_CONV_TYPE_CHAT)
+		conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, purpleName.c_str(), account);
+	if (conv == NULL)
+		return LibpurpleAdapter::SENT;
+	inChat = true;
+
+	PurpleConvChat* convChat = PURPLE_CONV_CHAT(conv);
+	const char* nick = purple_conv_chat_get_nick(convChat);
+	const char* ownName = purple_account_get_username(account);
+	std::string const serviceStr(serviceName);
+	std::vector<ChatMembers::Member> found;
+	for (GList* l = purple_conv_chat_get_users(convChat); l != NULL; l = l->next) {
+		PurpleConvChatBuddy* cb = (PurpleConvChatBuddy*)l->data;
+		const char* who = cb ? purple_conv_chat_cb_get_name(cb) : NULL;
+		if (who == NULL || *who == '\0')
+			continue;
+		// Not us: by our nick in the chat, or by our account's own name.
+		if ((nick != NULL && strcmp(who, nick) == 0) || (ownName != NULL && strcmp(who, ownName) == 0))
+			continue;
+		std::string const stripped = stripResourceFromJabberUsername(who, serviceStr);
+		ChatMembers::Member m;
+		m.address = getWebosUsername(stripped.c_str(), serviceStr, account);
+		m.name = chatMemberName(account, serviceStr, stripped.c_str(), cb->alias);
+		found.push_back(m);
+	}
+	members = ChatMembers::clean(found, getWebosUsername(account->username, serviceStr, account));
+	return LibpurpleAdapter::SENT;
+}
+
 /*
  * webOS reactions (SEND): the user reacted (or removed a reaction) to a message from the TouchPad.
  * Resolve the owning account and emit "webos-im-send-reaction" so the owning prpl transmits it over

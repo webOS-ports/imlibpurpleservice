@@ -33,6 +33,7 @@
 #include <string>
 #include "PalmImCommon.h"
 #include "SendExtras.h"
+#include "ChatMembers.h"
 #include "core/MojService.h"
 #include "db/MojDb.h"
 
@@ -255,6 +256,12 @@ public:
 	static SendResult createGroup(const char *serviceName, const char *username, const char *name, const char *membersJoined);
 	static SendResult inviteToGroup(const char *serviceName, const char *username, const char *chat, const char *membersJoined);
 	static SendResult leaveGroup(const char *serviceName, const char *username, const char *chat);
+	// Group Info: who is in the group chat `chat` (as the app names it), from the people the prpl
+	// put on its conversation, each by the address and name an incoming message from them gets.
+	// inChat is false when there is no such chat conversation open in libpurple; the list is then
+	// empty. Not us. SENT, or USER_NOT_LOGGED_IN / INVALID_PARAMS.
+	static SendResult chatMembers(const char *serviceName, const char *username, const char *chat,
+			std::vector<ChatMembers::Member>& members, bool& inChat);
 	// webOS attachment send: transmit a local file (absolute path, must exist and be readable in the
 	// transport process) to usernameTo. Mirrors sendMessage's account resolution + channel detection:
 	// a group-channel target routes through serv_chat_send_file, a 1:1 IM through serv_send_file. All

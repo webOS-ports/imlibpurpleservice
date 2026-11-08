@@ -68,6 +68,7 @@ const IMServiceHandler::Method IMServiceHandler::s_methods[] = {
 	{_T("watchTyping"), (Callback) &IMServiceHandler::watchTyping},
 	{_T("markRead"), (Callback) &IMServiceHandler::markRead},
 	{_T("setChannelOptions"), (Callback) &IMServiceHandler::setChannelOptions},
+	{_T("getChatMembers"), (Callback) &IMServiceHandler::getChatMembers},
 	{NULL, NULL} };
 
 IMServiceHandler::IMServiceHandler(MojService* service)
@@ -1304,6 +1305,30 @@ MojErr IMServiceHandler::setChannelOptions(MojServiceMessage* serviceMsg, const 
 		break;
 	}
 	return MojErrNone;
+}
+
+/*
+ * Group Info: who is in a group chat, as far as the prpl has told libpurple.
+ *   { "serviceName": "type_whatsapp", "username": "<ours>", "usernameTo": "<the chat>" }
+ * Reply (ChatMembers.h): { "returnValue": true, "inChat": bool, "members": [ {address, name} ] }.
+ * An empty list means the prpl has put no one on the chat (or it is not open): the app then names
+ * who has written in it.
+ */
+MojErr IMServiceHandler::getChatMembers(MojServiceMessage* serviceMsg, const MojObject& payload)
+{
+	MojString serviceName, username, usernameTo;
+	if (!chatTarget(serviceMsg, payload, "getChatMembers", serviceName, username, usernameTo))
+		return MojErrNone;
+	std::vector<ChatMembers::Member> members;
+	bool inChat = false;
+	LibpurpleAdapter::SendResult const result = LibpurpleAdapter::chatMembers(serviceName.data(),
+			username.data(), usernameTo.data(), members, inChat);
+	if (result != LibpurpleAdapter::SENT)
+		return replySendResult(serviceMsg, result);
+	MojObject reply;
+	MojErr err = ChatMembers::toPayload(members, inChat, reply);
+	MojErrCheck(err);
+	return serviceMsg->reply(reply);
 }
 
 /*

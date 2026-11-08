@@ -262,6 +262,8 @@ private:
 	MojErr watchTyping(MojServiceMessage* serviceMsg, const MojObject& payload);
 	MojErr markRead(MojServiceMessage* serviceMsg, const MojObject& payload);
 	MojErr setChannelOptions(MojServiceMessage* serviceMsg, const MojObject& payload);
+	//  getChatMembers {serviceName, username, usernameTo}    - who is in that group chat
+	MojErr getChatMembers(MojServiceMessage* serviceMsg, const MojObject& payload);
 
 	// Kicks off the send process. Queries DB for outgoing messages and sends them.
 	MojErr IMSend(MojServiceMessage* msg, const MojObject payload);
