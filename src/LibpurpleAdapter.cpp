@@ -5230,6 +5230,19 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::removeFromGroup(const char* servi
 	return actionResult("removeFromGroup", serviceName, taken);
 }
 
+LibpurpleAdapter::SendResult LibpurpleAdapter::renameGroup(const char* serviceName, const char* username, const char* chat, const char* name)
+{
+	if (!serviceName || !username || !chat || !*chat || !name || !*name)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	std::string const purpleName = getPurpleUsername(chat, serviceName);
+	bool const taken = WebosSendSignals::renameGroup(purple_conversations_get_handle(), account,
+			purpleName.c_str(), name);
+	return actionResult("renameGroup", serviceName, taken);
+}
+
 LibpurpleAdapter::SendResult LibpurpleAdapter::leaveGroup(const char* serviceName, const char* username, const char* chat)
 {
 	if (!serviceName || !username || !chat || !*chat)

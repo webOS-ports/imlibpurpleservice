@@ -100,6 +100,7 @@ private:
 	LibpurpleAdapter::SendResult createGroup(const MojObject imCmd);
 	LibpurpleAdapter::SendResult inviteToGroup(const MojObject imCmd);
 	LibpurpleAdapter::SendResult removeFromGroup(const MojObject imCmd);
+	LibpurpleAdapter::SendResult renameGroup(const MojObject imCmd);
 	LibpurpleAdapter::SendResult leaveGroup(const MojObject imCmd);
 	static bool isSynchronous(const MojString& command);
 	LibpurpleAdapter::SendResult removeBuddy(const MojObject imCmd);

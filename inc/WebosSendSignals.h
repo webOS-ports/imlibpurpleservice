@@ -16,9 +16,10 @@
  *   webos-im-group-create (PurpleAccount*, const char* name, const char* members)
  *   webos-im-group-invite (PurpleAccount*, const char* chat, const char* members)
  *   webos-im-group-remove (PurpleAccount*, const char* chat, const char* members)
+ *   webos-im-group-rename (PurpleAccount*, const char* chat, const char* name)
  *   webos-im-group-leave  (PurpleAccount*, const char* chat)
  *
- * members: buddy names joined by "\x1f". Each emit says whether a prpl took it.
+ * members: buddy names joined by "\x1f"; name: the group's new name. Each emit says whether a prpl took it.
  */
 
 #ifndef WEBOSSENDSIGNALS_H_
@@ -36,6 +37,7 @@ bool deleteMessage(void* handle, PurpleAccount* account, const char* chat, const
 bool createGroup(void* handle, PurpleAccount* account, const char* name, const char* members);
 bool inviteToGroup(void* handle, PurpleAccount* account, const char* chat, const char* members);
 bool removeFromGroup(void* handle, PurpleAccount* account, const char* chat, const char* members);
+bool renameGroup(void* handle, PurpleAccount* account, const char* chat, const char* name);
 bool leaveGroup(void* handle, PurpleAccount* account, const char* chat);
 
 } // namespace WebosSendSignals

@@ -67,7 +67,7 @@ SendOneCommandHandler::~SendOneCommandHandler()
    "type"    : "object",
    "properties" : {
       "command"       : {"type"        : "string",
-                         "enum"        : ["blockBuddy","deleteBuddy","sendBuddyInvite","receivedBuddyInvite","createChatGroup","inviteToGroup","removeFromGroup","leaveGroup"],
+                         "enum"        : ["blockBuddy","deleteBuddy","sendBuddyInvite","receivedBuddyInvite","createChatGroup","inviteToGroup","removeFromGroup","renameGroup","leaveGroup"],
                          "description" : "The command to be processed"},
       "params"        : {"type"        : "any",
                          "description" : "Parameters associated with the command are stored here."}
@@ -151,6 +151,9 @@ MojErr SendOneCommandHandler::doSend(const MojObject imCmd) {
 	}
 	else if (0 == command.compare(_T("removeFromGroup"))) {
 		retVal = removeFromGroup(imCmd);
+	}
+	else if (0 == command.compare(_T("renameGroup"))) {
+		retVal = renameGroup(imCmd);
 	}
 	else if (0 == command.compare(_T("leaveGroup"))) {
 		retVal = leaveGroup(imCmd);
@@ -319,7 +322,8 @@ bool SendOneCommandHandler::isSynchronous(const MojString& command)
 {
 	static const MojChar* const names[] = {
 		_T("sendReaction"), _T("sendPollVote"), _T("editMessage"), _T("deleteMessage"),
-		_T("createGroup"), _T("inviteToGroup"), _T("removeFromGroup"), _T("leaveGroup")
+		_T("createGroup"), _T("inviteToGroup"), _T("removeFromGroup"), _T("renameGroup"),
+		_T("leaveGroup")
 	};
 	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
 		if (0 == command.compare(names[i]))
@@ -359,7 +363,7 @@ LibpurpleAdapter::SendResult SendOneCommandHandler::deleteMessage(const MojObjec
 
 /*
  * B4: params name and members ("\x1f"-joined buddy names) to create a group; members to add to
- * or remove from the group m_buddyName; nothing to leave it.
+ * or remove from the group m_buddyName; name to rename it; nothing to leave it.
  */
 LibpurpleAdapter::SendResult SendOneCommandHandler::createGroup(const MojObject imCmd) {
 	MojString const name = paramString(imCmd, XPORT_GROUP_NAME);
@@ -375,6 +379,11 @@ LibpurpleAdapter::SendResult SendOneCommandHandler::inviteToGroup(const MojObjec
 LibpurpleAdapter::SendResult SendOneCommandHandler::removeFromGroup(const MojObject imCmd) {
 	MojString const members = paramString(imCmd, XPORT_MEMBERS);
 	return LibpurpleAdapter::removeFromGroup(m_serviceName.data(), m_username.data(), m_buddyName.data(), members.data());
+}
+
+LibpurpleAdapter::SendResult SendOneCommandHandler::renameGroup(const MojObject imCmd) {
+	MojString const name = paramString(imCmd, XPORT_GROUP_NAME);
+	return LibpurpleAdapter::renameGroup(m_serviceName.data(), m_username.data(), m_buddyName.data(), name.data());
 }
 
 LibpurpleAdapter::SendResult SendOneCommandHandler::leaveGroup(const MojObject imCmd) {

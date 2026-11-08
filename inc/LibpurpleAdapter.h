@@ -251,11 +251,12 @@ public:
 	static SendResult sendEdit(const char *serviceName, const char *username, const char *chat, const char *serviceMessageId, const char *text);
 	static SendResult sendDelete(const char *serviceName, const char *username, const char *chat, const char *serviceMessageId);
 	// Groups (B4): create one with a name and members, add members to or remove them from one,
-	// leave one. Members are "\x1f"-joined buddy names as the app has them. Emits
-	// "webos-im-group-create", "-invite", "-remove" and "-leave"; SEND_FAILED when no prpl took it. A new group appears as messages into it do.
+	// rename one, leave one. Members are "\x1f"-joined buddy names as the app has them. Emits
+	// "webos-im-group-create", "-invite", "-remove", "-rename" and "-leave"; SEND_FAILED when no prpl took it. A new group appears as messages into it do.
 	static SendResult createGroup(const char *serviceName, const char *username, const char *name, const char *membersJoined);
 	static SendResult inviteToGroup(const char *serviceName, const char *username, const char *chat, const char *membersJoined);
 	static SendResult removeFromGroup(const char *serviceName, const char *username, const char *chat, const char *membersJoined);
+	static SendResult renameGroup(const char *serviceName, const char *username, const char *chat, const char *name);
 	static SendResult leaveGroup(const char *serviceName, const char *username, const char *chat);
 	// Group Info: who is in the group chat `chat` (as the app names it), from the people the prpl
 	// put on its conversation, each by the address and name an incoming message from them gets.

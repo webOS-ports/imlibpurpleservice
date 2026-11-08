@@ -243,6 +243,7 @@ TEST_F(Signals, NoPrplNoTaker)
 	EXPECT_FALSE(WebosSendSignals::createGroup(handle, Ours, "G", "a"));
 	EXPECT_FALSE(WebosSendSignals::inviteToGroup(handle, Ours, "g", "a"));
 	EXPECT_FALSE(WebosSendSignals::removeFromGroup(handle, Ours, "g", "a"));
+	EXPECT_FALSE(WebosSendSignals::renameGroup(handle, Ours, "g", "New name"));
 	EXPECT_FALSE(WebosSendSignals::leaveGroup(handle, Ours, "g"));
 }
 
@@ -307,4 +308,35 @@ TEST_F(Signals, RemoveFromGroupNotTakenForAnotherAccount)
 	purple_signal_connect(handle, "webos-im-group-remove", &other, PURPLE_CALLBACK(other_prpl_cb), &others);
 	EXPECT_FALSE(WebosSendSignals::removeFromGroup(handle, Ours, "g1", "c"));
 	EXPECT_EQ(1, others.calls);
+}
+
+TEST_F(Signals, RenameGroupIsItsOwnSignal)
+{
+	// A rename carries the group and its new name, and reaches no prpl as a create (which would
+	// make a new group of that name) or as any other group change.
+	Seen create = { 0, "" }, invite = { 0, "" }, remove = { 0, "" }, rename = { 0, "" };
+	purple_signal_connect(handle, "webos-im-group-create", &owner, PURPLE_CALLBACK(three_cb), &create);
+	purple_signal_connect(handle, "webos-im-group-invite", &owner, PURPLE_CALLBACK(three_cb), &invite);
+	purple_signal_connect(handle, "webos-im-group-remove", &owner, PURPLE_CALLBACK(three_cb), &remove);
+	purple_signal_connect(handle, "webos-im-group-rename", &owner, PURPLE_CALLBACK(three_cb), &rename);
+	EXPECT_TRUE(WebosSendSignals::renameGroup(handle, Ours, "g1", "Trip to Rome"));
+	EXPECT_EQ(1, rename.calls);
+	EXPECT_EQ("g1|Trip to Rome", rename.args);
+	EXPECT_EQ(0, create.calls);
+	EXPECT_EQ(0, invite.calls);
+	EXPECT_EQ(0, remove.calls);
+	EXPECT_TRUE(WebosSendSignals::createGroup(handle, Ours, "Trip", "a"));
+	EXPECT_EQ(1, rename.calls);
+}
+
+TEST_F(Signals, RenameGroupNotTakenForAnotherAccount)
+{
+	// Today's prpls: none takes the rename for an account that is not its own, so the command fails.
+	Seen others = { 0, "" }, rename = { 0, "" };
+	purple_signal_connect(handle, "webos-im-group-rename", &other, PURPLE_CALLBACK(other_prpl_cb), &others);
+	EXPECT_FALSE(WebosSendSignals::renameGroup(handle, Ours, "g1", "x"));
+	EXPECT_EQ(1, others.calls);
+	purple_signal_connect(handle, "webos-im-group-rename", &owner, PURPLE_CALLBACK(three_cb), &rename);
+	EXPECT_FALSE(WebosSendSignals::renameGroup(handle, Theirs, "g1", "x")) << "not its account";
+	EXPECT_EQ(1, rename.calls);
 }
