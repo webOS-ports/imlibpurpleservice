@@ -226,9 +226,66 @@ TEST(ChatMembers, AJoiningPrplsChatIsJoinedFromTheBuddyList)
 {
 	EXPECT_EQ(ChatMembers::OpenByJoin, ChatMembers::openWay("prpl-telegram", "chat-1001234567890", true, true));
 	EXPECT_EQ(ChatMembers::OpenByJoin, ChatMembers::openWay("prpl-hehoe-whatsmeow", "120363012345678901@g.us", true, true));
-	// Not in the buddy list: serv_join_chat has no components to go on, and the prpl is not asked
-	// the other way either.
-	EXPECT_EQ(ChatMembers::DontOpen, ChatMembers::openWay("prpl-telegram", "chat-1001234567890", false, true));
+}
+
+// Not in the buddy list: joined with the prpl's chat_info_defaults, for a name the prpl gives its
+// groups only; otherwise left, and not asked the other way either.
+TEST(ChatMembers, AJoiningPrplsGroupOutsideTheBuddyListIsJoinedFromDefaults)
+{
+	EXPECT_EQ(ChatMembers::OpenByJoinDefaults, ChatMembers::openWay("prpl-hehoe-whatsmeow", "120363012345678901@g.us", false, true));
+	EXPECT_EQ(ChatMembers::OpenByJoinDefaults, ChatMembers::openWay("prpl-hehoe-whatsmeow", "31611111111-1500000000@g.us", false, true));
+	EXPECT_EQ(ChatMembers::OpenByJoinDefaults, ChatMembers::openWay("prpl-telegram", "chat-1001234567890", false, true));
+	EXPECT_EQ(ChatMembers::OpenByJoinDefaults, ChatMembers::openWay("prpl-telegram", "chat123456789", false, true));
+	// Never joined: a Channel or the status broadcast (left to the signal, which purple-combined
+	// does not take), or anything that is not a group's name.
+	EXPECT_EQ(ChatMembers::OpenBySignal, ChatMembers::openWay("prpl-hehoe-whatsmeow", "120363098765432109@newsletter", false, true));
+	EXPECT_EQ(ChatMembers::OpenBySignal, ChatMembers::openWay("prpl-hehoe-whatsmeow", "status@broadcast", false, true));
+	EXPECT_EQ(ChatMembers::DontOpen, ChatMembers::openWay("prpl-hehoe-whatsmeow", "31611111111@s.whatsapp.net", false, true));
+	EXPECT_EQ(ChatMembers::DontOpen, ChatMembers::openWay("prpl-telegram", "Some Group", false, true));
+	// Signed off: nothing.
+	EXPECT_EQ(ChatMembers::DontOpen, ChatMembers::openWay("prpl-hehoe-whatsmeow", "120363012345678901@g.us", false, false));
+}
+
+TEST(ChatMembers, DefaultsOnlyForAGroupNameThePrplParses)
+{
+	EXPECT_TRUE(ChatMembers::joinFromDefaults("prpl-hehoe-whatsmeow", "120363012345678901@g.us"));
+	EXPECT_TRUE(ChatMembers::joinFromDefaults("prpl-hehoe-whatsmeow", "1@g.us"));
+	EXPECT_TRUE(ChatMembers::joinFromDefaults("prpl-hehoe-whatsmeow", "31611111111-1500000000@g.us"));
+	// gowhatsapp_go_query_group_participants makes an unparsable JID a fatal account error.
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-hehoe-whatsmeow", "@g.us"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-hehoe-whatsmeow", "g.us"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-hehoe-whatsmeow", ""));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-hehoe-whatsmeow", "-1@g.us"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-hehoe-whatsmeow", "1-@g.us"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-hehoe-whatsmeow", "1-2-3@g.us"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-hehoe-whatsmeow", "12a4@g.us"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-hehoe-whatsmeow", "1 2@g.us"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-hehoe-whatsmeow", "120363012345678901@g.us.x"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-hehoe-whatsmeow", "120363012345678901@g.usx"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-hehoe-whatsmeow", "1@x@g.us"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-hehoe-whatsmeow", "120363098765432109@newsletter"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-hehoe-whatsmeow", "status@broadcast"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-hehoe-whatsmeow", "chat-1"));
+
+	EXPECT_TRUE(ChatMembers::joinFromDefaults("prpl-telegram", "chat-1001234567890"));
+	EXPECT_TRUE(ChatMembers::joinFromDefaults("prpl-telegram", "chat1"));
+	EXPECT_TRUE(ChatMembers::joinFromDefaults("prpl-telegram", "chat-9223372036854775808"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-telegram", "chat-92233720368547758080"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-telegram", "chat"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-telegram", "chat-"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-telegram", "chat--1"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-telegram", "chat1x"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-telegram", "xchat1"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-telegram", "chan123"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-telegram", "1234567"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-telegram", "cha"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-telegram", "120363012345678901@g.us"));
+
+	// No other prpl, whatever the name.
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-discord", "120363012345678901@g.us"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-gometa", "chat1"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("", "chat1"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-telegram-x", "chat1"));
 }
 
 TEST(ChatMembers, AnyOtherPrplIsAskedWithTheSignal)

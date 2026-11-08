@@ -100,12 +100,66 @@ bool joinOpensMembers(const std::string& protocolId, const std::string& chat)
 	return false;
 }
 
+namespace {
+
+bool allDigits(const std::string& s, size_t from, size_t to)
+{
+	if (from >= to)
+		return false;
+	for (size_t i = from; i < to; ++i) {
+		if (s[i] < '0' || s[i] > '9')
+			return false;
+	}
+	return true;
+}
+
+/* "<digits>@g.us" or "<digits>-<digits>@g.us" (an older group's creator and creation time). */
+bool isWhatsAppGroupJid(const std::string& chat)
+{
+	static const std::string group = "@g.us";
+	if (chat.size() <= group.size()
+			|| chat.compare(chat.size() - group.size(), group.size(), group) != 0)
+		return false;
+	size_t const end = chat.size() - group.size();
+	size_t const dash = chat.find('-');
+	if (dash == std::string::npos || dash >= end)
+		return allDigits(chat, 0, end);
+	return allDigits(chat, 0, dash) && allDigits(chat, dash + 1, end);
+}
+
+/* "chat<id>": tdlib-purple's name for a chat, the id as ChatId::fromString reads it. */
+bool isTelegramChatName(const std::string& chat)
+{
+	static const std::string prefix = "chat";
+	if (chat.compare(0, prefix.size(), prefix) != 0)
+		return false;
+	size_t from = prefix.size();
+	if (from < chat.size() && chat[from] == '-')
+		++from;
+	// An int64: at most 19 digits.
+	return chat.size() - from <= 19 && allDigits(chat, from, chat.size());
+}
+
+} // namespace
+
+bool joinFromDefaults(const std::string& protocolId, const std::string& chat)
+{
+	if (protocolId == "prpl-hehoe-whatsmeow")
+		return isWhatsAppGroupJid(chat);
+	if (protocolId == "prpl-telegram")
+		return isTelegramChatName(chat);
+	return false;
+}
+
 OpenWay openWay(const std::string& protocolId, const std::string& chat, bool inBuddyList, bool connected)
 {
 	if (!connected || chat.empty())
 		return DontOpen;
-	if (joinOpensMembers(protocolId, chat))
-		return inBuddyList ? OpenByJoin : DontOpen;
+	if (joinOpensMembers(protocolId, chat)) {
+		if (inBuddyList)
+			return OpenByJoin;
+		return joinFromDefaults(protocolId, chat) ? OpenByJoinDefaults : DontOpen;
+	}
 	return OpenBySignal;
 }
 

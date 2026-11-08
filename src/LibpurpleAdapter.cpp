@@ -5305,7 +5305,8 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::chatMembers(const char* serviceNa
 		conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, purpleName.c_str(), account);
 	// No conversation yet: the prpl opens one when the first message in the chat arrives. For a
 	// group in the buddy list whose prpl's join_chat only opens it and puts its members on it
-	// (ChatMembers::joinOpensMembers), open it now. Those joins are done when serv_join_chat
+	// (ChatMembers::joinOpensMembers), open it now; a WhatsApp or Telegram group that is not in it
+	// with the prpl's chat_info_defaults (ChatMembers::joinFromDefaults). Those joins are done when serv_join_chat
 	// returns: the conversation is there (and found by the next request, which joins no more) or
 	// the prpl declined and nothing is pending, so a join is never asked twice for one chat.
 	// Any other prpl is asked with webos-im-chat-open, which one takes only for a chat of its own
@@ -5326,6 +5327,20 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::chatMembers(const char* serviceNa
 					purpleName.c_str(), serviceName);
 			serv_join_chat(gc, components);
 			joinAsked = true;
+		} else if (way == ChatMembers::OpenByJoinDefaults) {
+			// Not in the buddy list: the components are the prpl's own defaults for the chat's name,
+			// as Pidgin and Finch build them to rejoin such a chat, and freed the same way.
+			PurplePlugin* prpl = purple_connection_get_prpl(gc);
+			PurplePluginProtocolInfo* info = prpl ? PURPLE_PLUGIN_PROTOCOL_INFO(prpl) : NULL;
+			GHashTable* defaults = (info != NULL && info->chat_info_defaults != NULL)
+					? info->chat_info_defaults(gc, purpleName.c_str()) : NULL;
+			if (defaults != NULL) {
+				MojLogInfo(IMServiceApp::s_log, _T("getChatMembers: opening %s on %s for its members (not in the buddy list)"),
+						purpleName.c_str(), serviceName);
+				serv_join_chat(gc, defaults);
+				g_hash_table_destroy(defaults);
+				joinAsked = true;
+			}
 		} else if (way == ChatMembers::OpenBySignal) {
 			joinAsked = WebosSendSignals::openChat(purple_conversations_get_handle(), account, purpleName.c_str());
 			if (joinAsked)

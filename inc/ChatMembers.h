@@ -74,18 +74,38 @@ std::vector<Member> clean(const std::vector<Member>& members, const std::string&
  */
 bool joinOpensMembers(const std::string& protocolId, const std::string& chat);
 
+/**
+ * Whether a chat of a joinOpensMembers prpl that is NOT in the buddy list may still be joined, with
+ * the components the prpl's own chat_info_defaults(gc, chat) makes (as Pidgin and Finch rejoin a
+ * chat that has none). Only names that prpl gives its groups, so that what its join_chat does with
+ * them is known:
+ *  - prpl-hehoe-whatsmeow: a group JID, "<digits>@g.us" or "<digits>-<digits>@g.us".
+ *    gowhatsapp_chat_info_defaults gives {name: chat, topic: ""}; gowhatsapp_join_chat puts the
+ *    group in the buddy list and opens it, asking WhatsApp for its participants (GetGroupInfo,
+ *    retried in the background when it fails). A JID it cannot parse is a fatal account error
+ *    there (purple_error ERROR_FATAL), hence the strict form. Never "@newsletter" or
+ *    "status@broadcast".
+ *  - prpl-telegram: "chat<id>", the id a decimal number, negative for supergroups.
+ *    tgprpl_chat_info_defaults gives {id: chat}; tgprpl_chat_join opens it only from what tdlib
+ *    already has, sending nothing, and reports chat-join-failed for one it does not know or is
+ *    not a member of.
+ */
+bool joinFromDefaults(const std::string& protocolId, const std::string& chat);
+
 /** How getChatMembers opens a chat (as libpurple names it) that has no conversation yet. */
 enum OpenWay {
-	DontOpen,	///< leave it: not connected, no chat, or a joining prpl's chat not in the buddy list
+	DontOpen,	///< leave it: not connected, no chat, or a joining prpl's chat it cannot join
 	OpenByJoin,	///< serv_join_chat with the buddy-list chat's components (joinOpensMembers)
+	OpenByJoinDefaults,	///< serv_join_chat with the prpl's chat_info_defaults (joinFromDefaults)
 	OpenBySignal	///< emit webos-im-chat-open; the prpl that owns the chat opens it, or none takes it
 };
 
 /**
  * Which way, if any. connected: the account is signed on (and has a connection);
  * inBuddyList: the chat is in the buddy list, whose components serv_join_chat needs.
- * A prpl whose join_chat only opens the chat is joined, and only that way; any other is asked
- * with the signal, in or out of the buddy list.
+ * A prpl whose join_chat only opens the chat is joined, and only that way: with the buddy-list
+ * chat's components, else with the prpl's defaults where joinFromDefaults allows it. Any other is
+ * asked with the signal, in or out of the buddy list.
  */
 OpenWay openWay(const std::string& protocolId, const std::string& chat, bool inBuddyList, bool connected);
 
