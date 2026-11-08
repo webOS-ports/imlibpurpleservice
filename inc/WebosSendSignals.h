@@ -18,8 +18,15 @@
  *   webos-im-group-remove (PurpleAccount*, const char* chat, const char* members)
  *   webos-im-group-rename (PurpleAccount*, const char* chat, const char* name)
  *   webos-im-group-leave  (PurpleAccount*, const char* chat)
+ *   webos-im-chat-open    (PurpleAccount*, const char* chat)
  *
  * members: buddy names joined by "\x1f"; name: the group's new name. Each emit says whether a prpl took it.
+ *
+ * webos-im-chat-open asks a prpl whose join_chat does more than open the chat (purple-discord's
+ * fetches its messages) to open the chat conversation and put its members on it, and nothing else:
+ * no history, nothing marked read, no line written. getChatMembers emits it for a chat that has no
+ * conversation yet (ChatMembers::openWay). TRUE: the conversation is open, its members on it or
+ * on their way.
  */
 
 #ifndef WEBOSSENDSIGNALS_H_
@@ -39,6 +46,7 @@ bool inviteToGroup(void* handle, PurpleAccount* account, const char* chat, const
 bool removeFromGroup(void* handle, PurpleAccount* account, const char* chat, const char* members);
 bool renameGroup(void* handle, PurpleAccount* account, const char* chat, const char* name);
 bool leaveGroup(void* handle, PurpleAccount* account, const char* chat);
+bool openChat(void* handle, PurpleAccount* account, const char* chat);
 
 } // namespace WebosSendSignals
 

@@ -25,8 +25,10 @@
  * libpurple has a chat's conversation only once the prpl opened it, which most do when the first
  * message in it arrives. For a group in the buddy list that has none yet, getChatMembers asks the
  * prpl to open it (serv_join_chat) when that prpl's join_chat only opens the conversation and puts
- * the members on it (joinOpensMembers). The reply then also has "joining": true when the members
- * may still come: the app asks again.
+ * the members on it (joinOpensMembers). Any other prpl is asked to open it with the
+ * webos-im-chat-open signal (WebosSendSignals.h), which one whose join_chat does more takes for
+ * its own chats (purple-discord: a group DM). openWay holds the choice. The reply then also has
+ * "joining": true when the members may still come: the app asks again.
  *
  * Nothing here touches libpurple, so it can be tested on its own.
  */
@@ -71,6 +73,21 @@ std::vector<Member> clean(const std::vector<Member>& members, const std::string&
  * Not purple-discord: its join_chat fetches the channel's messages every time. Nor any other prpl.
  */
 bool joinOpensMembers(const std::string& protocolId, const std::string& chat);
+
+/** How getChatMembers opens a chat (as libpurple names it) that has no conversation yet. */
+enum OpenWay {
+	DontOpen,	///< leave it: not connected, no chat, or a joining prpl's chat not in the buddy list
+	OpenByJoin,	///< serv_join_chat with the buddy-list chat's components (joinOpensMembers)
+	OpenBySignal	///< emit webos-im-chat-open; the prpl that owns the chat opens it, or none takes it
+};
+
+/**
+ * Which way, if any. connected: the account is signed on (and has a connection);
+ * inBuddyList: the chat is in the buddy list, whose components serv_join_chat needs.
+ * A prpl whose join_chat only opens the chat is joined, and only that way; any other is asked
+ * with the signal, in or out of the buddy list.
+ */
+OpenWay openWay(const std::string& protocolId, const std::string& chat, bool inBuddyList, bool connected);
 
 /** Whether the reply says "joining": true. joinAsked: serv_join_chat was called in this request.
  *  Then the members may still come when the conversation is not there or has no one on it yet. */

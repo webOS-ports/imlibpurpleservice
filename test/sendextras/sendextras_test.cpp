@@ -245,6 +245,7 @@ TEST_F(Signals, NoPrplNoTaker)
 	EXPECT_FALSE(WebosSendSignals::removeFromGroup(handle, Ours, "g", "a"));
 	EXPECT_FALSE(WebosSendSignals::renameGroup(handle, Ours, "g", "New name"));
 	EXPECT_FALSE(WebosSendSignals::leaveGroup(handle, Ours, "g"));
+	EXPECT_FALSE(WebosSendSignals::openChat(handle, Ours, "g"));
 }
 
 TEST_F(Signals, EditGoesToThePrplWithItsArguments)
@@ -339,4 +340,37 @@ TEST_F(Signals, RenameGroupNotTakenForAnotherAccount)
 	purple_signal_connect(handle, "webos-im-group-rename", &owner, PURPLE_CALLBACK(three_cb), &rename);
 	EXPECT_FALSE(WebosSendSignals::renameGroup(handle, Theirs, "g1", "x")) << "not its account";
 	EXPECT_EQ(1, rename.calls);
+}
+
+TEST_F(Signals, OpenChatIsItsOwnSignal)
+{
+	// Opening a chat for its members is no join, no leave and no other group change.
+	Seen open = { 0, "" }, leave = { 0, "" };
+	purple_signal_connect(handle, "webos-im-group-leave", &owner, PURPLE_CALLBACK(leave_cb), &leave);
+	purple_signal_connect(handle, "webos-im-chat-open", &owner, PURPLE_CALLBACK(leave_cb), &open);
+	EXPECT_TRUE(WebosSendSignals::openChat(handle, Ours, "1410895923755880"));
+	EXPECT_EQ(1, open.calls);
+	EXPECT_EQ("1410895923755880", open.args);
+	EXPECT_EQ(0, leave.calls);
+	EXPECT_TRUE(WebosSendSignals::leaveGroup(handle, Ours, "g1"));
+	EXPECT_EQ(1, open.calls);
+}
+
+// Another prpl's handler on a two-argument signal: never its account.
+static gboolean other_prpl_two_cb(PurpleAccount*, const char*, gpointer data)
+{
+	static_cast<Seen*>(data)->calls++;
+	return FALSE;
+}
+
+TEST_F(Signals, OpenChatNotTakenForAnotherAccount)
+{
+	Seen others = { 0, "" }, open = { 0, "" };
+	purple_signal_connect(handle, "webos-im-chat-open", &other, PURPLE_CALLBACK(other_prpl_two_cb), &others);
+	EXPECT_FALSE(WebosSendSignals::openChat(handle, Ours, "g1"));
+	EXPECT_EQ(1, others.calls);
+	purple_signal_connect(handle, "webos-im-chat-open", &owner, PURPLE_CALLBACK(leave_cb), &open);
+	EXPECT_FALSE(WebosSendSignals::openChat(handle, Theirs, "g1")) << "not its account";
+	EXPECT_TRUE(WebosSendSignals::openChat(handle, Ours, "g1"));
+	EXPECT_EQ(2, open.calls);
 }

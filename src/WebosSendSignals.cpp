@@ -23,6 +23,7 @@ const char* const InviteSignal = "webos-im-group-invite";
 const char* const RemoveSignal = "webos-im-group-remove";
 const char* const RenameSignal = "webos-im-group-rename";
 const char* const LeaveSignal = "webos-im-group-leave";
+const char* const OpenSignal = "webos-im-chat-open";
 
 PurpleValue* accountValue() { return purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT); }
 PurpleValue* stringValue() { return purple_value_new(PURPLE_TYPE_STRING); }
@@ -49,6 +50,8 @@ void registerSignals(void* handle)
 	purple_signal_register(handle, RenameSignal, purple_marshal_BOOLEAN__POINTER_POINTER_POINTER,
 			booleanValue(), 3, accountValue(), stringValue(), stringValue());
 	purple_signal_register(handle, LeaveSignal, purple_marshal_BOOLEAN__POINTER_POINTER,
+			booleanValue(), 2, accountValue(), stringValue());
+	purple_signal_register(handle, OpenSignal, purple_marshal_BOOLEAN__POINTER_POINTER,
 			booleanValue(), 2, accountValue(), stringValue());
 }
 
@@ -85,6 +88,11 @@ bool renameGroup(void* handle, PurpleAccount* account, const char* chat, const c
 bool leaveGroup(void* handle, PurpleAccount* account, const char* chat)
 {
 	return taken(purple_signal_emit_return_1(handle, LeaveSignal, account, chat));
+}
+
+bool openChat(void* handle, PurpleAccount* account, const char* chat)
+{
+	return taken(purple_signal_emit_return_1(handle, OpenSignal, account, chat));
 }
 
 } // namespace WebosSendSignals

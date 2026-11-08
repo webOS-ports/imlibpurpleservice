@@ -100,6 +100,15 @@ bool joinOpensMembers(const std::string& protocolId, const std::string& chat)
 	return false;
 }
 
+OpenWay openWay(const std::string& protocolId, const std::string& chat, bool inBuddyList, bool connected)
+{
+	if (!connected || chat.empty())
+		return DontOpen;
+	if (joinOpensMembers(protocolId, chat))
+		return inBuddyList ? OpenByJoin : DontOpen;
+	return OpenBySignal;
+}
+
 bool stillJoining(bool joinAsked, bool inChat, size_t memberCount)
 {
 	return joinAsked && (!inChat || memberCount == 0);

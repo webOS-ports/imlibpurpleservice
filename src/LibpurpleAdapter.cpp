@@ -5308,6 +5308,9 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::chatMembers(const char* serviceNa
 	// (ChatMembers::joinOpensMembers), open it now. Those joins are done when serv_join_chat
 	// returns: the conversation is there (and found by the next request, which joins no more) or
 	// the prpl declined and nothing is pending, so a join is never asked twice for one chat.
+	// Any other prpl is asked with webos-im-chat-open, which one takes only for a chat of its own
+	// that it can open without its join_chat's history fetch; it too opens the conversation before
+	// it returns TRUE, its members on it or on their way (ChatMembers::openWay).
 	bool joinAsked = false;
 	if (conv == NULL) {
 		PurpleConnection* gc = purple_account_get_connection(account);
@@ -5316,12 +5319,20 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::chatMembers(const char* serviceNa
 			chatNode = purple_blist_find_chat(account, purpleName.c_str());
 		GHashTable* components = chatNode ? purple_chat_get_components(chatNode) : NULL;
 		const char* protoId = purple_account_get_protocol_id(account);
-		if (gc != NULL && components != NULL && purple_account_is_connected(account)
-				&& ChatMembers::joinOpensMembers(protoId ? protoId : "", purpleName)) {
+		ChatMembers::OpenWay const way = ChatMembers::openWay(protoId ? protoId : "", purpleName,
+				components != NULL, gc != NULL && purple_account_is_connected(account));
+		if (way == ChatMembers::OpenByJoin) {
 			MojLogInfo(IMServiceApp::s_log, _T("getChatMembers: opening %s on %s for its members"),
 					purpleName.c_str(), serviceName);
 			serv_join_chat(gc, components);
 			joinAsked = true;
+		} else if (way == ChatMembers::OpenBySignal) {
+			joinAsked = WebosSendSignals::openChat(purple_conversations_get_handle(), account, purpleName.c_str());
+			if (joinAsked)
+				MojLogInfo(IMServiceApp::s_log, _T("getChatMembers: %s on %s opened for its members"),
+						purpleName.c_str(), serviceName);
+		}
+		if (joinAsked) {
 			conv = conversationFor(account, purpleName.c_str(), false);
 			if (conv == NULL || purple_conversation_get_type(conv) != PURPLE_CONV_TYPE_CHAT)
 				conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, purpleName.c_str(), account);

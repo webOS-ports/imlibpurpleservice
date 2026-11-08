@@ -219,6 +219,39 @@ TEST(ChatMembers, NoChatNoJoin)
 	EXPECT_FALSE(ChatMembers::joinOpensMembers("prpl-hehoe-whatsmeow", ""));
 }
 
+// How a chat with no conversation is opened (openWay): joined where the join only opens it,
+// otherwise asked for with webos-im-chat-open, which the prpl that owns it takes or not.
+
+TEST(ChatMembers, AJoiningPrplsChatIsJoinedFromTheBuddyList)
+{
+	EXPECT_EQ(ChatMembers::OpenByJoin, ChatMembers::openWay("prpl-telegram", "chat-1001234567890", true, true));
+	EXPECT_EQ(ChatMembers::OpenByJoin, ChatMembers::openWay("prpl-hehoe-whatsmeow", "120363012345678901@g.us", true, true));
+	// Not in the buddy list: serv_join_chat has no components to go on, and the prpl is not asked
+	// the other way either.
+	EXPECT_EQ(ChatMembers::DontOpen, ChatMembers::openWay("prpl-telegram", "chat-1001234567890", false, true));
+}
+
+TEST(ChatMembers, AnyOtherPrplIsAskedWithTheSignal)
+{
+	// purple-discord: its join_chat fetches the channel's messages, so it gets the signal, in the
+	// buddy list or not.
+	EXPECT_EQ(ChatMembers::OpenBySignal, ChatMembers::openWay("prpl-discord", "1410895923755880", true, true));
+	EXPECT_EQ(ChatMembers::OpenBySignal, ChatMembers::openWay("prpl-discord", "1410895923755880", false, true));
+	EXPECT_EQ(ChatMembers::OpenBySignal, ChatMembers::openWay("prpl-irc", "#luneos", true, true));
+	// A WhatsApp Channel is not joined (its posts would be fetched); purple-combined takes no
+	// webos-im-chat-open, so the signal leaves it as it is.
+	EXPECT_EQ(ChatMembers::OpenBySignal, ChatMembers::openWay("prpl-hehoe-whatsmeow", "120363098765432109@newsletter", true, true));
+	EXPECT_EQ(ChatMembers::OpenBySignal, ChatMembers::openWay("", "chat-1", true, true));
+}
+
+TEST(ChatMembers, NothingIsOpenedSignedOffOrWithoutAChat)
+{
+	EXPECT_EQ(ChatMembers::DontOpen, ChatMembers::openWay("prpl-telegram", "chat-1", true, false));
+	EXPECT_EQ(ChatMembers::DontOpen, ChatMembers::openWay("prpl-discord", "1410895923755880", true, false));
+	EXPECT_EQ(ChatMembers::DontOpen, ChatMembers::openWay("prpl-discord", "", true, true));
+	EXPECT_EQ(ChatMembers::DontOpen, ChatMembers::openWay("prpl-telegram", "", true, true));
+}
+
 TEST(ChatMembers, StillJoiningOnlyAfterAJoinThatMayStillBringMembers)
 {
 	// Nothing was asked of the prpl: never joining, whatever was found.
