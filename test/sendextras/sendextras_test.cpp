@@ -242,6 +242,7 @@ TEST_F(Signals, NoPrplNoTaker)
 	EXPECT_FALSE(WebosSendSignals::deleteMessage(handle, Ours, "anna", "m1"));
 	EXPECT_FALSE(WebosSendSignals::createGroup(handle, Ours, "G", "a"));
 	EXPECT_FALSE(WebosSendSignals::inviteToGroup(handle, Ours, "g", "a"));
+	EXPECT_FALSE(WebosSendSignals::removeFromGroup(handle, Ours, "g", "a"));
 	EXPECT_FALSE(WebosSendSignals::leaveGroup(handle, Ours, "g"));
 }
 
@@ -283,4 +284,27 @@ TEST_F(Signals, Groups)
 	EXPECT_TRUE(WebosSendSignals::leaveGroup(handle, Ours, "g1"));
 	EXPECT_EQ("g1", leave.args);
 	EXPECT_FALSE(WebosSendSignals::leaveGroup(handle, Theirs, "g1"));
+}
+
+TEST_F(Signals, RemoveFromGroupIsItsOwnSignal)
+{
+	// Removing must not reach a prpl as an invite (or the other way round): a member asked to be
+	// removed would be added.
+	Seen invite = { 0, "" }, remove = { 0, "" };
+	purple_signal_connect(handle, "webos-im-group-invite", &owner, PURPLE_CALLBACK(three_cb), &invite);
+	purple_signal_connect(handle, "webos-im-group-remove", &owner, PURPLE_CALLBACK(three_cb), &remove);
+	EXPECT_TRUE(WebosSendSignals::removeFromGroup(handle, Ours, "g1", "c\x1f" "d"));
+	EXPECT_EQ("g1|c\x1f" "d", remove.args);
+	EXPECT_EQ(0, invite.calls);
+	EXPECT_TRUE(WebosSendSignals::inviteToGroup(handle, Ours, "g1", "e"));
+	EXPECT_EQ("g1|e", invite.args);
+	EXPECT_EQ(1, remove.calls);
+}
+
+TEST_F(Signals, RemoveFromGroupNotTakenForAnotherAccount)
+{
+	Seen others = { 0, "" };
+	purple_signal_connect(handle, "webos-im-group-remove", &other, PURPLE_CALLBACK(other_prpl_cb), &others);
+	EXPECT_FALSE(WebosSendSignals::removeFromGroup(handle, Ours, "g1", "c"));
+	EXPECT_EQ(1, others.calls);
 }

@@ -20,6 +20,7 @@ const char* const EditSignal = "webos-im-send-edit";
 const char* const DeleteSignal = "webos-im-send-delete";
 const char* const CreateSignal = "webos-im-group-create";
 const char* const InviteSignal = "webos-im-group-invite";
+const char* const RemoveSignal = "webos-im-group-remove";
 const char* const LeaveSignal = "webos-im-group-leave";
 
 PurpleValue* accountValue() { return purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT); }
@@ -41,6 +42,8 @@ void registerSignals(void* handle)
 	purple_signal_register(handle, CreateSignal, purple_marshal_BOOLEAN__POINTER_POINTER_POINTER,
 			booleanValue(), 3, accountValue(), stringValue(), stringValue());
 	purple_signal_register(handle, InviteSignal, purple_marshal_BOOLEAN__POINTER_POINTER_POINTER,
+			booleanValue(), 3, accountValue(), stringValue(), stringValue());
+	purple_signal_register(handle, RemoveSignal, purple_marshal_BOOLEAN__POINTER_POINTER_POINTER,
 			booleanValue(), 3, accountValue(), stringValue(), stringValue());
 	purple_signal_register(handle, LeaveSignal, purple_marshal_BOOLEAN__POINTER_POINTER,
 			booleanValue(), 2, accountValue(), stringValue());
@@ -64,6 +67,11 @@ bool createGroup(void* handle, PurpleAccount* account, const char* name, const c
 bool inviteToGroup(void* handle, PurpleAccount* account, const char* chat, const char* members)
 {
 	return taken(purple_signal_emit_return_1(handle, InviteSignal, account, chat, members));
+}
+
+bool removeFromGroup(void* handle, PurpleAccount* account, const char* chat, const char* members)
+{
+	return taken(purple_signal_emit_return_1(handle, RemoveSignal, account, chat, members));
 }
 
 bool leaveGroup(void* handle, PurpleAccount* account, const char* chat)

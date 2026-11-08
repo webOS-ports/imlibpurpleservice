@@ -5214,6 +5214,22 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::inviteToGroup(const char* service
 	return actionResult("inviteToGroup", serviceName, taken);
 }
 
+LibpurpleAdapter::SendResult LibpurpleAdapter::removeFromGroup(const char* serviceName, const char* username, const char* chat, const char* membersJoined)
+{
+	if (!serviceName || !username || !chat || !*chat)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	std::string const members = purpleMembers(membersJoined, serviceName);
+	if (members.empty())
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	std::string const purpleName = getPurpleUsername(chat, serviceName);
+	bool const taken = WebosSendSignals::removeFromGroup(purple_conversations_get_handle(), account,
+			purpleName.c_str(), members.c_str());
+	return actionResult("removeFromGroup", serviceName, taken);
+}
+
 LibpurpleAdapter::SendResult LibpurpleAdapter::leaveGroup(const char* serviceName, const char* username, const char* chat)
 {
 	if (!serviceName || !username || !chat || !*chat)
