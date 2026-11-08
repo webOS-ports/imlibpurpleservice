@@ -90,39 +90,48 @@ MojErr SendOneCommandHandler::doSend(const MojObject imCmd) {
 	LibpurpleAdapter::SendResult retVal = LibpurpleAdapter::SENT;
 	bool found = false;
 
+	// A command that cannot be read is dropped below like an unknown one: returning here would
+	// leave it pending and its OutgoingIMCommandHandler waiting for a messageFinished that never
+	// comes, so the activity would never be completed and the watch never re-armed.
 	MojErr err = imCmd.get(MOJDB_COMMAND, command, found);
-	MojErrCheck(err);
 
 	// serviceName
-	err = imCmd.get(MOJDB_SERVICE_NAME, m_serviceName, found);
-	MojErrCheck(err);
+	if (err == MojErrNone)
+		err = imCmd.get(MOJDB_SERVICE_NAME, m_serviceName, found);
 
 	// get the id so we can update the status in  the DB after sending
-	err = imCmd.getRequired(MOJDB_ID, m_currentCmdDbId);
-	MojErrCheck(err);
+	if (err == MojErrNone)
+		err = imCmd.getRequired(MOJDB_ID, m_currentCmdDbId);
 
 	// for receiving invite, the user account and remote user are reversed: targetUsername is us and the fromUsername is the remote buddy
-	if (0 == command.compare(_T("receivedBuddyInvite"))) {
+	if (err != MojErrNone) {
+		// not read
+	}
+	else if (0 == command.compare(_T("receivedBuddyInvite"))) {
 		// username of current account
 		err = imCmd.get(MOJDB_FROM_USER, m_buddyName, found);
-		MojErrCheck(err);
 
 		// buddy / remote user
-		err = imCmd.get(MOJODB_TARGET_USER, m_username, found);
-		MojErrCheck(err);
+		if (err == MojErrNone)
+			err = imCmd.get(MOJODB_TARGET_USER, m_username, found);
 	}
 	else {
 		// username of current account
 		err = imCmd.get(MOJDB_FROM_USER, m_username, found);
-		MojErrCheck(err);
 
 		// buddy / remote user
-		err = imCmd.get(MOJODB_TARGET_USER, m_buddyName, found);
-		MojErrCheck(err);
+		if (err == MojErrNone)
+			err = imCmd.get(MOJODB_TARGET_USER, m_buddyName, found);
 	}
 
 	// which command?
-	if (0 == command.compare(_T("blockBuddy"))) {
+	if (err != MojErrNone) {
+		MojString error;
+		MojErrToString(err, error);
+		MojLogError(IMServiceApp::s_log, _T("doSend: command could not be read: %d - %s"), err, error.data());
+		retVal = LibpurpleAdapter::SEND_FAILED;
+	}
+	else if (0 == command.compare(_T("blockBuddy"))) {
 		retVal = blockBuddy(imCmd);
 	}
 	else if (0 == command.compare(_T("deleteBuddy"))) {
@@ -191,10 +200,14 @@ MojErr SendOneCommandHandler::doSend(const MojObject imCmd) {
 
 		// luna://com.palm.db/del '{"ids":[2]}'
 		IMServiceHandler::logMojObjectJsonString(_T("deleting imcommand: %s"), idsToDelete);
-		err = m_dbClient.del(this->m_imDeleteCommandSlot, idsToDelete.arrayBegin(), idsToDelete.arrayEnd());
-
-		if (err) {
-			MojLogError(IMServiceApp::s_log, _T("doSend - DB del command failed. err %d, DB id %s: "), err, m_currentCmdDbId.data() );
+		if (m_currentCmdDbId.empty()) {
+			MojLogError(IMServiceApp::s_log, _T("doSend - command has no DB id, cannot delete it"));
+		}
+		else {
+			err = m_dbClient.del(this->m_imDeleteCommandSlot, idsToDelete.arrayBegin(), idsToDelete.arrayEnd());
+			if (err) {
+				MojLogError(IMServiceApp::s_log, _T("doSend - DB del command failed. err %d, DB id %s: "), err, m_currentCmdDbId.data() );
+			}
 		}
 	}
 
@@ -591,6 +604,8 @@ MojErr SendOneCommandHandler::findAccountIdForRemoveResult(MojObject& result, Mo
 		MojString error;
 		MojErrToString(findErr, error);
 		MojLogError(IMServiceApp::s_log, _T("findAccountIdResult failed: error %d - %s"), findErr, error.data());
+		// tell the outgoing Command handler we are done, or the activity is never completed
+		m_outgoingIMHandler->messageFinished();
 
 	} else {
 
@@ -786,6 +801,8 @@ MojErr SendOneCommandHandler::findAccountIdForAddResult(MojObject& result, MojEr
 		MojString error;
 		MojErrToString(findErr, error);
 		MojLogError(IMServiceApp::s_log, _T("findAccountIdResult failed: error %d - %s"), findErr, error.data());
+		// tell the outgoing Command handler we are done, or the activity is never completed
+		m_outgoingIMHandler->messageFinished();
 
 	} else {
 
