@@ -5280,10 +5280,11 @@ static std::string chatMemberName(PurpleAccount* account, const std::string& ser
 }
 
 LibpurpleAdapter::SendResult LibpurpleAdapter::chatMembers(const char* serviceName, const char* username, const char* chat,
-		std::vector<ChatMembers::Member>& members, bool& inChat)
+		std::vector<ChatMembers::Member>& members, bool& inChat, bool& joining)
 {
 	members.clear();
 	inChat = false;
+	joining = false;
 	if (!serviceName || !username || !chat || !*chat)
 		return LibpurpleAdapter::INVALID_PARAMS;
 	PurpleAccount* account = onlineAccount(serviceName, username);
@@ -5302,8 +5303,34 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::chatMembers(const char* serviceNa
 	PurpleConversation* conv = conversationFor(account, purpleName.c_str(), false);
 	if (conv == NULL || purple_conversation_get_type(conv) != PURPLE_CONV_TYPE_CHAT)
 		conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, purpleName.c_str(), account);
-	if (conv == NULL)
+	// No conversation yet: the prpl opens one when the first message in the chat arrives. For a
+	// group in the buddy list whose prpl's join_chat only opens it and puts its members on it
+	// (ChatMembers::joinOpensMembers), open it now. Those joins are done when serv_join_chat
+	// returns: the conversation is there (and found by the next request, which joins no more) or
+	// the prpl declined and nothing is pending, so a join is never asked twice for one chat.
+	bool joinAsked = false;
+	if (conv == NULL) {
+		PurpleConnection* gc = purple_account_get_connection(account);
+		PurpleChat* chatNode = findChatByIdComponent(account, purpleName.c_str());
+		if (chatNode == NULL)
+			chatNode = purple_blist_find_chat(account, purpleName.c_str());
+		GHashTable* components = chatNode ? purple_chat_get_components(chatNode) : NULL;
+		const char* protoId = purple_account_get_protocol_id(account);
+		if (gc != NULL && components != NULL && purple_account_is_connected(account)
+				&& ChatMembers::joinOpensMembers(protoId ? protoId : "", purpleName)) {
+			MojLogInfo(IMServiceApp::s_log, _T("getChatMembers: opening %s on %s for its members"),
+					purpleName.c_str(), serviceName);
+			serv_join_chat(gc, components);
+			joinAsked = true;
+			conv = conversationFor(account, purpleName.c_str(), false);
+			if (conv == NULL || purple_conversation_get_type(conv) != PURPLE_CONV_TYPE_CHAT)
+				conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, purpleName.c_str(), account);
+		}
+	}
+	if (conv == NULL) {
+		joining = ChatMembers::stillJoining(joinAsked, false, 0);
 		return LibpurpleAdapter::SENT;
+	}
 	inChat = true;
 
 	PurpleConvChat* convChat = PURPLE_CONV_CHAT(conv);
@@ -5329,6 +5356,7 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::chatMembers(const char* serviceNa
 		found.push_back(m);
 	}
 	members = ChatMembers::clean(found, getWebosUsername(account->username, serviceStr, account));
+	joining = ChatMembers::stillJoining(joinAsked, inChat, members.size());
 	return LibpurpleAdapter::SENT;
 }
 

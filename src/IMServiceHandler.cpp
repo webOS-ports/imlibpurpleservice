@@ -1310,9 +1310,10 @@ MojErr IMServiceHandler::setChannelOptions(MojServiceMessage* serviceMsg, const 
 /*
  * Group Info: who is in a group chat, as far as the prpl has told libpurple.
  *   { "serviceName": "type_whatsapp", "username": "<ours>", "usernameTo": "<the chat>" }
- * Reply (ChatMembers.h): { "returnValue": true, "inChat": bool, "members": [ {address, name} ] }.
- * An empty list means the prpl has put no one on the chat (or it is not open): the app then names
- * who has written in it.
+ * Reply (ChatMembers.h): { "returnValue": true, "inChat": bool, ["joining": true,]
+ * "members": [ {address, name} ] }. An empty list means the prpl has put no one on the chat (or it
+ * is not open): the app then names who has written in it. "joining": the chat was not open and the
+ * prpl was asked to open it in this request; its members may come, so ask again shortly.
  */
 MojErr IMServiceHandler::getChatMembers(MojServiceMessage* serviceMsg, const MojObject& payload)
 {
@@ -1321,12 +1322,13 @@ MojErr IMServiceHandler::getChatMembers(MojServiceMessage* serviceMsg, const Moj
 		return MojErrNone;
 	std::vector<ChatMembers::Member> members;
 	bool inChat = false;
+	bool joining = false;
 	LibpurpleAdapter::SendResult const result = LibpurpleAdapter::chatMembers(serviceName.data(),
-			username.data(), usernameTo.data(), members, inChat);
+			username.data(), usernameTo.data(), members, inChat, joining);
 	if (result != LibpurpleAdapter::SENT)
 		return replySendResult(serviceMsg, result);
 	MojObject reply;
-	MojErr err = ChatMembers::toPayload(members, inChat, reply);
+	MojErr err = ChatMembers::toPayload(members, inChat, joining, reply);
 	MojErrCheck(err);
 	return serviceMsg->reply(reply);
 }

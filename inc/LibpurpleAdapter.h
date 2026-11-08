@@ -261,9 +261,11 @@ public:
 	// Group Info: who is in the group chat `chat` (as the app names it), from the people the prpl
 	// put on its conversation, each by the address and name an incoming message from them gets.
 	// inChat is false when there is no such chat conversation open in libpurple; the list is then
-	// empty. Not us. SENT, or USER_NOT_LOGGED_IN / INVALID_PARAMS.
+	// empty. Not us. A group in the buddy list with no conversation is opened first when its prpl
+	// allows (ChatMembers::joinOpensMembers); joining is then true while its members may still
+	// come. SENT, or USER_NOT_LOGGED_IN / INVALID_PARAMS.
 	static SendResult chatMembers(const char *serviceName, const char *username, const char *chat,
-			std::vector<ChatMembers::Member>& members, bool& inChat);
+			std::vector<ChatMembers::Member>& members, bool& inChat, bool& joining);
 	// webOS attachment send: transmit a local file (absolute path, must exist and be readable in the
 	// transport process) to usernameTo. Mirrors sendMessage's account resolution + channel detection:
 	// a group-channel target routes through serv_chat_send_file, a 1:1 IM through serv_send_file. All

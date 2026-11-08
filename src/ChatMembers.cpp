@@ -84,12 +84,42 @@ std::vector<Member> clean(const std::vector<Member>& members, const std::string&
 	return out;
 }
 
+bool joinOpensMembers(const std::string& protocolId, const std::string& chat)
+{
+	if (chat.empty())
+		return false;
+	if (protocolId == "prpl-telegram")
+		return true;
+	if (protocolId == "prpl-hehoe-whatsmeow") {
+		static const std::string newsletter = "@newsletter";
+		if (chat.size() >= newsletter.size()
+				&& chat.compare(chat.size() - newsletter.size(), newsletter.size(), newsletter) == 0)
+			return false;
+		return chat != "status@broadcast";
+	}
+	return false;
+}
+
+bool stillJoining(bool joinAsked, bool inChat, size_t memberCount)
+{
+	return joinAsked && (!inChat || memberCount == 0);
+}
+
 MojErr toPayload(const std::vector<Member>& members, bool inChat, MojObject& out)
+{
+	return toPayload(members, inChat, false, out);
+}
+
+MojErr toPayload(const std::vector<Member>& members, bool inChat, bool joining, MojObject& out)
 {
 	MojErr err = out.putBool(_T("returnValue"), true);
 	MojErrCheck(err);
 	err = out.putBool(_T("inChat"), inChat);
 	MojErrCheck(err);
+	if (joining) {
+		err = out.putBool(_T("joining"), true);
+		MojErrCheck(err);
+	}
 	MojObject list(MojObject::TypeArray);
 	for (size_t i = 0; i < members.size(); ++i) {
 		MojObject one;

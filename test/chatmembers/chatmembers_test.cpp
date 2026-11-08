@@ -175,3 +175,78 @@ TEST(ChatMembers, AnyMemberListedAgainIsFilledIn)
 	EXPECT_EQ("+46701234567", out[1].phone);
 	EXPECT_EQ("+31611111111", out[0].phone) << "another member's phone is left alone";
 }
+
+// Opening a chat that has no conversation yet (getChatMembers -> serv_join_chat): only where the
+// prpl's join_chat just opens it and puts its members on it.
+
+TEST(ChatMembers, TelegramGroupsAreOpenedForTheirMembers)
+{
+	EXPECT_TRUE(ChatMembers::joinOpensMembers("prpl-telegram", "chat-1001234567890"));
+}
+
+TEST(ChatMembers, WhatsAppGroupsAreOpenedForTheirMembers)
+{
+	EXPECT_TRUE(ChatMembers::joinOpensMembers("prpl-hehoe-whatsmeow", "120363012345678901@g.us"));
+}
+
+TEST(ChatMembers, AWhatsAppChannelIsNotOpened)
+{
+	// Its join fetches the Channel's posts.
+	EXPECT_FALSE(ChatMembers::joinOpensMembers("prpl-hehoe-whatsmeow", "120363098765432109@newsletter"));
+	EXPECT_FALSE(ChatMembers::joinOpensMembers("prpl-hehoe-whatsmeow", "@newsletter"));
+	EXPECT_FALSE(ChatMembers::joinOpensMembers("prpl-hehoe-whatsmeow", "status@broadcast"));
+	// Only the end says it is a Channel, as gowhatsapp_join_chat tests it (g_str_has_suffix).
+	EXPECT_TRUE(ChatMembers::joinOpensMembers("prpl-hehoe-whatsmeow", "newsletter@g.us"));
+	EXPECT_TRUE(ChatMembers::joinOpensMembers("prpl-hehoe-whatsmeow", "1@newsletter.g.us"));
+}
+
+TEST(ChatMembers, DiscordAndTheRestAreNotOpened)
+{
+	// purple-discord's join_chat fetches the channel's messages each time.
+	EXPECT_FALSE(ChatMembers::joinOpensMembers("prpl-discord", "1410895923755880"));
+	EXPECT_FALSE(ChatMembers::joinOpensMembers("prpl-eionrobb-discord", "1410895923755880"));
+	EXPECT_FALSE(ChatMembers::joinOpensMembers("prpl-irc", "#luneos"));
+	EXPECT_FALSE(ChatMembers::joinOpensMembers("prpl-gometa", "123"));
+	EXPECT_FALSE(ChatMembers::joinOpensMembers("", "chat-1"));
+	// A prefix of an allowed id is another prpl.
+	EXPECT_FALSE(ChatMembers::joinOpensMembers("prpl-telegram-x", "chat-1"));
+	EXPECT_FALSE(ChatMembers::joinOpensMembers("prpl-tele", "chat-1"));
+}
+
+TEST(ChatMembers, NoChatNoJoin)
+{
+	EXPECT_FALSE(ChatMembers::joinOpensMembers("prpl-telegram", ""));
+	EXPECT_FALSE(ChatMembers::joinOpensMembers("prpl-hehoe-whatsmeow", ""));
+}
+
+TEST(ChatMembers, StillJoiningOnlyAfterAJoinThatMayStillBringMembers)
+{
+	// Nothing was asked of the prpl: never joining, whatever was found.
+	EXPECT_FALSE(ChatMembers::stillJoining(false, false, 0));
+	EXPECT_FALSE(ChatMembers::stillJoining(false, true, 0));
+	EXPECT_FALSE(ChatMembers::stillJoining(false, true, 3));
+	// Asked: joining while there is no conversation, or no one on it yet.
+	EXPECT_TRUE(ChatMembers::stillJoining(true, false, 0));
+	EXPECT_TRUE(ChatMembers::stillJoining(true, true, 0));
+	// Asked and the members are there: done.
+	EXPECT_FALSE(ChatMembers::stillJoining(true, true, 2));
+}
+
+TEST(ChatMembers, ThePayloadSaysJoiningOnlyWhenJoining)
+{
+	std::vector<Member> none;
+	MojObject joining;
+	ASSERT_EQ(MojErrNone, ChatMembers::toPayload(none, false, true, joining));
+	EXPECT_EQ("{\"inChat\":false,\"joining\":true,\"members\":[],\"returnValue\":true}", json(joining));
+
+	std::vector<Member> one(1, member("+31611111111", "Anna"));
+	MojObject done;
+	ASSERT_EQ(MojErrNone, ChatMembers::toPayload(one, true, false, done));
+	EXPECT_EQ("{\"inChat\":true,\"members\":[{\"address\":\"+31611111111\",\"name\":\"Anna\"}],\"returnValue\":true}",
+			json(done));
+
+	// The old form is the same as not joining.
+	MojObject old;
+	ASSERT_EQ(MojErrNone, ChatMembers::toPayload(one, true, old));
+	EXPECT_EQ(json(done), json(old));
+}
