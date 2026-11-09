@@ -39,6 +39,7 @@
 #include "IMServiceApp.h"
 #include "DisplayController.h"
 #include "AuthChannel.h"
+#include "TypingChannel.h"
 
 class IMServiceHandler : public MojService::CategoryHandler, public IMServiceCallbackInterface, public IMServiceApp::Listener
 {
@@ -66,7 +67,7 @@ public:
 	// webOS: the sender edited a message they'd previously sent; update the stored bubble's text in place
 	// (found by serviceMessageId) instead of showing a separate "[EDIT]" message. See EditHandler.
 	virtual bool handleMessageEdit(const char* serviceName, const char* username, const char* serviceMessageId,
-			const char* newText);
+			const char* newText, bool bySender);
 	// webOS: the sender deleted a message they'd previously sent "for everyone"; replace the stored
 	// bubble's text with a placeholder in place (found by serviceMessageId). See DeleteHandler.
 	virtual bool handleMessageDelete(const char* serviceName, const char* username, const char* serviceMessageId);
@@ -215,6 +216,8 @@ private:
 	DisplayController* m_displayController;
 	// Interactive-login (Discord QR) challenge channel surfaced to the accounts UI.
 	AuthChannel* m_authChannel;
+	// Who is typing to us, for the app (watchTyping).
+	TypingChannel* m_typingChannel;
 
 	// count of active processes (signal handlers)
 	MojInt64 m_activeProcesses;
@@ -251,6 +254,16 @@ private:
 	// Takes the payload by reference: the method table calls every handler as
 	// (MojServiceMessage*, const MojObject&).
 	MojErr leaveChannel(MojServiceMessage* serviceMsg, const MojObject& payload);
+	// Typing and read state, from the Messaging app (see TypingChannel, LibpurpleAdapter):
+	//  sendTyping  {serviceName, username, usernameTo, state} - state: typing | paused | none
+	//  watchTyping {subscribe: true}                          - who is typing to us
+	//  markRead    {serviceName, username, usernameTo}        - the user read that chat
+	MojErr sendTyping(MojServiceMessage* serviceMsg, const MojObject& payload);
+	MojErr watchTyping(MojServiceMessage* serviceMsg, const MojObject& payload);
+	MojErr markRead(MojServiceMessage* serviceMsg, const MojObject& payload);
+	MojErr setChannelOptions(MojServiceMessage* serviceMsg, const MojObject& payload);
+	//  getChatMembers {serviceName, username, usernameTo}    - who is in that group chat
+	MojErr getChatMembers(MojServiceMessage* serviceMsg, const MojObject& payload);
 
 	// Kicks off the send process. Queries DB for outgoing messages and sends them.
 	MojErr IMSend(MojServiceMessage* msg, const MojObject payload);

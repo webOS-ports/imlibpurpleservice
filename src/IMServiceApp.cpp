@@ -27,6 +27,8 @@
 #include "luna/MojLunaService.h"
 #include "LibpurpleAdapter.h"
 #include "IMServiceHandler.h"
+#include "ActivityRearm.h"
+#include "ActivityDefinitions.h"
 
 IMServiceApp* IMServiceApp::s_instance = NULL;
 const char* const IMServiceApp::ServiceName = _T("com.palm.imlibpurple");
@@ -74,6 +76,12 @@ MojErr IMServiceApp::open()
 
 	err = m_service.addCategory(MojLunaService::DefaultCategory, handler.get());
 	MojErrCheck(err);
+
+	// Now that sendIM, sendCommand and loginStateChanged can be called, arm the DB-watch
+	// activities again: one left expired by an earlier run (a restart while it fired) would
+	// otherwise stay so until the next boot. A watch whose query already matches fires at once,
+	// which sends what was left pending. See ActivityRearm.h.
+	ActivityRearm::rearmAll(&m_service, ActivityDefinitions::DIR);
 
 	MojLogNotice(s_log, _T("%s started."), name().data());
 

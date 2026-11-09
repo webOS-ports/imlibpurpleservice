@@ -32,6 +32,8 @@
 #include <syslog.h>
 #include <string>
 #include "PalmImCommon.h"
+#include "SendExtras.h"
+#include "ChatMembers.h"
 #include "core/MojService.h"
 #include "db/MojDb.h"
 
@@ -41,6 +43,7 @@
 #define UI_ID                  "adapter"
 
 class AuthChannel;
+class TypingChannel;
 
 
 /*
@@ -108,8 +111,10 @@ public:
 	// webOS: the sender edited a message they'd previously sent; update the stored bubble's text in place
 	// (found by serviceMessageId) rather than showing a separate "[EDIT]" message. Driven by the
 	// "webos-im-edit" signal. newText is the new body (already HTML-escaped, like a normal incoming body).
+	// bySender false: driven by "webos-im-replace", the prpl's own rewrite of what it gave (a file's
+	// card as it downloads), which leaves the message not marked edited.
 	virtual bool handleMessageEdit(const char* serviceName, const char* username, const char* serviceMessageId,
-				const char* newText) = 0;
+				const char* newText, bool bySender) = 0;
 	// webOS: the sender deleted a message they'd previously sent "for everyone"; replace the stored
 	// bubble's text with a placeholder in place (found by serviceMessageId). Driven by the
 	// "webos-im-delete" signal.
@@ -166,6 +171,8 @@ public:
 	static void assignIMServiceHandler(IMServiceCallbackInterface* incomingIMHandler);
 	// Interactive-login (Discord QR) challenge channel. See AuthChannel.
 	static void assignAuthChannel(AuthChannel* authChannel);
+	// Who is typing to us, for the app's watchTyping. See TypingChannel.
+	static void assignTypingChannel(TypingChannel* typingChannel);
 	// Start a disposable, not-yet-persisted remote-auth login purely to obtain a QR /
 	// token (create-after-confirm). The QR is surfaced through the AuthChannel; on
 	// remote-auth success the obtained token is pushed as the confirmed credential.
@@ -199,6 +206,19 @@ public:
 	// webOS IRC: leave a channel (PART) and forget it, so it is not joined at the next sign-in, and
 	// drop its row from the Servers tab. channel is its key, "#chan@network". IRC only for now.
 	static bool leaveChannel(const char* serviceName, const char* username, const char* channel);
+	// webOS Servers tab: mute a server or channel, or choose whether its messages arrive while it is
+	// not open (ChannelOptions.h). channel (an id) picks a channel; without one, server (its name)
+	// picks a server. muted and background are each NULL to leave that setting as it is.
+	enum ChannelOptionsResult
+	{
+		CHANNEL_OPTIONS_OK,
+		CHANNEL_OPTIONS_INVALID,      // nothing to set, or nothing named to set it on
+		CHANNEL_OPTIONS_OFFLINE,      // no signed-in account of the service
+		CHANNEL_OPTIONS_UNSUPPORTED,  // the service has no such settings
+		CHANNEL_OPTIONS_NOT_FOUND     // no such server or channel on the account
+	};
+	static ChannelOptionsResult setChannelOptions(const char* serviceName, const char* username,
+		const char* server, const char* channel, const bool* muted, const bool* background);
 	static bool setMyAvailability(const char* serviceName, const char* username, int availability);
 	static bool setMyCustomMessage(const char* serviceName, const char* username, const char* customMessage);
 	static SendResult blockBuddy(const char* serviceName, const char* username, const char* buddyUsername, bool block);
@@ -206,7 +226,9 @@ public:
 	static SendResult addBuddy(const char* serviceName, const char* username, const char* buddyUsername, const char* groupname);
 	static SendResult authorizeBuddy(const char* serviceName, const char* username, const char* buddyUsername);
 	static SendResult declineBuddy(const char* serviceName, const char* username, const char* buddyUsername);
-	static SendResult sendMessage(const char *serviceName, const char *username, const char *usernameTo, const char *messageText, const char *quotedMessageId = NULL);
+	// extras: what the message carries besides its text (SendExtras.h), set on the conversation for
+	// the prpl's send and taken off again after it; NULL for none.
+	static SendResult sendMessage(const char *serviceName, const char *username, const char *usernameTo, const char *messageText, const char *quotedMessageId = NULL, const SendExtras::Extras* extras = NULL);
 	// webOS reactions (SEND): transmit a reaction the user placed from the device. emoji "" = remove.
 	// targetSender = the reacted-to message's original sender (from the app's db8 row). It is stashed on
 	// the account right before the send-reaction signal so a backend (whatsmeow) can build the reaction
@@ -217,6 +239,40 @@ public:
 	// targetSender, so whatsmeow can build+encrypt the vote without a live in-memory message-cache
 	// entry (survives a transport restart, or a poll older than the cache).
 	static SendResult sendPollVote(const char *serviceName, const char *username, const char *usernameTo, const char *pollMessageId, const char *optionNamesJoined, const char *senderJid = NULL);
+	// Typing (B1): tell usernameTo (a 1:1 chat) that we are typing, paused or not typing any more:
+	// state is "typing", "paused" or "none". libpurple sends nothing for a group chat.
+	static SendResult sendTyping(const char *serviceName, const char *username, const char *usernameTo, const char *state);
+	// Read receipts (B2): the user has read the chat with usernameTo (a buddy, or a channel's id or
+	// name). Raises the "unseen" update Pidgin raises when a chat is looked at, which is what the
+	// prpls send their read receipts on, with the chat in focus for a moment.
+	static SendResult markRead(const char *serviceName, const char *username, const char *usernameTo);
+	// Editing and deleting (for everyone) a message we sent (B3): chat is the conversation it is in,
+	// serviceMessageId the prpl's id for it (the outbox row's serviceMessageId); text is the new text,
+	// as sendMessage takes it. Emits "webos-im-send-edit" / "webos-im-send-delete"; SEND_FAILED when
+	// no prpl took it, as one that has no editing does not.
+	static SendResult sendEdit(const char *serviceName, const char *username, const char *chat, const char *serviceMessageId, const char *text);
+	static SendResult sendDelete(const char *serviceName, const char *username, const char *chat, const char *serviceMessageId);
+	// A file the prpl offered rather than fetched (tdlib-purple: a video, a music file, a document
+	// over 1 MB), asked for with a tap: chat is the conversation it is in, serviceMessageId the
+	// message's. Emits "webos-im-download-file"; the prpl rewrites the message as the file comes
+	// ("webos-im-replace"). SEND_FAILED when no prpl took it.
+	static SendResult downloadFile(const char *serviceName, const char *username, const char *chat, const char *serviceMessageId);
+	// Groups (B4): create one with a name and members, add members to or remove them from one,
+	// rename one, leave one. Members are "\x1f"-joined buddy names as the app has them. Emits
+	// "webos-im-group-create", "-invite", "-remove", "-rename" and "-leave"; SEND_FAILED when no prpl took it. A new group appears as messages into it do.
+	static SendResult createGroup(const char *serviceName, const char *username, const char *name, const char *membersJoined);
+	static SendResult inviteToGroup(const char *serviceName, const char *username, const char *chat, const char *membersJoined);
+	static SendResult removeFromGroup(const char *serviceName, const char *username, const char *chat, const char *membersJoined);
+	static SendResult renameGroup(const char *serviceName, const char *username, const char *chat, const char *name);
+	static SendResult leaveGroup(const char *serviceName, const char *username, const char *chat);
+	// Group Info: who is in the group chat `chat` (as the app names it), from the people the prpl
+	// put on its conversation, each by the address and name an incoming message from them gets.
+	// inChat is false when there is no such chat conversation open in libpurple; the list is then
+	// empty. Not us. A group in the buddy list with no conversation is opened first when its prpl
+	// allows (ChatMembers::joinOpensMembers); joining is then true while its members may still
+	// come. SENT, or USER_NOT_LOGGED_IN / INVALID_PARAMS.
+	static SendResult chatMembers(const char *serviceName, const char *username, const char *chat,
+			std::vector<ChatMembers::Member>& members, bool& inChat, bool& joining);
 	// webOS attachment send: transmit a local file (absolute path, must exist and be readable in the
 	// transport process) to usernameTo. Mirrors sendMessage's account resolution + channel detection:
 	// a group-channel target routes through serv_chat_send_file, a 1:1 IM through serv_send_file. All

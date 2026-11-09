@@ -52,6 +52,9 @@ MojErr OutgoingIMCommandHandler::sendMessage(MojObject imMsg)
 		MojString error;
 		MojErrToString(err, error);
 		MojLogError(IMServiceApp::s_log, _T("doSend FAILED. error %d - %s"), err, error.data());
+		// As OutgoingIMHandler::sendMessage: go on with the next command, and complete the
+		// activity after the last, or the pending-command watch is never re-armed.
+		messageFinished();
 	}
 	return MojErrNone;
 }

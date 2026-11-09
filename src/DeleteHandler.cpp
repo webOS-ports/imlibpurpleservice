@@ -2,13 +2,10 @@
  * DeleteHandler.cpp  - see DeleteHandler.h
  */
 #include "DeleteHandler.h"
+#include "MessageChanges.h"
 #include "IMMessage.h"          // PALM_DB_IMMESSAGE_KIND, MOJDB_* field names
 #include "db/MojDbQuery.h"
 #include "IMServiceApp.h"
-
-// Shown in place of the original body/attachment once a message is deleted "for everyone" -
-// mirrors what WhatsApp's own clients show for a revoked message.
-static const char* const kDeletedPlaceholder = "This message was deleted.";
 
 DeleteHandler::DeleteHandler(MojService* service, IMServiceApp::Listener* listener)
 : m_findSlot(this, &DeleteHandler::findResult),
@@ -80,11 +77,7 @@ MojErr DeleteHandler::findResult(MojObject& result, MojErr err)
 	}
 
 	MojObject mergeProps;
-	err = mergeProps.putString(MOJDB_MSG_TEXT, kDeletedPlaceholder); MojErrCheck(err);
-	// Clear any attachment reference too, so a deleted image/video/document doesn't keep rendering
-	// next to the placeholder text.
-	err = mergeProps.putString(MOJDB_FILE_PATH, _T(""));             MojErrCheck(err);
-	err = mergeProps.putString(MOJDB_ID, dbId);                      MojErrCheck(err);
+	err = MessageChanges::deleted(dbId, mergeProps); MojErrCheck(err);
 	err = m_dbClient.merge(m_mergeSlot, mergeProps);
 	MojErrCheck(err);
 	return MojErrNone;

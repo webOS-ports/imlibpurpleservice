@@ -2,6 +2,7 @@
  * EditHandler.cpp  - see EditHandler.h
  */
 #include "EditHandler.h"
+#include "MessageChanges.h"
 #include "IMMessage.h"          // PALM_DB_IMMESSAGE_KIND, MOJDB_* field names
 #include "db/MojDbQuery.h"
 #include "IMServiceApp.h"
@@ -9,6 +10,7 @@
 EditHandler::EditHandler(MojService* service, IMServiceApp::Listener* listener)
 : m_findSlot(this, &EditHandler::findResult),
   m_mergeSlot(this, &EditHandler::mergeResult),
+  m_bySender(true),
   m_service(service),
   m_listener(listener),
   m_dbClient(service)
@@ -20,7 +22,7 @@ EditHandler::~EditHandler()
 }
 
 MojErr EditHandler::handleEdit(const char* serviceName, const char* username,
-		const char* serviceMessageId, const char* newText)
+		const char* serviceMessageId, const char* newText, bool bySender)
 {
 	MojErr err;
 	if (serviceName == NULL || username == NULL || serviceMessageId == NULL || *serviceMessageId == '\0') {
@@ -31,9 +33,10 @@ MojErr EditHandler::handleEdit(const char* serviceName, const char* username,
 	err = m_username.assign(username);                    MojErrCheck(err);
 	err = m_serviceMessageId.assign(serviceMessageId);    MojErrCheck(err);
 	err = m_newText.assign(newText ? newText : "");       MojErrCheck(err);
+	m_bySender = bySender;
 
-	MojLogInfo(IMServiceApp::s_log, _T("EditHandler: applying edit to %s message serviceMessageId %s"),
-			m_serviceName.data(), m_serviceMessageId.data());
+	MojLogInfo(IMServiceApp::s_log, _T("EditHandler: applying %s to %s message serviceMessageId %s"),
+			m_bySender ? "edit" : "rewrite", m_serviceName.data(), m_serviceMessageId.data());
 
 	// Find the exact message by (serviceName, username, serviceMessageId) - the same 3-prop index
 	// ReceiptHandler uses for by-id lookups. There is at most one match (limit is a safety cap).
@@ -75,9 +78,14 @@ MojErr EditHandler::findResult(MojObject& result, MojErr err)
 		return MojErrNone;
 	}
 
+	if (!MessageChanges::editApplies(row)) {
+		MojLogInfo(IMServiceApp::s_log, _T("EditHandler::findResult: serviceMessageId %s was deleted; edit not applied"),
+				m_serviceMessageId.data());
+		return MojErrNone;
+	}
+
 	MojObject mergeProps;
-	err = mergeProps.putString(MOJDB_MSG_TEXT, m_newText); MojErrCheck(err);
-	err = mergeProps.putString(MOJDB_ID, dbId);           MojErrCheck(err);
+	err = MessageChanges::textChanged(dbId, m_newText, m_bySender, mergeProps); MojErrCheck(err);
 	err = m_dbClient.merge(m_mergeSlot, mergeProps);
 	MojErrCheck(err);
 	return MojErrNone;

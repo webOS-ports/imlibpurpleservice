@@ -64,6 +64,11 @@ const IMServiceHandler::Method IMServiceHandler::s_methods[] = {
 	{_T("submitAuthInput"), (Callback) &IMServiceHandler::submitAuthInput},
 	{_T("openChannel"), (Callback) &IMServiceHandler::openChannel},
 	{_T("leaveChannel"), (Callback) &IMServiceHandler::leaveChannel},
+	{_T("sendTyping"), (Callback) &IMServiceHandler::sendTyping},
+	{_T("watchTyping"), (Callback) &IMServiceHandler::watchTyping},
+	{_T("markRead"), (Callback) &IMServiceHandler::markRead},
+	{_T("setChannelOptions"), (Callback) &IMServiceHandler::setChannelOptions},
+	{_T("getChatMembers"), (Callback) &IMServiceHandler::getChatMembers},
 	{NULL, NULL} };
 
 IMServiceHandler::IMServiceHandler(MojService* service)
@@ -102,6 +107,7 @@ IMServiceHandler::IMServiceHandler(MojService* service)
 	m_shutdownCallbackId = 0;
 	m_displayController = NULL;
 	m_authChannel = NULL;
+	m_typingChannel = NULL;
 	m_syncInFlight = false;
 }
 
@@ -111,6 +117,8 @@ IMServiceHandler::~IMServiceHandler()
 	delete m_loginState;
 	delete m_displayController;
 	delete m_authChannel;
+	LibpurpleAdapter::assignTypingChannel(NULL);
+	delete m_typingChannel;
 }
 
 
@@ -136,6 +144,10 @@ MojErr IMServiceHandler::init()
 	// create the interactive-login (QR) challenge channel and hand it to the adapter
 	m_authChannel = new AuthChannel(m_service);
 	LibpurpleAdapter::assignAuthChannel(m_authChannel);
+
+	// who is typing to us, for the Messaging app's watchTyping
+	m_typingChannel = new TypingChannel(m_service);
+	LibpurpleAdapter::assignTypingChannel(m_typingChannel);
 
 	// consume a one-shot purge sentinel, if present (shell-driven service reset without luna-send)
 	checkPurgeSentinel();
@@ -838,6 +850,10 @@ MojErr IMServiceHandler::syncFindServersResult(MojObject& payload, MojErr err)
 		bool f = false;
 		sIt->get(_T("remoteId"), remoteId, f);
 		sIt->get(_T("name"), name, f);
+		// Servers tab options (ChannelOptions.h), on protocols that have them
+		bool muted = false, background = false;
+		const bool hasMuted = sIt->get(_T("muted"), muted);
+		const bool hasBackground = sIt->get(_T("background"), background);
 		if (remoteId.empty())
 			continue;
 		incoming.insert(std::string(remoteId.data()));
@@ -851,6 +867,10 @@ MojErr IMServiceHandler::syncFindServersResult(MojObject& payload, MojErr err)
 			MojErrCheck(m.put(_T("_id"), e->second));
 			MojErrCheck(m.putString(_T("displayName"), name));
 			MojErrCheck(m.putString(_T("name"), name));
+			if (hasMuted)
+				MojErrCheck(m.putBool(_T("muted"), muted));
+			if (hasBackground)
+				MojErrCheck(m.putBool(_T("background"), background));
 			MojErrCheck(mergeServers.push(m));
 			m_syncServerIdByRemote[std::string(remoteId.data())] = e->second; // _id known now
 		}
@@ -863,6 +883,10 @@ MojErr IMServiceHandler::syncFindServersResult(MojObject& payload, MojErr err)
 			MojErrCheck(s.putString(_T("remoteId"), remoteId));
 			MojErrCheck(s.putString(_T("displayName"), name));
 			MojErrCheck(s.putString(_T("name"), name));
+			if (hasMuted)
+				MojErrCheck(s.putBool(_T("muted"), muted));
+			if (hasBackground)
+				MojErrCheck(s.putBool(_T("background"), background));
 			MojErrCheck(putServers.push(s));
 			m_syncNewServerRemotes.push_back(std::string(remoteId.data()));
 		}
@@ -983,6 +1007,9 @@ MojErr IMServiceHandler::syncFindChannelsResult(MojObject& payload, MojErr err)
 			cIt->get(_T("parentId"), parentId, hasParent);
 			MojInt64 position = 0;
 			cIt->get(_T("position"), position);
+			bool muted = false, background = false;
+			const bool hasMuted = cIt->get(_T("muted"), muted);
+			const bool hasBackground = cIt->get(_T("background"), background);
 			if (remoteId.empty())
 				continue;
 			incoming.insert(std::string(remoteId.data()));
@@ -1001,6 +1028,10 @@ MojErr IMServiceHandler::syncFindChannelsResult(MojObject& payload, MojErr err)
 				if (hasParent)
 					MojErrCheck(m.putString(_T("parentId"), parentId));
 				MojErrCheck(m.putInt(_T("position"), position));
+				if (hasMuted)
+					MojErrCheck(m.putBool(_T("muted"), muted));
+				if (hasBackground)
+					MojErrCheck(m.putBool(_T("background"), background));
 				MojErrCheck(mergeChannels.push(m));
 			}
 			else
@@ -1016,6 +1047,10 @@ MojErr IMServiceHandler::syncFindChannelsResult(MojObject& payload, MojErr err)
 				if (hasParent)
 					MojErrCheck(channel.putString(_T("parentId"), parentId));
 				MojErrCheck(channel.putInt(_T("position"), position));
+				if (hasMuted)
+					MojErrCheck(channel.putBool(_T("muted"), muted));
+				if (hasBackground)
+					MojErrCheck(channel.putBool(_T("background"), background));
 				MojErrCheck(putChannels.push(channel));
 			}
 		}
@@ -1141,6 +1176,161 @@ MojErr IMServiceHandler::leaveChannel(MojServiceMessage* serviceMsg, const MojOb
 
 	serviceMsg->replySuccess();
 	return MojErrNone;
+}
+
+// The (serviceName, username, usernameTo) every chat call takes; false, with an error sent, when
+// one is missing.
+static bool chatTarget(MojServiceMessage* serviceMsg, const MojObject& payload, const char* method,
+		MojString& serviceName, MojString& username, MojString& usernameTo)
+{
+	bool found = false;
+	payload.get(_T("serviceName"), serviceName, found);
+	payload.get(_T("username"), username, found);
+	payload.get(_T("usernameTo"), usernameTo, found);
+	if (serviceName.empty() || username.empty() || usernameTo.empty())
+	{
+		MojLogError(IMServiceApp::s_log, _T("%s: serviceName, username and usernameTo are required"), method);
+		serviceMsg->replyError(MojErrInvalidArg);
+		return false;
+	}
+	return true;
+}
+
+// A SendResult as the reply: success, or why not.
+static MojErr replySendResult(MojServiceMessage* serviceMsg, LibpurpleAdapter::SendResult result)
+{
+	switch (result)
+	{
+	case LibpurpleAdapter::SENT:
+		return serviceMsg->replySuccess();
+	case LibpurpleAdapter::USER_NOT_LOGGED_IN:
+		return serviceMsg->replyError(MojErrNotFound, _T("the account is not signed in"));
+	case LibpurpleAdapter::INVALID_PARAMS:
+		return serviceMsg->replyError(MojErrInvalidArg);
+	default:
+		return serviceMsg->replyError(MojErrNotFound, _T("no conversation to act on"));
+	}
+}
+
+/*
+ * Typing (B1): the Messaging app's composer, while the user types to a buddy.
+ *   { "serviceName": "type_telegram", "username": "<ours>", "usernameTo": "<buddy>",
+ *     "state": "typing" | "paused" | "none" }
+ */
+MojErr IMServiceHandler::sendTyping(MojServiceMessage* serviceMsg, const MojObject& payload)
+{
+	MojString serviceName, username, usernameTo, state;
+	if (!chatTarget(serviceMsg, payload, "sendTyping", serviceName, username, usernameTo))
+		return MojErrNone;
+	bool found = false;
+	payload.get(_T("state"), state, found);
+	return replySendResult(serviceMsg, LibpurpleAdapter::sendTyping(serviceName.data(), username.data(),
+			usernameTo.data(), state.empty() ? "none" : state.data()));
+}
+
+/*
+ * Typing (B1): who is typing to us. A subscription: the typers there are now first,
+ * { "typing": [ {serviceName, username, from, state}, ... ] }, then one event per change,
+ * { serviceName, username, from, state }.
+ */
+MojErr IMServiceHandler::watchTyping(MojServiceMessage* serviceMsg, const MojObject& payload)
+{
+	(void)payload;
+	if (m_typingChannel == NULL)
+		return serviceMsg->replyError(MojErrNotInitialized);
+	return m_typingChannel->subscribe(serviceMsg);
+}
+
+/*
+ * Read receipts (B2): the user has read the chat; the prpl sends its read receipts.
+ *   { "serviceName": "type_whatsapp", "username": "<ours>", "usernameTo": "<buddy or chat>" }
+ */
+MojErr IMServiceHandler::markRead(MojServiceMessage* serviceMsg, const MojObject& payload)
+{
+	MojString serviceName, username, usernameTo;
+	if (!chatTarget(serviceMsg, payload, "markRead", serviceName, username, usernameTo))
+		return MojErrNone;
+	return replySendResult(serviceMsg, LibpurpleAdapter::markRead(serviceName.data(), username.data(),
+			usernameTo.data()));
+}
+
+/*
+ * webOS Servers tab: setChannelOptions - mute or unmute a server or a channel, and choose whether its
+ * messages arrive while it is not open. Discord only for now (ChannelOptions.h).
+ *   { "serviceName": "type_discord", "username": "<optional>",
+ *     "channel": "<channel id>" | "server": "<server name>",
+ *     "muted": true|false (optional), "background": true|false (optional) }
+ * The answer comes before the prpl has done it; the imserver/imchannel rows change once it has.
+ */
+MojErr IMServiceHandler::setChannelOptions(MojServiceMessage* serviceMsg, const MojObject& payload)
+{
+	MojLogTrace(IMServiceApp::s_log);
+
+	MojString serviceName, username, server, channel;
+	bool found = false;
+	payload.get(_T("serviceName"), serviceName, found);
+	payload.get(_T("username"), username, found);   // optional
+	payload.get(_T("server"), server, found);
+	payload.get(_T("channel"), channel, found);
+	bool muted = false, background = false;
+	const bool haveMuted = payload.get(_T("muted"), muted);
+	const bool haveBackground = payload.get(_T("background"), background);
+
+	if (serviceName.empty() || (server.empty() && channel.empty()) || (!haveMuted && !haveBackground))
+	{
+		MojLogError(IMServiceApp::s_log, _T("setChannelOptions: serviceName, server or channel, and muted or background are required"));
+		serviceMsg->replyError(MojErrInvalidArg);
+		return MojErrNone;
+	}
+
+	switch (LibpurpleAdapter::setChannelOptions(serviceName.data(), username.empty() ? NULL : username.data(),
+		server.empty() ? NULL : server.data(), channel.empty() ? NULL : channel.data(),
+		haveMuted ? &muted : NULL, haveBackground ? &background : NULL))
+	{
+	case LibpurpleAdapter::CHANNEL_OPTIONS_OK:
+		serviceMsg->replySuccess();
+		break;
+	case LibpurpleAdapter::CHANNEL_OPTIONS_OFFLINE:
+		serviceMsg->replyError(MojErrNotOpen, _T("no signed-in account of this service"));
+		break;
+	case LibpurpleAdapter::CHANNEL_OPTIONS_UNSUPPORTED:
+		serviceMsg->replyError(MojErrNotImpl, _T("this service has no such settings"));
+		break;
+	case LibpurpleAdapter::CHANNEL_OPTIONS_NOT_FOUND:
+		serviceMsg->replyError(MojErrNotFound, _T("no such server or channel on the account"));
+		break;
+	case LibpurpleAdapter::CHANNEL_OPTIONS_INVALID:
+	default:
+		serviceMsg->replyError(MojErrInvalidArg);
+		break;
+	}
+	return MojErrNone;
+}
+
+/*
+ * Group Info: who is in a group chat, as far as the prpl has told libpurple.
+ *   { "serviceName": "type_whatsapp", "username": "<ours>", "usernameTo": "<the chat>" }
+ * Reply (ChatMembers.h): { "returnValue": true, "inChat": bool, ["joining": true,]
+ * "members": [ {address, name} ] }. An empty list means the prpl has put no one on the chat (or it
+ * is not open): the app then names who has written in it. "joining": the chat was not open and the
+ * prpl was asked to open it in this request; its members may come, so ask again shortly.
+ */
+MojErr IMServiceHandler::getChatMembers(MojServiceMessage* serviceMsg, const MojObject& payload)
+{
+	MojString serviceName, username, usernameTo;
+	if (!chatTarget(serviceMsg, payload, "getChatMembers", serviceName, username, usernameTo))
+		return MojErrNone;
+	std::vector<ChatMembers::Member> members;
+	bool inChat = false;
+	bool joining = false;
+	LibpurpleAdapter::SendResult const result = LibpurpleAdapter::chatMembers(serviceName.data(),
+			username.data(), usernameTo.data(), members, inChat, joining);
+	if (result != LibpurpleAdapter::SENT)
+		return replySendResult(serviceMsg, result);
+	MojObject reply;
+	MojErr err = ChatMembers::toPayload(members, inChat, joining, reply);
+	MojErrCheck(err);
+	return serviceMsg->reply(reply);
 }
 
 /*
@@ -1473,13 +1663,13 @@ bool IMServiceHandler::handleOutboxId(const char* serviceName, const char* usern
  * so the conversation updates the ORIGINAL bubble in place instead of showing a separate "[EDIT]" message.
  */
 bool IMServiceHandler::handleMessageEdit(const char* serviceName, const char* username,
-		const char* serviceMessageId, const char* newText)
+		const char* serviceMessageId, const char* newText, bool bySender)
 {
 	MojLogInfo(IMServiceApp::s_log, _T("handleMessageEdit: service %s id %s"),
 			serviceName ? serviceName : "", serviceMessageId ? serviceMessageId : "");
 
 	MojRefCountedPtr<EditHandler> editHandler(new EditHandler(m_service, this));
-	MojErr err = editHandler->handleEdit(serviceName, username, serviceMessageId, newText);
+	MojErr err = editHandler->handleEdit(serviceName, username, serviceMessageId, newText, bySender);
 	if (err) {
 		MojString error;
 		MojErrToString(err, error);

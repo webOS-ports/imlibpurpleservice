@@ -126,16 +126,23 @@ MojErr  OutgoingIMHandler::activityAdoptResult(MojObject& result, MojErr resultE
 			MojErrToString(err, error);
 			MojLogError(IMServiceApp::s_log, _T("createOutgoingMessageQuery failed: error %d - %s"), err, error.data());
 		}
-
-		// call find
-		//virtual MojErr find(Signal::SlotRef handler, const MojDbQuery& query,
-		//					bool watch = false, bool returnCount = false) = 0;
-		err = m_dbClient.find(this->m_findMessageSlot, query, /* watch */ false );
-		if (err) {
-			MojString error;
-			MojErrToString(err, error);
-			MojLogError(IMServiceApp::s_log, _T("dbClient.find() failed: error %d - %s"), err, error.data());
+		else {
+			// call find
+			//virtual MojErr find(Signal::SlotRef handler, const MojDbQuery& query,
+			//					bool watch = false, bool returnCount = false) = 0;
+			err = m_dbClient.find(this->m_findMessageSlot, query, /* watch */ false );
+			if (err) {
+				MojString error;
+				MojErrToString(err, error);
+				MojLogError(IMServiceApp::s_log, _T("dbClient.find() failed: error %d - %s"), err, error.data());
+			}
 		}
+
+		// Nothing will be sent, so nothing would complete the activity: it would stay adopted and
+		// its watch unarmed until this transport exits. Complete it now; the restarted watch fires
+		// again while anything is still pending.
+		if (err)
+			messageFinished();
 	}
 
 	return MojErrNone;
@@ -160,6 +167,8 @@ MojErr OutgoingIMHandler::findMessageResult(MojObject& result, MojErr findErr)
 		MojString error;
 		MojErrToString(findErr, error);
 		MojLogError(IMServiceApp::s_log, _T("find outgoing messages failed: error %d - %s"), findErr, error.data());
+		// Complete the activity anyway (see activityAdoptResult), or its watch is never re-armed.
+		messageFinished();
 
 	} else {
 
@@ -302,8 +311,10 @@ MojErr OutgoingIMHandler::completeActivityManagerActivity() {
 	// Get a request object from the service
 	MojRefCountedPtr<MojServiceRequest> req;
 	MojErr err = m_service->createRequest(req);
-	if (err)
+	if (err) {
 		MojLogError(IMServiceApp::s_log, _T("completeActivityManagerActivity: createRequest failed"));
+		return err;
+	}
 
 	// create the service call
 	MojObject params;

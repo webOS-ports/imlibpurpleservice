@@ -68,7 +68,10 @@
 #include "LibpurpleAdapter.h"
 #include "PalmImCommon.h"
 #include "AuthChannel.h"
+#include "TypingChannel.h"
+#include "WebosSendSignals.h"
 #include "IrcSupport.h"
+#include "ChannelOptions.h"
 
 //#include <cjson/json.h>
 //#include <lunaservice.h>
@@ -97,6 +100,8 @@ static IMServiceCallbackInterface* s_imServiceHandler = NULL;
 // login is a disposable QR-preview (create-after-confirm). Preview logins route
 // their connect callbacks to the AuthChannel, NOT to the webOS login-state machine.
 static AuthChannel* s_authChannel = NULL;
+// Who is typing to us, for the app's watchTyping (see TypingChannel). Set by IMServiceHandler.
+static TypingChannel* s_typingChannel = NULL;
 static std::set<std::string> s_qrPreviewKeys;
 
 // Pending Discord remote-auth captcha requests. The prpl raised purple_request_fields
@@ -248,6 +253,9 @@ static void im_reaction_cb(PurpleAccount* account, const char* targetServiceMess
 static void im_outbox_id_cb(PurpleAccount* account, const char* serviceMessageId, const char* text, void* data);
 // webOS: handler for "webos-im-edit" - the sender edited a message; update its stored bubble text in place.
 static void im_edit_cb(PurpleAccount* account, const char* serviceMessageId, const char* newText, void* data);
+// webOS: handler for "webos-im-replace" - the prpl rewrote what it gave for a message (a file's card
+// as it downloads); update the stored text in place, without marking it edited.
+static void im_replace_cb(PurpleAccount* account, const char* serviceMessageId, const char* newText, void* data);
 // webOS: handler for "webos-im-delete" - the sender deleted a message "for everyone"; replace its
 // stored bubble text with a placeholder in place.
 static void im_delete_cb(PurpleAccount* account, const char* serviceMessageId, void* data);
@@ -365,10 +373,32 @@ static PurpleEventLoopUiOps adapterEventLoopUIOps =
 	g_timeout_add, g_source_remove, adapterIOAdd, g_source_remove, NULL, g_timeout_add_seconds, NULL, NULL, NULL
 };
 
+// Read receipts (B2): how long a chat counts as in front of the user after the app marked it
+// read. tdlib-purple looks 500 ms after the update it is sent; the rest is slack.
+static const gint64 READ_FOCUS_SECONDS = 3;
+
+static gint64 monotonicSeconds()
+{
+	return g_get_monotonic_time() / G_USEC_PER_SEC;
+}
+
+// has_focus ui-op: whether the user is reading the conversation, which a prpl asks before it sends
+// read receipts (tdlib-purple; purple_conversation_has_focus for the rest). True only for a while
+// after the app marked it read (LibpurpleAdapter::markRead). Without the op tdlib-purple took
+// every conversation for focused, and sent a read receipt for each message as it arrived.
+static gboolean conversation_has_focus(PurpleConversation* conv)
+{
+	if (conv == NULL)
+		return FALSE;
+	// Seconds since boot, as an int: it fits a pointer on 32-bit armv7 too.
+	gint64 const until = GPOINTER_TO_INT(purple_conversation_get_data(conv, "webos-read-until"));
+	return (until > 0 && monotonicSeconds() <= until) ? TRUE : FALSE;
+}
+
 static PurpleConversationUiOps adapterConversationUIOps  =
 {
-	NULL, NULL, NULL, NULL, incoming_message_cb, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-	NULL, NULL
+	NULL, NULL, NULL, NULL, incoming_message_cb, NULL, NULL, NULL, NULL, NULL, conversation_has_focus, NULL, NULL, NULL,
+	NULL, NULL, NULL, NULL, NULL
 };
 
 /* webOS: Discord's remote-auth (QR) login raises the QR through purple_request_fields
@@ -1776,6 +1806,14 @@ static void account_signed_off_cb(PurpleConnection* gc, gpointer loginState)
 
 	MojLogInfo(IMServiceApp::s_log, _T("Account disconnected..."));
 
+	// Nobody is typing on an account that is not signed in.
+	if (s_typingChannel != NULL)
+	{
+		std::string const typingService = getServiceNameFromPurpleAccount(account);
+		s_typingChannel->clearAccount(typingService.c_str(),
+				getWebosUsername(account->username, typingService, account).c_str());
+	}
+
 	if (s_offlineAccountData.count(accountKey))
 	{
 		/*
@@ -2117,6 +2155,12 @@ static std::string deriveServerName(PurpleAccount* account, const char* groupNam
 		return htmlUnescape(g.substr(0, sep));
 	}
 	return htmlUnescape(g);
+}
+
+// deriveServerName as a ChannelOptions::ServerOf.
+static std::string serverOfGroup(PurpleAccount* account, const char* groupName)
+{
+	return deriveServerName(account, groupName, NULL);
 }
 
 /*
@@ -2662,7 +2706,23 @@ static void im_edit_cb(PurpleAccount* account, const char* serviceMessageId, con
 	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
 	std::string ownerWebos = getWebosUsername(account->username, serviceName, account);
 	s_imServiceHandler->handleMessageEdit(serviceName.c_str(), ownerWebos.c_str(), serviceMessageId,
-			newText ? newText : "");
+			newText ? newText : "", true);
+}
+
+/*
+ * webOS: a prpl rewrote the text it gave for a message itself (tdlib-purple: a file's card, as the
+ * file the user tapped downloads). Stored in place as an edit is, but not marked edited: the app
+ * says "Edited" for the sender's edits only.
+ */
+static void im_replace_cb(PurpleAccount* account, const char* serviceMessageId, const char* newText, void* data)
+{
+	(void)data;
+	if (account == NULL || serviceMessageId == NULL || *serviceMessageId == '\0' || s_imServiceHandler == NULL)
+		return;
+	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
+	std::string ownerWebos = getWebosUsername(account->username, serviceName, account);
+	s_imServiceHandler->handleMessageEdit(serviceName.c_str(), ownerWebos.c_str(), serviceMessageId,
+			newText ? newText : "", false);
 }
 
 /*
@@ -4485,8 +4545,19 @@ bool LibpurpleAdapter::enumerateServersChannels(const char* serviceName, const c
 			if (chanId == NULL || *chanId == '\0')
 				continue;   // no stable key -> skip
 
-			// churn-guard signature: server + channel key (the set makes it order-independent).
-			sigSet.insert(guildName + std::string("\x1f") + chanId);
+			// webOS Servers tab: mute and background delivery, where the prpl offers them.
+			const bool hasOptions = ChannelOptions::supports(account);
+			const ChannelOptions::Flags flags = hasOptions ? ChannelOptions::flagsOf(chat) : ChannelOptions::Flags();
+
+			// churn-guard signature: server + channel key (the set makes it order-independent), and
+			// the options, so changing one syncs.
+			std::string sigEntry = guildName + std::string("\x1f") + chanId;
+			if (hasOptions)
+			{
+				sigEntry += std::string("\x1f") + (flags.muted ? "m" : "-") + (flags.background ? "b" : "-")
+					+ (flags.serverMuted ? "M" : "-") + (flags.serverBackground ? "B" : "-");
+			}
+			sigSet.insert(sigEntry);
 
 			if (serverByGuild.find(guildName) == serverByGuild.end())
 			{
@@ -4509,6 +4580,13 @@ bool LibpurpleAdapter::enumerateServersChannels(const char* serviceName, const c
 			channel.putInt(_T("position"), position++);
 
 			MojObject& server = serverByGuild[guildName];
+			if (hasOptions)
+			{
+				channel.putBool(_T("muted"), flags.muted);
+				channel.putBool(_T("background"), flags.background);
+				server.putBool(_T("muted"), flags.serverMuted);
+				server.putBool(_T("background"), flags.serverBackground);
+			}
 			MojObject channels;
 			server.get(_T("channels"), channels);
 			channels.push(channel);
@@ -4608,29 +4686,13 @@ bool LibpurpleAdapter::enumerateServersChannels(const char* serviceName, const c
 }
 
 /*
- * webOS Servers/Rooms M3: join a channel on demand (called when the user opens it in the Servers tab)
- * so the prpl fetches + delivers its history. username may be NULL - the account is then resolved by
- * serviceName (first online account of that service). Joining also lands the channel in the buddy
- * list, so a subsequent send finds it instead of falling back to a 1:1 IM ("<snowflake> is offline").
+ * The signed-in account a Servers-tab call is for: the one named by username, else the first online
+ * account of the service. username may be NULL.
  */
-bool LibpurpleAdapter::openChannel(const char* serviceName, const char* username, const char* channel)
+static PurpleAccount* findRoomAccount(const char* serviceName, const char* username)
 {
-	if (!serviceName || !channel || !*channel)
-		return false;
-
 	PurpleAccount* account = NULL;
-	// webOS IRC: the channel key names its network, and so the account to join it from.
-	std::string ircChannel, ircNetwork;
-	if (strcmp(serviceName, Irc::SERVICE_NAME) == 0 && Irc::splitChannelKey(channel, &ircChannel, &ircNetwork))
-	{
-		account = Irc::accountForNetwork(ircNetwork);
-		if (account == NULL || !purple_account_is_connected(account))
-		{
-			MojLogInfo(IMServiceApp::s_log, _T("openChannel: no account signed in to %s"), ircNetwork.c_str());
-			return false;
-		}
-	}
-	if (account == NULL && username && *username)
+	if (username && *username)
 	{
 		std::string accountKey = getAccountKey(username, serviceName);
 		if (s_onlineAccountData.count(accountKey))
@@ -4668,6 +4730,34 @@ bool LibpurpleAdapter::openChannel(const char* serviceName, const char* username
 			}
 		}
 	}
+	return account;
+}
+
+/*
+ * webOS Servers/Rooms M3: join a channel on demand (called when the user opens it in the Servers tab)
+ * so the prpl fetches + delivers its history. username may be NULL - the account is then resolved by
+ * serviceName (first online account of that service). Joining also lands the channel in the buddy
+ * list, so a subsequent send finds it instead of falling back to a 1:1 IM ("<snowflake> is offline").
+ */
+bool LibpurpleAdapter::openChannel(const char* serviceName, const char* username, const char* channel)
+{
+	if (!serviceName || !channel || !*channel)
+		return false;
+
+	PurpleAccount* account = NULL;
+	// webOS IRC: the channel key names its network, and so the account to join it from.
+	std::string ircChannel, ircNetwork;
+	if (strcmp(serviceName, Irc::SERVICE_NAME) == 0 && Irc::splitChannelKey(channel, &ircChannel, &ircNetwork))
+	{
+		account = Irc::accountForNetwork(ircNetwork);
+		if (account == NULL || !purple_account_is_connected(account))
+		{
+			MojLogInfo(IMServiceApp::s_log, _T("openChannel: no account signed in to %s"), ircNetwork.c_str());
+			return false;
+		}
+	}
+	if (account == NULL)
+		account = findRoomAccount(serviceName, username);
 	if (account == NULL)
 	{
 		MojLogInfo(IMServiceApp::s_log, _T("openChannel: no online account for %s"), serviceName);
@@ -4676,6 +4766,58 @@ bool LibpurpleAdapter::openChannel(const char* serviceName, const char* username
 
 	MojLogInfo(IMServiceApp::s_log, _T("openChannel: joining %s on %s"), channel, serviceName);
 	return joinChannelChat(account, channel) != NULL;
+}
+
+/*
+ * webOS Servers tab: mute a server or channel, or choose whether its messages arrive while it is not
+ * open (see ChannelOptions.h). channel, the channel's id, picks a channel; with no channel, server picks
+ * a server by its name as the Servers tab shows it. muted and background are each NULL to leave it.
+ */
+LibpurpleAdapter::ChannelOptionsResult LibpurpleAdapter::setChannelOptions(const char* serviceName,
+		const char* username, const char* server, const char* channel, const bool* muted, const bool* background)
+{
+	if (serviceName == NULL || (muted == NULL && background == NULL))
+		return CHANNEL_OPTIONS_INVALID;
+	const bool forChannel = channel != NULL && *channel != '\0';
+	if (!forChannel && (server == NULL || *server == '\0'))
+		return CHANNEL_OPTIONS_INVALID;
+
+	PurpleAccount* account = findRoomAccount(serviceName, username);
+	if (account == NULL)
+		return CHANNEL_OPTIONS_OFFLINE;
+	if (!ChannelOptions::supports(account))
+		return CHANNEL_OPTIONS_UNSUPPORTED;
+
+	PurpleChat* chat = forChannel ? ChannelOptions::findChannel(account, channel)
+		: ChannelOptions::findServerChat(account, server, serverOfGroup);
+	if (chat == NULL)
+		return CHANNEL_OPTIONS_NOT_FOUND;
+
+	const ChannelOptions::Scope scope = forChannel ? ChannelOptions::CHANNEL : ChannelOptions::SERVER;
+	MojLogInfo(IMServiceApp::s_log, _T("setChannelOptions: %s %s%s%s"), forChannel ? "channel" : "server",
+		forChannel ? channel : server, muted ? (*muted ? " muted" : " unmuted") : "",
+		background ? (*background ? " background" : " foreground") : "");
+	if (muted != NULL)
+		ChannelOptions::set(account, chat, scope, "muted", *muted);
+	if (background != NULL)
+		ChannelOptions::set(account, chat, scope, "background", *background);
+	return CHANNEL_OPTIONS_OK;
+}
+
+/*
+ * webOS Servers tab: a prpl changed what ChannelOptions shows (here, or the user did it on another
+ * client). Copy it into the Servers tab; the roster signature carries the flags, so this syncs.
+ */
+static void channelsChangedCb(PurpleAccount* account, void* data)
+{
+	(void)data;
+	if (account == NULL || !purple_account_is_connected(account))
+		return;
+	std::string const serviceName = getServiceNameFromPurpleAccount(account);
+	std::string const username = getWebosUsername(account->username, serviceName, account);
+	if (serviceName.empty() || username.empty())
+		return;
+	LibpurpleAdapter::enumerateServersChannels(serviceName.c_str(), username.c_str());
 }
 
 /*
@@ -4751,7 +4893,35 @@ bool LibpurpleAdapter::leaveChannel(const char* serviceName, const char* usernam
 	return true;
 }
 
-LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceName, const char* username, const char* usernameTo, const char* messageText, const char* quotedMessageId)
+/*
+ * B5/B6: what a message carries besides its text, on the conversation for the length of the
+ * prpl's send (SendExtras.h). The prpl reads them in its send_im/chat_send and leaves them; they
+ * are taken off and freed here once the send returns, so none is left for the next message.
+ */
+// The conversation's data, as SendExtras::set/clear use it.
+struct PurpleConvData {
+	PurpleConversation* conv;
+	gpointer get(const char* key) const { return purple_conversation_get_data(conv, key); }
+	void set(const char* key, gpointer value) { purple_conversation_set_data(conv, key, value); }
+};
+
+static void setSendExtras(PurpleConversation* conv, const SendExtras::Extras* extras)
+{
+	if (conv == NULL)
+		return;
+	PurpleConvData data = { conv };
+	SendExtras::set(data, extras);
+}
+
+static void clearSendExtras(PurpleConversation* conv)
+{
+	if (conv == NULL)
+		return;
+	PurpleConvData data = { conv };
+	SendExtras::clear(data);
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceName, const char* username, const char* usernameTo, const char* messageText, const char* quotedMessageId, const SendExtras::Extras* extras)
 {
 	if (!serviceName || !username || !usernameTo || !messageText)
 	{
@@ -4844,9 +5014,11 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceNa
 				if (quotedMessageId && *quotedMessageId)
 					purple_conversation_set_data(chatConv, "webos-reply-to", g_strdup(quotedMessageId));
 				char* chatMsg = g_strcompress(messageText);
+				setSendExtras(chatConv, extras);
 				int cerr = serv_chat_send(gc, purple_conv_chat_get_id(purple_conversation_get_chat_data(chatConv)),
 						chatMsg, (PurpleMessageFlags)0);
-				free(chatMsg);
+				clearSendExtras(chatConv);
+				g_free(chatMsg);
 				if (cerr < 0)
 				{
 					retVal = LibpurpleAdapter::SEND_FAILED;
@@ -4877,16 +5049,373 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendMessage(const char* serviceNa
 		// real reply_to on the tdlib sendMessage (the prpl clears it after use). No-op for non-replies.
 		if (quotedMessageId && *quotedMessageId)
 			purple_conversation_set_data(purpleConversation, "webos-reply-to", g_strdup(quotedMessageId));
+		setSendExtras(purpleConversation, extras);
 		int err = serv_send_im(purple_conversation_get_gc(purpleConversation), purple_conversation_get_name(purpleConversation), messageTextUnescaped, (PurpleMessageFlags)0);
+		clearSendExtras(purpleConversation);
 		if (err < 0) {
 			retVal = LibpurpleAdapter::SEND_FAILED;
 			MojLogError(IMServiceApp::s_log, _T("sendMessage: serv_send_im returned err %d"), err);
 		}
 
-		free(messageTextUnescaped);
+		g_free(messageTextUnescaped);
 	}
 
 	return retVal;
+}
+
+// The signed-in account for (serviceName, username), or NULL.
+static PurpleAccount* onlineAccount(const char* serviceName, const char* username)
+{
+	if (!serviceName || !username)
+		return NULL;
+	std::string const accountKey = getAccountKey(username, serviceName);
+	std::unordered_map<std::string, PurpleAccount*>::iterator it = s_onlineAccountData.find(accountKey);
+	return (it == s_onlineAccountData.end()) ? NULL : it->second;
+}
+
+// The open conversation with purpleName: a chat matched as sendMessage matches one (its "id"
+// component, or its name), else a 1:1 conversation, made when there is none and makeIm is set.
+static PurpleConversation* conversationFor(PurpleAccount* account, const char* purpleName, bool makeIm)
+{
+	PurpleChat* chat = findChatByIdComponent(account, purpleName);
+	if (chat == NULL)
+		chat = purple_blist_find_chat(account, purpleName);
+	if (chat != NULL) {
+		PurpleConversation* conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, purpleName, account);
+		if (conv == NULL) {
+			// The conversation is named by the chat's own name, which a Discord channel's id is not.
+			const char* name = purple_chat_get_name(chat);
+			if (name != NULL)
+				conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, name, account);
+		}
+		return conv;
+	}
+	PurpleConversation* conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_IM, purpleName, account);
+	if (conv == NULL && makeIm)
+		conv = purple_conversation_new(PURPLE_CONV_TYPE_IM, account, purpleName);
+	return conv;
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::sendTyping(const char* serviceName, const char* username, const char* usernameTo, const char* state)
+{
+	if (!serviceName || !username || !usernameTo || !*usernameTo)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	PurpleConnection* gc = purple_account_get_connection(account);
+	if (gc == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+
+	std::string const purpleName = getPurpleUsername(usernameTo, serviceName);
+	PurpleTypingState typing = PURPLE_NOT_TYPING;
+	switch (TypingState::parse(state)) {
+	case TypingState::Typing: typing = PURPLE_TYPING; break;
+	case TypingState::Paused: typing = PURPLE_TYPED; break;
+	default:                  typing = PURPLE_NOT_TYPING; break;
+	}
+	// A chat has no typing state in libpurple 2: serv_send_typing is for a buddy.
+	const PurpleChat* chat = findChatByIdComponent(account, purpleName.c_str());
+	if (chat != NULL || purple_blist_find_chat(account, purpleName.c_str()) != NULL)
+		return LibpurpleAdapter::SENT;
+	serv_send_typing(gc, purpleName.c_str(), typing);
+	return LibpurpleAdapter::SENT;
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::markRead(const char* serviceName, const char* username, const char* usernameTo)
+{
+	if (!serviceName || !username || !usernameTo || !*usernameTo)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+
+	std::string const purpleName = getPurpleUsername(usernameTo, serviceName);
+	PurpleConversation* conv = conversationFor(account, purpleName.c_str(), true);
+	if (conv == NULL) {
+		MojLogInfo(IMServiceApp::s_log, _T("markRead: no open conversation for %s on %s"), usernameTo, serviceName);
+		return LibpurpleAdapter::SEND_FAILED;
+	}
+
+	// In focus for a while, for a prpl that asks (tdlib-purple, after 500 ms).
+	purple_conversation_set_data(conv, "webos-read-until",
+			GINT_TO_POINTER((int)(monotonicSeconds() + READ_FOCUS_SECONDS)));
+	// Pidgin counts what arrived unseen and sets "unseen-count" to 0 once the chat is looked at;
+	// gowhatsapp sends its receipts when the count drops to 0 from more, Discord and Telegram on
+	// any "unseen" update. So: one unseen, then none, each announced.
+	purple_conversation_set_data(conv, "unseen-count", GINT_TO_POINTER(1));
+	purple_conversation_update(conv, PURPLE_CONV_UPDATE_UNSEEN);
+	purple_conversation_set_data(conv, "unseen-count", GINT_TO_POINTER(0));
+	purple_conversation_update(conv, PURPLE_CONV_UPDATE_UNSEEN);
+	return LibpurpleAdapter::SENT;
+}
+
+/*
+ * B3/B4: what the app does to a message or a group besides sending to it. Each goes to the prpls
+ * as a signal that returns TRUE from the prpl that owns the account and took it; none taking it
+ * (a prpl without the feature) fails the command. The names are the prpl's, as for a send.
+ */
+static LibpurpleAdapter::SendResult actionResult(const char* what, const char* serviceName, bool taken)
+{
+	if (!taken) {
+		MojLogWarning(IMServiceApp::s_log, _T("%s: no plugin took it for %s"), what, serviceName);
+		return LibpurpleAdapter::SEND_FAILED;
+	}
+	MojLogInfo(IMServiceApp::s_log, _T("%s: sent for %s"), what, serviceName);
+	return LibpurpleAdapter::SENT;
+}
+
+// The prpl's names for a "\x1f"-joined list of the app's, joined the same way.
+static std::string purpleMembers(const char* membersJoined, const char* serviceName)
+{
+	std::vector<std::string> members = SendExtras::splitMembers(membersJoined ? membersJoined : "");
+	for (std::vector<std::string>::iterator it = members.begin(); it != members.end(); ++it)
+		*it = getPurpleUsername(*it, serviceName);
+	return SendExtras::joinMembers(members);
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::sendEdit(const char* serviceName, const char* username, const char* chat, const char* serviceMessageId, const char* text)
+{
+	if (!serviceName || !username || !chat || !*chat || !serviceMessageId || !*serviceMessageId || !text || !*text)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	std::string const purpleName = getPurpleUsername(chat, serviceName);
+	gchar* unescaped = g_strcompress(text);   // as sendMessage hands a text to the prpl
+	bool const taken = WebosSendSignals::edit(purple_conversations_get_handle(), account,
+			purpleName.c_str(), serviceMessageId, unescaped);
+	g_free(unescaped);
+	return actionResult("sendEdit", serviceName, taken);
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::sendDelete(const char* serviceName, const char* username, const char* chat, const char* serviceMessageId)
+{
+	if (!serviceName || !username || !chat || !*chat || !serviceMessageId || !*serviceMessageId)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	std::string const purpleName = getPurpleUsername(chat, serviceName);
+	bool const taken = WebosSendSignals::deleteMessage(purple_conversations_get_handle(), account,
+			purpleName.c_str(), serviceMessageId);
+	return actionResult("sendDelete", serviceName, taken);
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::downloadFile(const char* serviceName, const char* username, const char* chat, const char* serviceMessageId)
+{
+	if (!serviceName || !username || !chat || !*chat || !serviceMessageId || !*serviceMessageId)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	std::string const purpleName = getPurpleUsername(chat, serviceName);
+	bool const taken = WebosSendSignals::downloadFile(purple_conversations_get_handle(), account,
+			purpleName.c_str(), serviceMessageId);
+	return actionResult("downloadFile", serviceName, taken);
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::createGroup(const char* serviceName, const char* username, const char* name, const char* membersJoined)
+{
+	if (!serviceName || !username || !name || !*name)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	std::string const members = purpleMembers(membersJoined, serviceName);
+	if (members.empty())
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	bool const taken = WebosSendSignals::createGroup(purple_conversations_get_handle(), account,
+			name, members.c_str());
+	return actionResult("createGroup", serviceName, taken);
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::inviteToGroup(const char* serviceName, const char* username, const char* chat, const char* membersJoined)
+{
+	if (!serviceName || !username || !chat || !*chat)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	std::string const members = purpleMembers(membersJoined, serviceName);
+	if (members.empty())
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	std::string const purpleName = getPurpleUsername(chat, serviceName);
+	bool const taken = WebosSendSignals::inviteToGroup(purple_conversations_get_handle(), account,
+			purpleName.c_str(), members.c_str());
+	return actionResult("inviteToGroup", serviceName, taken);
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::removeFromGroup(const char* serviceName, const char* username, const char* chat, const char* membersJoined)
+{
+	if (!serviceName || !username || !chat || !*chat)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	std::string const members = purpleMembers(membersJoined, serviceName);
+	if (members.empty())
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	std::string const purpleName = getPurpleUsername(chat, serviceName);
+	bool const taken = WebosSendSignals::removeFromGroup(purple_conversations_get_handle(), account,
+			purpleName.c_str(), members.c_str());
+	return actionResult("removeFromGroup", serviceName, taken);
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::renameGroup(const char* serviceName, const char* username, const char* chat, const char* name)
+{
+	if (!serviceName || !username || !chat || !*chat || !name || !*name)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	std::string const purpleName = getPurpleUsername(chat, serviceName);
+	bool const taken = WebosSendSignals::renameGroup(purple_conversations_get_handle(), account,
+			purpleName.c_str(), name);
+	return actionResult("renameGroup", serviceName, taken);
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::leaveGroup(const char* serviceName, const char* username, const char* chat)
+{
+	if (!serviceName || !username || !chat || !*chat)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	std::string const purpleName = getPurpleUsername(chat, serviceName);
+	bool const taken = WebosSendSignals::leaveGroup(purple_conversations_get_handle(), account,
+			purpleName.c_str());
+	return actionResult("leaveGroup", serviceName, taken);
+}
+
+// The name a chat member is shown with, as incoming_message_cb names a group message's sender: the
+// prpl's alias for them in the chat, else their buddy's alias; for WhatsApp the push-name or
+// "+<phone>", never the raw JID; for Signal never the raw UUID. "" leaves the address as the name.
+static std::string chatMemberName(PurpleAccount* account, const std::string& serviceName,
+		const char* who, const char* chatAlias)
+{
+	const char* alias = (chatAlias != NULL && *chatAlias != '\0') ? chatAlias : NULL;
+	if (alias == NULL) {
+		PurpleBuddy* buddy = purple_find_buddy(account, who);
+		const char* buddyAlias = buddy ? purple_buddy_get_alias_only(buddy) : NULL;
+		if (buddyAlias != NULL && *buddyAlias != '\0')
+			alias = buddyAlias;
+	}
+	if (serviceName == "type_whatsapp")
+		return whatsAppDisplayName(alias, who);
+	if (serviceName == "type_signal") {
+		if (alias != NULL && !isSignalUuid(alias))
+			return alias;
+		return isSignalUuid(who) ? "Signal user" : "";
+	}
+	return alias != NULL ? alias : "";
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::chatMembers(const char* serviceName, const char* username, const char* chat,
+		std::vector<ChatMembers::Member>& members, bool& inChat, bool& joining)
+{
+	members.clear();
+	inChat = false;
+	joining = false;
+	if (!serviceName || !username || !chat || !*chat)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+
+	std::string purpleName = getPurpleUsername(chat, serviceName);
+	// webOS IRC: the app names a channel by its key, "#chan@network"; libpurple by "#chan".
+	if (Irc::isAccount(account)) {
+		std::string ircChannel;
+		if (Irc::splitChannelKey(purpleName, &ircChannel, NULL))
+			purpleName = ircChannel;
+	}
+	// A chat in the buddy list is found as sendMessage finds it (its "id" component, or its name);
+	// a WhatsApp group that is not in it by the conversation's own name, "<id>@g.us".
+	PurpleConversation* conv = conversationFor(account, purpleName.c_str(), false);
+	if (conv == NULL || purple_conversation_get_type(conv) != PURPLE_CONV_TYPE_CHAT)
+		conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, purpleName.c_str(), account);
+	// No conversation yet: the prpl opens one when the first message in the chat arrives. For a
+	// group in the buddy list whose prpl's join_chat only opens it and puts its members on it
+	// (ChatMembers::joinOpensMembers), open it now; a WhatsApp or Telegram group that is not in it
+	// with the prpl's chat_info_defaults (ChatMembers::joinFromDefaults). Those joins are done when serv_join_chat
+	// returns: the conversation is there (and found by the next request, which joins no more) or
+	// the prpl declined and nothing is pending, so a join is never asked twice for one chat.
+	// Any other prpl is asked with webos-im-chat-open, which one takes only for a chat of its own
+	// that it can open without its join_chat's history fetch; it too opens the conversation before
+	// it returns TRUE, its members on it or on their way (ChatMembers::openWay).
+	bool joinAsked = false;
+	if (conv == NULL) {
+		PurpleConnection* gc = purple_account_get_connection(account);
+		PurpleChat* chatNode = findChatByIdComponent(account, purpleName.c_str());
+		if (chatNode == NULL)
+			chatNode = purple_blist_find_chat(account, purpleName.c_str());
+		GHashTable* components = chatNode ? purple_chat_get_components(chatNode) : NULL;
+		const char* protoId = purple_account_get_protocol_id(account);
+		ChatMembers::OpenWay const way = ChatMembers::openWay(protoId ? protoId : "", purpleName,
+				components != NULL, gc != NULL && purple_account_is_connected(account));
+		if (way == ChatMembers::OpenByJoin) {
+			MojLogInfo(IMServiceApp::s_log, _T("getChatMembers: opening %s on %s for its members"),
+					purpleName.c_str(), serviceName);
+			serv_join_chat(gc, components);
+			joinAsked = true;
+		} else if (way == ChatMembers::OpenByJoinDefaults) {
+			// Not in the buddy list: the components are the prpl's own defaults for the chat's name,
+			// as Pidgin and Finch build them to rejoin such a chat, and freed the same way.
+			PurplePlugin* prpl = purple_connection_get_prpl(gc);
+			PurplePluginProtocolInfo* info = prpl ? PURPLE_PLUGIN_PROTOCOL_INFO(prpl) : NULL;
+			GHashTable* defaults = (info != NULL && info->chat_info_defaults != NULL)
+					? info->chat_info_defaults(gc, purpleName.c_str()) : NULL;
+			if (defaults != NULL) {
+				MojLogInfo(IMServiceApp::s_log, _T("getChatMembers: opening %s on %s for its members (not in the buddy list)"),
+						purpleName.c_str(), serviceName);
+				serv_join_chat(gc, defaults);
+				g_hash_table_destroy(defaults);
+				joinAsked = true;
+			}
+		} else if (way == ChatMembers::OpenBySignal) {
+			joinAsked = WebosSendSignals::openChat(purple_conversations_get_handle(), account, purpleName.c_str());
+			if (joinAsked)
+				MojLogInfo(IMServiceApp::s_log, _T("getChatMembers: %s on %s opened for its members"),
+						purpleName.c_str(), serviceName);
+		}
+		if (joinAsked) {
+			conv = conversationFor(account, purpleName.c_str(), false);
+			if (conv == NULL || purple_conversation_get_type(conv) != PURPLE_CONV_TYPE_CHAT)
+				conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, purpleName.c_str(), account);
+		}
+	}
+	if (conv == NULL) {
+		joining = ChatMembers::stillJoining(joinAsked, false, 0);
+		return LibpurpleAdapter::SENT;
+	}
+	inChat = true;
+
+	PurpleConvChat* convChat = PURPLE_CONV_CHAT(conv);
+	const char* nick = purple_conv_chat_get_nick(convChat);
+	const char* ownName = purple_account_get_username(account);
+	std::string const serviceStr(serviceName);
+	std::vector<ChatMembers::Member> found;
+	for (GList* l = purple_conv_chat_get_users(convChat); l != NULL; l = l->next) {
+		PurpleConvChatBuddy* cb = (PurpleConvChatBuddy*)l->data;
+		const char* who = cb ? purple_conv_chat_cb_get_name(cb) : NULL;
+		if (who == NULL || *who == '\0')
+			continue;
+		// Not us: by our nick in the chat, or by our account's own name.
+		if ((nick != NULL && strcmp(who, nick) == 0) || (ownName != NULL && strcmp(who, ownName) == 0))
+			continue;
+		std::string const stripped = stripResourceFromJabberUsername(who, serviceStr);
+		ChatMembers::Member m;
+		m.address = getWebosUsername(stripped.c_str(), serviceStr, account);
+		m.name = chatMemberName(account, serviceStr, stripped.c_str(), cb->alias);
+		const char* phone = purple_conv_chat_cb_get_attribute(cb, ChatMembers::PHONE_ATTRIBUTE);
+		if (phone != NULL)
+			m.phone = phone;
+		found.push_back(m);
+	}
+	members = ChatMembers::clean(found, getWebosUsername(account->username, serviceStr, account));
+	joining = ChatMembers::stillJoining(joinAsked, inChat, members.size());
+	return LibpurpleAdapter::SENT;
 }
 
 /*
@@ -5230,6 +5759,40 @@ bool LibpurpleAdapter::deviceConnectionClosed(bool all, const char* ipAddress)
 	return TRUE;
 }
 
+// Typing (B1): a prpl's serv_got_typing / serv_got_typing_stopped raise these for a 1:1
+// conversation, with the buddy's purple name. TypingChannel passes them to the app under the
+// names the app knows the account and the buddy by.
+static void typingChanged(PurpleAccount* account, const char* name, TypingState::State state)
+{
+	if (s_typingChannel == NULL || account == NULL || name == NULL || *name == '\0')
+		return;
+	std::string const serviceName = getServiceNameFromPurpleAccount(account);
+	if (serviceName.empty())
+		return;
+	std::string const stripped = stripResourceFromJabberUsername(name, serviceName);
+	std::string const from = getWebosUsername(stripped.c_str(), serviceName, account);
+	std::string const username = getWebosUsername(account->username, serviceName, account);
+	s_typingChannel->publish(serviceName.c_str(), username.c_str(), from.c_str(), state);
+}
+
+static void buddy_typing_cb(PurpleAccount* account, const char* name, gpointer data)
+{
+	(void)data;
+	typingChanged(account, name, TypingState::Typing);
+}
+
+static void buddy_typed_cb(PurpleAccount* account, const char* name, gpointer data)
+{
+	(void)data;
+	typingChanged(account, name, TypingState::Paused);
+}
+
+static void buddy_typing_stopped_cb(PurpleAccount* account, const char* name, gpointer data)
+{
+	(void)data;
+	typingChanged(account, name, TypingState::None);
+}
+
 // Register + connect the webOS cross-prpl reaction signals ONCE. Called from initializeLibpurple
 // (right after purple_core_init, BEFORE any prpl logs in) so a prpl that reconnects instantly from a
 // saved session (e.g. whatsmeow) can connect to "webos-im-send-reaction" in its login handler without
@@ -5245,6 +5808,12 @@ static void registerWebosReactionSignals()
 
 	static int webosHandle = 0x1AD6;
 	void* convHandle = purple_conversations_get_handle();
+
+	// Typing (B1): libpurple's own conversation signals, (account, buddy name).
+	purple_signal_connect(convHandle, "buddy-typing", &webosHandle, PURPLE_CALLBACK(buddy_typing_cb), NULL);
+	purple_signal_connect(convHandle, "buddy-typed", &webosHandle, PURPLE_CALLBACK(buddy_typed_cb), NULL);
+	purple_signal_connect(convHandle, "buddy-typing-stopped", &webosHandle,
+			PURPLE_CALLBACK(buddy_typing_stopped_cb), NULL);
 
 	// RECV per-sender merge (WhatsApp/Facebook/Signal): (account, targetServiceMessageId, emoji, sender).
 	purple_signal_register(convHandle, "webos-im-reaction",
@@ -5285,6 +5854,16 @@ static void registerWebosReactionSignals()
 			purple_value_new(PURPLE_TYPE_STRING));
 	purple_signal_connect(convHandle, "webos-im-edit", &webosHandle,
 			PURPLE_CALLBACK(im_edit_cb), NULL);
+
+	// the prpl's own rewrite of a message it gave (tdlib-purple: a file's card as it downloads):
+	// (account, serviceMessageId, newText), stored as an edit is but not marked edited.
+	purple_signal_register(convHandle, "webos-im-replace",
+			purple_marshal_VOID__POINTER_POINTER_POINTER, NULL, 3,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+	purple_signal_connect(convHandle, "webos-im-replace", &webosHandle,
+			PURPLE_CALLBACK(im_replace_cb), NULL);
 
 	// "delete for everyone" (WhatsApp): a prpl emits (account, serviceMessageId) when the sender
 	// revokes a previously-sent message; DeleteHandler replaces the stored bubble's text in place.
@@ -5334,7 +5913,15 @@ static void registerWebosReactionSignals()
 			purple_value_new(PURPLE_TYPE_STRING),
 			purple_value_new(PURPLE_TYPE_STRING));
 
-	MojLogInfo(IMServiceApp::s_log, _T("registered webos-im-reaction + webos-im-reaction-set + webos-im-outbox-id + webos-im-send-reaction + webos-im-send-poll-vote signals (early)"));
+	// SEND (B3, B4): edit, delete, and the groups (WebosSendSignals.h).
+	WebosSendSignals::registerSignals(convHandle);
+
+	// Servers tab: (account, channelId, scope, setting, value) to the prpl, (account) back from it.
+	ChannelOptions::registerSignals();
+	purple_signal_connect(convHandle, ChannelOptions::CHANGED_SIGNAL, &webosHandle,
+			PURPLE_CALLBACK(channelsChangedCb), NULL);
+
+	MojLogInfo(IMServiceApp::s_log, _T("registered webos-im-reaction + webos-im-reaction-set + webos-im-outbox-id + webos-im-send-reaction + webos-im-send-poll-vote + webos-im-replace + edit/delete/group/download + channel option signals (early)"));
 }
 
 void LibpurpleAdapter::assignIMLoginState(LoginCallbackInterface* loginState)
@@ -5405,6 +5992,11 @@ void LibpurpleAdapter::assignAuthChannel(AuthChannel* authChannel)
 {
 	MojLogInfo(IMServiceApp::s_log, _T("%s called."), __FUNCTION__);
 	s_authChannel = authChannel;
+}
+
+void LibpurpleAdapter::assignTypingChannel(TypingChannel* typingChannel)
+{
+	s_typingChannel = typingChannel;
 }
 
 /* QR-preview token poll. prpl-discord persists the obtained token on the account

@@ -5,9 +5,9 @@
  * existing message (e.g. WhatsApp's ProtocolMessage/REVOKE), it emits the "webos-im-delete" signal
  * with the deleted message's server id (serviceMessageId). This handler finds the matching
  * immessage row by the (serviceName, username, serviceMessageId) index - the same lookup
- * EditHandler uses - and merges a "This message was deleted." placeholder onto its messageText, so
- * the conversation updates the ORIGINAL bubble in place instead of leaving the deleted content
- * visible forever. Self-retained through the async DB ops (mirrors EditHandler/OutboxIdHandler).
+ * EditHandler uses - and merges MessageChanges::deleted onto it (deleted: true, the words "This
+ * message was deleted." as its text, no file, quote or reactions), so the conversation updates the
+ * ORIGINAL bubble in place instead of leaving the deleted content visible forever. Self-retained through the async DB ops (mirrors EditHandler/OutboxIdHandler).
  */
 #ifndef DELETEHANDLER_H_
 #define DELETEHANDLER_H_

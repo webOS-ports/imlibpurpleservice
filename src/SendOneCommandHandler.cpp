@@ -29,6 +29,7 @@
 #include "IMServiceHandler.h"
 #include "LibpurpleAdapter.h"
 #include "BuddyStatusHandler.h"
+#include "WebosSendSignals.h"
 #include "IMDefines.h"
 #include "IMMessage.h"
 
@@ -67,7 +68,7 @@ SendOneCommandHandler::~SendOneCommandHandler()
    "type"    : "object",
    "properties" : {
       "command"       : {"type"        : "string",
-                         "enum"        : ["blockBuddy","deleteBuddy","sendBuddyInvite","receivedBuddyInvite","createChatGroup","inviteToGroup","leaveGroup"],
+                         "enum"        : ["blockBuddy","deleteBuddy","sendBuddyInvite","receivedBuddyInvite","createChatGroup","inviteToGroup","removeFromGroup","renameGroup","leaveGroup"],
                          "description" : "The command to be processed"},
       "params"        : {"type"        : "any",
                          "description" : "Parameters associated with the command are stored here."}
@@ -90,39 +91,48 @@ MojErr SendOneCommandHandler::doSend(const MojObject imCmd) {
 	LibpurpleAdapter::SendResult retVal = LibpurpleAdapter::SENT;
 	bool found = false;
 
+	// A command that cannot be read is dropped below like an unknown one: returning here would
+	// leave it pending and its OutgoingIMCommandHandler waiting for a messageFinished that never
+	// comes, so the activity would never be completed and the watch never re-armed.
 	MojErr err = imCmd.get(MOJDB_COMMAND, command, found);
-	MojErrCheck(err);
 
 	// serviceName
-	err = imCmd.get(MOJDB_SERVICE_NAME, m_serviceName, found);
-	MojErrCheck(err);
+	if (err == MojErrNone)
+		err = imCmd.get(MOJDB_SERVICE_NAME, m_serviceName, found);
 
 	// get the id so we can update the status in  the DB after sending
-	err = imCmd.getRequired(MOJDB_ID, m_currentCmdDbId);
-	MojErrCheck(err);
+	if (err == MojErrNone)
+		err = imCmd.getRequired(MOJDB_ID, m_currentCmdDbId);
 
 	// for receiving invite, the user account and remote user are reversed: targetUsername is us and the fromUsername is the remote buddy
-	if (0 == command.compare(_T("receivedBuddyInvite"))) {
+	if (err != MojErrNone) {
+		// not read
+	}
+	else if (0 == command.compare(_T("receivedBuddyInvite"))) {
 		// username of current account
 		err = imCmd.get(MOJDB_FROM_USER, m_buddyName, found);
-		MojErrCheck(err);
 
 		// buddy / remote user
-		err = imCmd.get(MOJODB_TARGET_USER, m_username, found);
-		MojErrCheck(err);
+		if (err == MojErrNone)
+			err = imCmd.get(MOJODB_TARGET_USER, m_username, found);
 	}
 	else {
 		// username of current account
 		err = imCmd.get(MOJDB_FROM_USER, m_username, found);
-		MojErrCheck(err);
 
 		// buddy / remote user
-		err = imCmd.get(MOJODB_TARGET_USER, m_buddyName, found);
-		MojErrCheck(err);
+		if (err == MojErrNone)
+			err = imCmd.get(MOJODB_TARGET_USER, m_buddyName, found);
 	}
 
 	// which command?
-	if (0 == command.compare(_T("blockBuddy"))) {
+	if (err != MojErrNone) {
+		MojString error;
+		MojErrToString(err, error);
+		MojLogError(IMServiceApp::s_log, _T("doSend: command could not be read: %d - %s"), err, error.data());
+		retVal = LibpurpleAdapter::SEND_FAILED;
+	}
+	else if (0 == command.compare(_T("blockBuddy"))) {
 		retVal = blockBuddy(imCmd);
 	}
 	else if (0 == command.compare(_T("deleteBuddy"))) {
@@ -136,6 +146,30 @@ MojErr SendOneCommandHandler::doSend(const MojObject imCmd) {
 	}
 	else if (0 == command.compare(_T("sendPollVote"))) {
 		retVal = sendPollVote(imCmd);
+	}
+	else if (0 == command.compare(_T("editMessage"))) {
+		retVal = editMessage(imCmd);
+	}
+	else if (0 == command.compare(_T("deleteMessage"))) {
+		retVal = deleteMessage(imCmd);
+	}
+	else if (0 == command.compare(_T("downloadFile"))) {
+		retVal = downloadFile(imCmd);
+	}
+	else if (0 == command.compare(_T("createGroup"))) {
+		retVal = createGroup(imCmd);
+	}
+	else if (0 == command.compare(_T("inviteToGroup"))) {
+		retVal = inviteToGroup(imCmd);
+	}
+	else if (0 == command.compare(_T("removeFromGroup"))) {
+		retVal = removeFromGroup(imCmd);
+	}
+	else if (0 == command.compare(_T("renameGroup"))) {
+		retVal = renameGroup(imCmd);
+	}
+	else if (0 == command.compare(_T("leaveGroup"))) {
+		retVal = leaveGroup(imCmd);
 	}
 	else if (0 == command.compare(_T("receivedBuddyInvite"))) {
 		retVal = receivedBuddyInvite(imCmd);
@@ -170,10 +204,14 @@ MojErr SendOneCommandHandler::doSend(const MojObject imCmd) {
 
 		// luna://com.palm.db/del '{"ids":[2]}'
 		IMServiceHandler::logMojObjectJsonString(_T("deleting imcommand: %s"), idsToDelete);
-		err = m_dbClient.del(this->m_imDeleteCommandSlot, idsToDelete.arrayBegin(), idsToDelete.arrayEnd());
-
-		if (err) {
-			MojLogError(IMServiceApp::s_log, _T("doSend - DB del command failed. err %d, DB id %s: "), err, m_currentCmdDbId.data() );
+		if (m_currentCmdDbId.empty()) {
+			MojLogError(IMServiceApp::s_log, _T("doSend - command has no DB id, cannot delete it"));
+		}
+		else {
+			err = m_dbClient.del(this->m_imDeleteCommandSlot, idsToDelete.arrayBegin(), idsToDelete.arrayEnd());
+			if (err) {
+				MojLogError(IMServiceApp::s_log, _T("doSend - DB del command failed. err %d, DB id %s: "), err, m_currentCmdDbId.data() );
+			}
 		}
 	}
 
@@ -183,7 +221,7 @@ MojErr SendOneCommandHandler::doSend(const MojObject imCmd) {
 		m_outgoingIMHandler->messageFinished();
 
 	}
-	else if (0 == command.compare(_T("sendReaction")) || 0 == command.compare(_T("sendPollVote"))) {
+	else if (isSynchronous(command)) {
 		// sendReaction/sendPollVote complete SYNCHRONOUSLY (unlike the buddy verbs, which call
 		// messageFinished from their own async DB callbacks). Without this, messageFinished() is never
 		// reached on success, so the OutgoingIMHandler queue never advances and
@@ -291,6 +329,95 @@ LibpurpleAdapter::SendResult SendOneCommandHandler::sendPollVote(const MojObject
 
 	return LibpurpleAdapter::sendPollVote(m_serviceName.data(), m_username.data(), m_buddyName.data(),
 			pollMessageId.data(), optionNames.data(), senderJid.data());
+}
+
+/*
+ * The commands that are done once LibpurpleAdapter returns, with no DB callback of their own to
+ * call messageFinished from.
+ */
+bool SendOneCommandHandler::isSynchronous(const MojString& command)
+{
+	static const MojChar* const names[] = {
+		_T("sendReaction"), _T("sendPollVote"), _T("editMessage"), _T("deleteMessage"),
+		_T("downloadFile"), _T("createGroup"), _T("inviteToGroup"), _T("removeFromGroup"), _T("renameGroup"),
+		_T("leaveGroup")
+	};
+	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+		if (0 == command.compare(names[i]))
+			return true;
+	}
+	return false;
+}
+
+namespace {
+MojString paramString(const MojObject& imCmd, const MojChar* key)
+{
+	MojObject params;
+	imCmd.get(MOJDB_PARAMS, params);
+	MojString value;
+	bool found = false;
+	params.get(key, value, found);
+	return value;
+}
+}
+
+/*
+ * B3: edit or delete (for everyone) a message we sent. params: targetServiceMessageId, and text
+ * for an edit. m_buddyName is the chat it is in (set in doSend).
+ */
+LibpurpleAdapter::SendResult SendOneCommandHandler::editMessage(const MojObject imCmd) {
+	MojString const target = paramString(imCmd, XPORT_TARGET_MSG_ID);
+	MojString const text = paramString(imCmd, XPORT_TEXT);
+	return LibpurpleAdapter::sendEdit(m_serviceName.data(), m_username.data(), m_buddyName.data(),
+			target.data(), text.data());
+}
+
+LibpurpleAdapter::SendResult SendOneCommandHandler::deleteMessage(const MojObject imCmd) {
+	MojString const target = paramString(imCmd, XPORT_TARGET_MSG_ID);
+	return LibpurpleAdapter::sendDelete(m_serviceName.data(), m_username.data(), m_buddyName.data(),
+			target.data());
+}
+
+/*
+ * A file the prpl offered rather than fetched, as the user tapped its card: params messageId, the
+ * message's serviceMessageId. m_buddyName is the chat it is in (set in doSend).
+ */
+LibpurpleAdapter::SendResult SendOneCommandHandler::downloadFile(const MojObject& imCmd) {
+	MojObject params;
+	imCmd.get(MOJDB_PARAMS, params);
+	std::string const messageId = WebosSendSignals::downloadFileMessageId(params);
+	return LibpurpleAdapter::downloadFile(m_serviceName.data(), m_username.data(), m_buddyName.data(),
+			messageId.c_str());
+}
+
+/*
+ * B4: params name and members ("\x1f"-joined buddy names) to create a group; members to add to
+ * or remove from the group m_buddyName; name to rename it; nothing to leave it.
+ */
+LibpurpleAdapter::SendResult SendOneCommandHandler::createGroup(const MojObject imCmd) {
+	MojString const name = paramString(imCmd, XPORT_GROUP_NAME);
+	MojString const members = paramString(imCmd, XPORT_MEMBERS);
+	return LibpurpleAdapter::createGroup(m_serviceName.data(), m_username.data(), name.data(), members.data());
+}
+
+LibpurpleAdapter::SendResult SendOneCommandHandler::inviteToGroup(const MojObject imCmd) {
+	MojString const members = paramString(imCmd, XPORT_MEMBERS);
+	return LibpurpleAdapter::inviteToGroup(m_serviceName.data(), m_username.data(), m_buddyName.data(), members.data());
+}
+
+LibpurpleAdapter::SendResult SendOneCommandHandler::removeFromGroup(const MojObject imCmd) {
+	MojString const members = paramString(imCmd, XPORT_MEMBERS);
+	return LibpurpleAdapter::removeFromGroup(m_serviceName.data(), m_username.data(), m_buddyName.data(), members.data());
+}
+
+LibpurpleAdapter::SendResult SendOneCommandHandler::renameGroup(const MojObject imCmd) {
+	MojString const name = paramString(imCmd, XPORT_GROUP_NAME);
+	return LibpurpleAdapter::renameGroup(m_serviceName.data(), m_username.data(), m_buddyName.data(), name.data());
+}
+
+LibpurpleAdapter::SendResult SendOneCommandHandler::leaveGroup(const MojObject imCmd) {
+	(void)imCmd;
+	return LibpurpleAdapter::leaveGroup(m_serviceName.data(), m_username.data(), m_buddyName.data());
 }
 
 LibpurpleAdapter::SendResult SendOneCommandHandler::blockBuddy(const MojObject imCmd) {
@@ -493,6 +620,8 @@ MojErr SendOneCommandHandler::findAccountIdForRemoveResult(MojObject& result, Mo
 		MojString error;
 		MojErrToString(findErr, error);
 		MojLogError(IMServiceApp::s_log, _T("findAccountIdResult failed: error %d - %s"), findErr, error.data());
+		// tell the outgoing Command handler we are done, or the activity is never completed
+		m_outgoingIMHandler->messageFinished();
 
 	} else {
 
@@ -688,6 +817,8 @@ MojErr SendOneCommandHandler::findAccountIdForAddResult(MojObject& result, MojEr
 		MojString error;
 		MojErrToString(findErr, error);
 		MojLogError(IMServiceApp::s_log, _T("findAccountIdResult failed: error %d - %s"), findErr, error.data());
+		// tell the outgoing Command handler we are done, or the activity is never completed
+		m_outgoingIMHandler->messageFinished();
 
 	} else {
 

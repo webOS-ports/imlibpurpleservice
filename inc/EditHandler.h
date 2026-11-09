@@ -5,7 +5,7 @@
  * (e.g. WhatsApp's ProtocolMessage/EditedMessage), it emits the "webos-im-edit" signal with the edited
  * message's server id (serviceMessageId) + the new (already HTML-escaped) text. This handler finds the
  * matching immessage row by the (serviceName, username, serviceMessageId) index and merges the new
- * messageText onto it -- so the conversation updates the ORIGINAL bubble in place instead of showing a
+ * messageText and edited: true onto it (MessageChanges::edited; not onto a deleted one) -- so the conversation updates the ORIGINAL bubble in place instead of showing a
  * separate "[EDIT] ..." message. Self-retained through the async DB ops (mirrors OutboxIdHandler).
  */
 #ifndef EDITHANDLER_H_
@@ -23,9 +23,11 @@ public:
 	virtual ~EditHandler();
 
 	// serviceName+username identify the owning account; serviceMessageId is the edited message's network
-	// id; newText is the new (HTML-escaped, like a normal incoming body) message text.
+	// id; newText is the new (HTML-escaped, like a normal incoming body) message text. bySender: the
+	// sender edited it ("webos-im-edit"), and the row is marked edited; false where the prpl rewrote
+	// what it gave ("webos-im-replace"), which is not (MessageChanges::textChanged).
 	MojErr handleEdit(const char* serviceName, const char* username, const char* serviceMessageId,
-			const char* newText);
+			const char* newText, bool bySender);
 
 private:
 	MojDbClient::Signal::Slot<EditHandler> m_findSlot;
@@ -38,6 +40,7 @@ private:
 	MojString m_username;
 	MojString m_serviceMessageId;
 	MojString m_newText;
+	bool m_bySender;
 
 	MojService* m_service;
 	IMServiceApp::Listener* m_listener;

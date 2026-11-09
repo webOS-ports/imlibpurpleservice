@@ -86,6 +86,7 @@ private:
 	MojString m_filePath;
 	// webOS native reply: serviceMessageId of the message being replied to (empty if not a reply).
 	MojString m_quotedMessageId;
+	SendExtras::Extras m_extras;   // B5/B6: location, contact card, mentions
 	MojString m_username;
 	MojString m_usernameTo;
 	MojString m_serviceName;

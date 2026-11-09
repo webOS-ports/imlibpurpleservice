@@ -43,6 +43,9 @@
 #define XPORT_POLL_MSG_ID			_T("pollMessageId")
 #define XPORT_POLL_OPTIONS			_T("optionNames")
 #define XPORT_POLL_SENDER			_T("senderJid")
+#define XPORT_TEXT					_T("text")
+#define XPORT_GROUP_NAME			_T("name")
+#define XPORT_MEMBERS				_T("members")
 
 class SendOneCommandHandler : public MojSignalHandler
 {
@@ -91,6 +94,17 @@ private:
 	LibpurpleAdapter::SendResult blockBuddy(const MojObject imCmd);
 	LibpurpleAdapter::SendResult sendReaction(const MojObject imCmd);
 	LibpurpleAdapter::SendResult sendPollVote(const MojObject imCmd);
+	// B3/B4: synchronous, as sendReaction is.
+	LibpurpleAdapter::SendResult editMessage(const MojObject imCmd);
+	LibpurpleAdapter::SendResult deleteMessage(const MojObject imCmd);
+	// A file the prpl offered, on a tap: synchronous too.
+	LibpurpleAdapter::SendResult downloadFile(const MojObject& imCmd);
+	LibpurpleAdapter::SendResult createGroup(const MojObject imCmd);
+	LibpurpleAdapter::SendResult inviteToGroup(const MojObject imCmd);
+	LibpurpleAdapter::SendResult removeFromGroup(const MojObject imCmd);
+	LibpurpleAdapter::SendResult renameGroup(const MojObject imCmd);
+	LibpurpleAdapter::SendResult leaveGroup(const MojObject imCmd);
+	static bool isSynchronous(const MojString& command);
 	LibpurpleAdapter::SendResult removeBuddy(const MojObject imCmd);
 	LibpurpleAdapter::SendResult inviteBuddy(const MojObject imCmd);
 	LibpurpleAdapter::SendResult receivedBuddyInvite(const MojObject imCmd);
