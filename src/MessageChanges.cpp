@@ -57,4 +57,16 @@ MojErr deleted(const MojString& dbId, MojObject& out)
 	return MojErrNone;
 }
 
+MojErr incomingFlags(bool muted, bool history, MojObject& flags, bool& any)
+{
+	any = muted || history;
+	if (!any)
+		return MojErrNone;
+	MojErr err = flags.putBool(_T("noNotification"), true); MojErrCheck(err);
+	if (history) {
+		err = flags.putBool(_T("read"), true);              MojErrCheck(err);
+	}
+	return MojErrNone;
+}
+
 }

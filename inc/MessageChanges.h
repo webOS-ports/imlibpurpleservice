@@ -49,6 +49,11 @@ namespace MessageChanges
 	// The merge for row dbId after a delete for everyone: the text, the file and the quote and
 	// reactions on it go.
 	MojErr deleted(const MojString& dbId, MojObject& out);
+
+	// The flags an incoming row is stored with: noNotification for a muted chat's message or a
+	// prpl's own line (muted), read and noNotification for an old message from the history the
+	// prpl was given (history): no banner, and not unread. any is false when it needs none.
+	MojErr incomingFlags(bool muted, bool history, MojObject& flags, bool& any);
 }
 
 #endif /* MESSAGECHANGES_H_ */

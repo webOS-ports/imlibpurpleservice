@@ -156,6 +156,9 @@ MojErr SendOneCommandHandler::doSend(const MojObject imCmd) {
 	else if (0 == command.compare(_T("downloadFile"))) {
 		retVal = downloadFile(imCmd);
 	}
+	else if (0 == command.compare(_T("loadHistory"))) {
+		retVal = loadHistory(imCmd);
+	}
 	else if (0 == command.compare(_T("createGroup"))) {
 		retVal = createGroup(imCmd);
 	}
@@ -339,7 +342,7 @@ bool SendOneCommandHandler::isSynchronous(const MojString& command)
 {
 	static const MojChar* const names[] = {
 		_T("sendReaction"), _T("sendPollVote"), _T("editMessage"), _T("deleteMessage"),
-		_T("downloadFile"), _T("createGroup"), _T("inviteToGroup"), _T("removeFromGroup"), _T("renameGroup"),
+		_T("downloadFile"), _T("loadHistory"), _T("createGroup"), _T("inviteToGroup"), _T("removeFromGroup"), _T("renameGroup"),
 		_T("leaveGroup")
 	};
 	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
@@ -388,6 +391,18 @@ LibpurpleAdapter::SendResult SendOneCommandHandler::downloadFile(const MojObject
 	std::string const messageId = WebosSendSignals::downloadFileMessageId(params);
 	return LibpurpleAdapter::downloadFile(m_serviceName.data(), m_username.data(), m_buddyName.data(),
 			messageId.c_str());
+}
+
+/*
+ * Older messages of a chat, asked for in the app: params messageId, timestamp and outgoing name the
+ * oldest message the app has of it (WebosSendSignals::loadHistoryAnchor). m_buddyName is the chat.
+ */
+LibpurpleAdapter::SendResult SendOneCommandHandler::loadHistory(const MojObject& imCmd) {
+	MojObject params;
+	imCmd.get(MOJDB_PARAMS, params);
+	WebosSendSignals::HistoryAnchor const anchor = WebosSendSignals::loadHistoryAnchor(params);
+	return LibpurpleAdapter::loadHistory(m_serviceName.data(), m_username.data(), m_buddyName.data(),
+			anchor.messageId.c_str(), anchor.timestamp.c_str(), anchor.outgoing);
 }
 
 /*

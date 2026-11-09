@@ -152,3 +152,31 @@ TEST(MessageChanges, ARewriteAfterADeleteIsNotApplied)
 	ASSERT_EQ(MojErrNone, MessageChanges::deleted(str("++abc"), row));
 	EXPECT_FALSE(MessageChanges::editApplies(row));
 }
+
+// An incoming row's flags: none for an ordinary message, no banner for a muted chat's message or a
+// prpl's own line, and no banner and read for an old message from the history the prpl was given,
+// muted or not, so it is not counted as unread either.
+TEST(MessageChanges, IncomingFlags)
+{
+	MojObject none;
+	bool any = true;
+	ASSERT_EQ(MojErrNone, MessageChanges::incomingFlags(false, false, none, any));
+	EXPECT_FALSE(any);
+	EXPECT_FALSE(none.contains(_T("noNotification")));
+	EXPECT_FALSE(none.contains(_T("read")));
+
+	MojObject muted;
+	ASSERT_EQ(MojErrNone, MessageChanges::incomingFlags(true, false, muted, any));
+	EXPECT_TRUE(any);
+	EXPECT_TRUE(getBool(muted, "noNotification"));
+	EXPECT_FALSE(muted.contains(_T("read"))) << "a muted chat's message still counts as unread";
+
+	for (bool chatMuted : { false, true }) {
+		MojObject old;
+		any = false;
+		ASSERT_EQ(MojErrNone, MessageChanges::incomingFlags(chatMuted, true, old, any));
+		EXPECT_TRUE(any);
+		EXPECT_TRUE(getBool(old, "noNotification"));
+		EXPECT_TRUE(getBool(old, "read"));
+	}
+}

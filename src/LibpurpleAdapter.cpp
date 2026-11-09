@@ -2627,10 +2627,16 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 	char* qMsgId = (char*) purple_conversation_get_data(conv, "webos-quoted-id");
 	char* qText  = (char*) purple_conversation_get_data(conv, "webos-quoted-text");
 	char* qFrom  = (char*) purple_conversation_get_data(conv, "webos-quoted-from");
+	// An old message from the history the prpl was given (purple-combined's WhatsApp: what the
+	// phone sends after linking, or when the app asks for older messages): the prpl marks the
+	// conversation "webos-msg-history" for just as long as it hands the message on, and clears it
+	// itself. A marker that owns nothing: read, never freed or cleared here. Stored read, without
+	// a banner.
+	const bool history = purple_conversation_get_data(conv, "webos-msg-history") != NULL;
 
 	s_imServiceHandler->incomingIM(serviceName.c_str(), ownerWebos.c_str(), senderWebos.c_str(),
 			message, mtime, channelName, channelDisplayName, serverName, serverName, muted, usernameFromDisplay, svcMsgId,
-			qMsgId, qText, qFrom);
+			qMsgId, qText, qFrom, false, history);
 
 	if (svcMsgId != NULL) {
 		g_free(svcMsgId);
@@ -5213,6 +5219,20 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::downloadFile(const char* serviceN
 	bool const taken = WebosSendSignals::downloadFile(purple_conversations_get_handle(), account,
 			purpleName.c_str(), serviceMessageId);
 	return actionResult("downloadFile", serviceName, taken);
+}
+
+LibpurpleAdapter::SendResult LibpurpleAdapter::loadHistory(const char* serviceName, const char* username, const char* chat,
+		const char* serviceMessageId, const char* timestamp, bool outgoing)
+{
+	if (!serviceName || !username || !chat || !*chat || !serviceMessageId || !*serviceMessageId || !timestamp || !*timestamp)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	std::string const purpleName = getPurpleUsername(chat, serviceName);
+	bool const taken = WebosSendSignals::loadHistory(purple_conversations_get_handle(), account,
+			purpleName.c_str(), serviceMessageId, timestamp, outgoing);
+	return actionResult("loadHistory", serviceName, taken);
 }
 
 LibpurpleAdapter::SendResult LibpurpleAdapter::createGroup(const char* serviceName, const char* username, const char* name, const char* membersJoined)

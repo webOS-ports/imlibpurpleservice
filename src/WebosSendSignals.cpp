@@ -26,6 +26,9 @@ const char* const LeaveSignal = "webos-im-group-leave";
 const char* const OpenSignal = "webos-im-chat-open";
 const char* const DownloadSignal = "webos-im-download-file";
 const MojChar* const DownloadMessageIdKey = _T("messageId");
+const char* const LoadHistorySignal = "webos-im-load-history";
+const MojChar* const HistoryTimestampKey = _T("timestamp");
+const MojChar* const HistoryOutgoingKey = _T("outgoing");
 
 PurpleValue* accountValue() { return purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT); }
 PurpleValue* stringValue() { return purple_value_new(PURPLE_TYPE_STRING); }
@@ -57,6 +60,8 @@ void registerSignals(void* handle)
 			booleanValue(), 2, accountValue(), stringValue());
 	purple_signal_register(handle, DownloadSignal, purple_marshal_BOOLEAN__POINTER_POINTER_POINTER,
 			booleanValue(), 3, accountValue(), stringValue(), stringValue());
+	purple_signal_register(handle, LoadHistorySignal, purple_marshal_BOOLEAN__POINTER_POINTER_POINTER_POINTER_POINTER,
+			booleanValue(), 5, accountValue(), stringValue(), stringValue(), stringValue(), stringValue());
 }
 
 bool edit(void* handle, PurpleAccount* account, const char* chat, const char* serviceMessageId, const char* text)
@@ -111,6 +116,36 @@ std::string downloadFileMessageId(const MojObject& params)
 	if (params.get(DownloadMessageIdKey, value, found) != MojErrNone || !found)
 		return std::string();
 	return value.data();
+}
+
+bool loadHistory(void* handle, PurpleAccount* account, const char* chat, const char* serviceMessageId,
+		const char* timestamp, bool outgoing)
+{
+	return taken(purple_signal_emit_return_1(handle, LoadHistorySignal, account, chat, serviceMessageId,
+			timestamp, outgoing ? "1" : "0"));
+}
+
+HistoryAnchor loadHistoryAnchor(const MojObject& params)
+{
+	HistoryAnchor anchor;
+	anchor.messageId = downloadFileMessageId(params);
+	MojObject at;
+	if (params.get(HistoryTimestampKey, at)) {
+		if (at.type() == MojObject::TypeInt || at.type() == MojObject::TypeDecimal) {
+			MojInt64 const n = at.intValue();
+			if (n > 0)
+				anchor.timestamp = std::to_string(n);
+		} else if (at.type() == MojObject::TypeString) {
+			MojString s;
+			if (at.stringValue(s) == MojErrNone && !s.empty()
+					&& std::string(s.data()).find_first_not_of("0123456789") == std::string::npos)
+				anchor.timestamp = s.data();
+		}
+	}
+	bool outgoing = false;
+	if (params.get(HistoryOutgoingKey, outgoing))
+		anchor.outgoing = outgoing;
+	return anchor;
 }
 
 } // namespace WebosSendSignals

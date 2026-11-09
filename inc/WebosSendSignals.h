@@ -20,6 +20,8 @@
  *   webos-im-group-leave  (PurpleAccount*, const char* chat)
  *   webos-im-chat-open    (PurpleAccount*, const char* chat)
  *   webos-im-download-file (PurpleAccount*, const char* chat, const char* serviceMessageId)
+ *   webos-im-load-history (PurpleAccount*, const char* chat, const char* serviceMessageId,
+ *                          const char* timestamp, const char* outgoing)
  *
  * members: buddy names joined by "\x1f"; name: the group's new name. Each emit says whether a prpl took it.
  *
@@ -32,6 +34,13 @@
  * webos-im-download-file asks a prpl for the file of a message it offered rather than fetched
  * (tdlib-purple: a video, a music file, a document over 1 MB), as the user tapped its card. TRUE:
  * the prpl asked for it; it rewrites the message as the file comes ("webos-im-replace").
+ *
+ * webos-im-load-history asks a prpl for the messages of chat before the oldest one the app has:
+ * serviceMessageId is that message's id, timestamp its time as the app keeps it (milliseconds since
+ * 1970, in decimal; a prpl takes a number too small for that as seconds), outgoing "1" when we sent
+ * it, else "0". TRUE: the prpl asked for them (WhatsApp asks the phone); they come as messages, with
+ * their own ids and times, marked as history ("webos-msg-history"), so they are stored read and
+ * without a banner, and those already stored are not stored again.
  */
 
 #ifndef WEBOSSENDSIGNALS_H_
@@ -58,6 +67,17 @@ bool downloadFile(void* handle, PurpleAccount* account, const char* chat, const 
 
 /** The serviceMessageId a downloadFile imcommand's params name ("messageId"); "" if none. */
 std::string downloadFileMessageId(const MojObject& params);
+
+bool loadHistory(void* handle, PurpleAccount* account, const char* chat, const char* serviceMessageId,
+		const char* timestamp, bool outgoing);
+
+/** What a loadHistory imcommand's params name: the oldest message the app has of the chat. */
+struct HistoryAnchor {
+	std::string messageId;  // its serviceMessageId ("messageId"); "" when not named
+	std::string timestamp;  // its time ("timestamp", a number or a string of digits) in decimal; "" when none
+	bool outgoing = false;  // we sent it ("outgoing")
+};
+HistoryAnchor loadHistoryAnchor(const MojObject& params);
 
 } // namespace WebosSendSignals
 

@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include "IMMessage.h"
+#include "MessageChanges.h"
 #include "IMServiceHandler.h"
 #include "sanitize.h"
 
@@ -111,6 +112,7 @@ IMMessage::IMMessage()
 	isGroupChat = false;
 	// muted messages (chat muted on the server side) get flags.noNotification; default off.
 	muted = false;
+	history = false;
 }
 
 IMMessage::~IMMessage() {
@@ -337,12 +339,17 @@ MojErr IMMessage::createDBObject(MojObject& returnObj) {
 	// mark it "no notification" so the Messaging app's DashboardManager (isNewMessage checks
 	// flags.noNotification) skips the banner. The message still lands in the inbox and counts as
 	// unread - matching native Telegram, which shows muted chats without alerting.
-	if (muted) {
+	// An old message from the history the prpl was given is stored read as well, so it neither
+	// counts as unread nor raises a banner (MessageChanges::incomingFlags).
+	{
 		MojObject flags;
-		err = flags.putBool(_T("noNotification"), true);
+		bool any = false;
+		err = MessageChanges::incomingFlags(muted, history, flags, any);
 		MojErrCheck(err);
-		err = returnObj.put(_T("flags"), flags);
-		MojErrCheck(err);
+		if (any) {
+			err = returnObj.put(_T("flags"), flags);
+			MojErrCheck(err);
+		}
 	}
 
 	// webOS Servers/Rooms (Milestone 0): tag multi-user-chat messages with their room + parent
