@@ -374,3 +374,39 @@ TEST_F(Signals, OpenChatNotTakenForAnotherAccount)
 	EXPECT_TRUE(WebosSendSignals::openChat(handle, Ours, "g1"));
 	EXPECT_EQ(2, open.calls);
 }
+
+TEST(DownloadFile, TheMessageIdOfTheCommand)
+{
+	// imcommand downloadFile: params { messageId: <serviceMessageId> }, as the app sends it.
+	MojObject params;
+	EXPECT_EQ("", WebosSendSignals::downloadFileMessageId(params));
+	ASSERT_EQ(MojErrNone, params.putString(_T("targetServiceMessageId"), "1:2"));
+	EXPECT_EQ("", WebosSendSignals::downloadFileMessageId(params)) << "only messageId names it";
+	ASSERT_EQ(MojErrNone, params.putString(_T("messageId"), "-1001234567890:3145728"));
+	EXPECT_EQ("-1001234567890:3145728", WebosSendSignals::downloadFileMessageId(params));
+}
+
+TEST_F(Signals, DownloadFileIsItsOwnSignal)
+{
+	// The chat and the message's id reach the prpl that owns the account, as no edit or delete.
+	Seen download = { 0, "" }, deleted = { 0, "" }, edited = { 0, "" };
+	purple_signal_connect(handle, "webos-im-send-delete", &owner, PURPLE_CALLBACK(three_cb), &deleted);
+	purple_signal_connect(handle, "webos-im-send-edit", &owner, PURPLE_CALLBACK(edit_cb), &edited);
+	EXPECT_FALSE(WebosSendSignals::downloadFile(handle, Ours, "chat-100", "-100:7")) << "no prpl connected";
+	purple_signal_connect(handle, "webos-im-download-file", &owner, PURPLE_CALLBACK(three_cb), &download);
+	EXPECT_TRUE(WebosSendSignals::downloadFile(handle, Ours, "chat-100", "-100:7"));
+	EXPECT_EQ(1, download.calls);
+	EXPECT_EQ("chat-100|-100:7", download.args);
+	EXPECT_EQ(0, deleted.calls);
+	EXPECT_EQ(0, edited.calls);
+	EXPECT_FALSE(WebosSendSignals::downloadFile(handle, Theirs, "chat-100", "-100:7")) << "not its account";
+	EXPECT_EQ(2, download.calls);
+}
+
+TEST_F(Signals, DownloadFileNotTakenForAnotherAccount)
+{
+	Seen others = { 0, "" };
+	purple_signal_connect(handle, "webos-im-download-file", &other, PURPLE_CALLBACK(other_prpl_cb), &others);
+	EXPECT_FALSE(WebosSendSignals::downloadFile(handle, Ours, "chat-100", "-100:7"));
+	EXPECT_EQ(1, others.calls);
+}

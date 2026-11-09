@@ -10,7 +10,8 @@
  * What EditHandler and DeleteHandler write onto an immessage row when the sender edits a message
  * or deletes it for everyone, kept apart from the db calls so it can be tested on its own.
  *
- *   edited   true once the text was replaced by an edit; the app marks the bubble "Edited"
+ *   edited   true once the text was replaced by an edit; the app marks the bubble "Edited". Not set
+ *            where the prpl rewrites what it gave itself ("webos-im-replace").
  *   deleted  true once the sender deleted it for everyone; the app draws the bubble as deleted.
  *            messageText still says so in words, for the thread summary and older apps.
  *
@@ -36,6 +37,14 @@ namespace MessageChanges
 
 	// The merge for row dbId after an edit to newText (HTML-escaped, like any incoming body).
 	MojErr edited(const MojString& dbId, const MojString& newText, MojObject& out);
+
+	// The merge for row dbId whose text the prpl rewrote itself, not the sender (the card of a file
+	// as it downloads): the text alone. edited stays as it was, so the app says "Edited" for the
+	// sender's edits only.
+	MojErr replaced(const MojString& dbId, const MojString& newText, MojObject& out);
+
+	// edited() where the sender changed the text, replaced() where the prpl did.
+	MojErr textChanged(const MojString& dbId, const MojString& newText, bool bySender, MojObject& out);
 
 	// The merge for row dbId after a delete for everyone: the text, the file and the quote and
 	// reactions on it go.

@@ -97,6 +97,8 @@ private:
 	// B3/B4: synchronous, as sendReaction is.
 	LibpurpleAdapter::SendResult editMessage(const MojObject imCmd);
 	LibpurpleAdapter::SendResult deleteMessage(const MojObject imCmd);
+	// A file the prpl offered, on a tap: synchronous too.
+	LibpurpleAdapter::SendResult downloadFile(const MojObject& imCmd);
 	LibpurpleAdapter::SendResult createGroup(const MojObject imCmd);
 	LibpurpleAdapter::SendResult inviteToGroup(const MojObject imCmd);
 	LibpurpleAdapter::SendResult removeFromGroup(const MojObject imCmd);

@@ -1663,13 +1663,13 @@ bool IMServiceHandler::handleOutboxId(const char* serviceName, const char* usern
  * so the conversation updates the ORIGINAL bubble in place instead of showing a separate "[EDIT]" message.
  */
 bool IMServiceHandler::handleMessageEdit(const char* serviceName, const char* username,
-		const char* serviceMessageId, const char* newText)
+		const char* serviceMessageId, const char* newText, bool bySender)
 {
 	MojLogInfo(IMServiceApp::s_log, _T("handleMessageEdit: service %s id %s"),
 			serviceName ? serviceName : "", serviceMessageId ? serviceMessageId : "");
 
 	MojRefCountedPtr<EditHandler> editHandler(new EditHandler(m_service, this));
-	MojErr err = editHandler->handleEdit(serviceName, username, serviceMessageId, newText);
+	MojErr err = editHandler->handleEdit(serviceName, username, serviceMessageId, newText, bySender);
 	if (err) {
 		MojString error;
 		MojErrToString(err, error);

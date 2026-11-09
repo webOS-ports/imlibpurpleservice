@@ -19,6 +19,7 @@
  *   webos-im-group-rename (PurpleAccount*, const char* chat, const char* name)
  *   webos-im-group-leave  (PurpleAccount*, const char* chat)
  *   webos-im-chat-open    (PurpleAccount*, const char* chat)
+ *   webos-im-download-file (PurpleAccount*, const char* chat, const char* serviceMessageId)
  *
  * members: buddy names joined by "\x1f"; name: the group's new name. Each emit says whether a prpl took it.
  *
@@ -27,12 +28,18 @@
  * no history, nothing marked read, no line written. getChatMembers emits it for a chat that has no
  * conversation yet (ChatMembers::openWay). TRUE: the conversation is open, its members on it or
  * on their way.
+ *
+ * webos-im-download-file asks a prpl for the file of a message it offered rather than fetched
+ * (tdlib-purple: a video, a music file, a document over 1 MB), as the user tapped its card. TRUE:
+ * the prpl asked for it; it rewrites the message as the file comes ("webos-im-replace").
  */
 
 #ifndef WEBOSSENDSIGNALS_H_
 #define WEBOSSENDSIGNALS_H_
 
 #include <purple.h>
+#include <string>
+#include "core/MojObject.h"
 
 namespace WebosSendSignals {
 
@@ -47,6 +54,10 @@ bool removeFromGroup(void* handle, PurpleAccount* account, const char* chat, con
 bool renameGroup(void* handle, PurpleAccount* account, const char* chat, const char* name);
 bool leaveGroup(void* handle, PurpleAccount* account, const char* chat);
 bool openChat(void* handle, PurpleAccount* account, const char* chat);
+bool downloadFile(void* handle, PurpleAccount* account, const char* chat, const char* serviceMessageId);
+
+/** The serviceMessageId a downloadFile imcommand's params name ("messageId"); "" if none. */
+std::string downloadFileMessageId(const MojObject& params);
 
 } // namespace WebosSendSignals
 

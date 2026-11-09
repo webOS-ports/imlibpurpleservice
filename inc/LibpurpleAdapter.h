@@ -111,8 +111,10 @@ public:
 	// webOS: the sender edited a message they'd previously sent; update the stored bubble's text in place
 	// (found by serviceMessageId) rather than showing a separate "[EDIT]" message. Driven by the
 	// "webos-im-edit" signal. newText is the new body (already HTML-escaped, like a normal incoming body).
+	// bySender false: driven by "webos-im-replace", the prpl's own rewrite of what it gave (a file's
+	// card as it downloads), which leaves the message not marked edited.
 	virtual bool handleMessageEdit(const char* serviceName, const char* username, const char* serviceMessageId,
-				const char* newText) = 0;
+				const char* newText, bool bySender) = 0;
 	// webOS: the sender deleted a message they'd previously sent "for everyone"; replace the stored
 	// bubble's text with a placeholder in place (found by serviceMessageId). Driven by the
 	// "webos-im-delete" signal.
@@ -250,6 +252,11 @@ public:
 	// no prpl took it, as one that has no editing does not.
 	static SendResult sendEdit(const char *serviceName, const char *username, const char *chat, const char *serviceMessageId, const char *text);
 	static SendResult sendDelete(const char *serviceName, const char *username, const char *chat, const char *serviceMessageId);
+	// A file the prpl offered rather than fetched (tdlib-purple: a video, a music file, a document
+	// over 1 MB), asked for with a tap: chat is the conversation it is in, serviceMessageId the
+	// message's. Emits "webos-im-download-file"; the prpl rewrites the message as the file comes
+	// ("webos-im-replace"). SEND_FAILED when no prpl took it.
+	static SendResult downloadFile(const char *serviceName, const char *username, const char *chat, const char *serviceMessageId);
 	// Groups (B4): create one with a name and members, add members to or remove them from one,
 	// rename one, leave one. Members are "\x1f"-joined buddy names as the app has them. Emits
 	// "webos-im-group-create", "-invite", "-remove", "-rename" and "-leave"; SEND_FAILED when no prpl took it. A new group appears as messages into it do.

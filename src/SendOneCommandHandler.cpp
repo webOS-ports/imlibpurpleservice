@@ -29,6 +29,7 @@
 #include "IMServiceHandler.h"
 #include "LibpurpleAdapter.h"
 #include "BuddyStatusHandler.h"
+#include "WebosSendSignals.h"
 #include "IMDefines.h"
 #include "IMMessage.h"
 
@@ -151,6 +152,9 @@ MojErr SendOneCommandHandler::doSend(const MojObject imCmd) {
 	}
 	else if (0 == command.compare(_T("deleteMessage"))) {
 		retVal = deleteMessage(imCmd);
+	}
+	else if (0 == command.compare(_T("downloadFile"))) {
+		retVal = downloadFile(imCmd);
 	}
 	else if (0 == command.compare(_T("createGroup"))) {
 		retVal = createGroup(imCmd);
@@ -335,7 +339,7 @@ bool SendOneCommandHandler::isSynchronous(const MojString& command)
 {
 	static const MojChar* const names[] = {
 		_T("sendReaction"), _T("sendPollVote"), _T("editMessage"), _T("deleteMessage"),
-		_T("createGroup"), _T("inviteToGroup"), _T("removeFromGroup"), _T("renameGroup"),
+		_T("downloadFile"), _T("createGroup"), _T("inviteToGroup"), _T("removeFromGroup"), _T("renameGroup"),
 		_T("leaveGroup")
 	};
 	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
@@ -372,6 +376,18 @@ LibpurpleAdapter::SendResult SendOneCommandHandler::deleteMessage(const MojObjec
 	MojString const target = paramString(imCmd, XPORT_TARGET_MSG_ID);
 	return LibpurpleAdapter::sendDelete(m_serviceName.data(), m_username.data(), m_buddyName.data(),
 			target.data());
+}
+
+/*
+ * A file the prpl offered rather than fetched, as the user tapped its card: params messageId, the
+ * message's serviceMessageId. m_buddyName is the chat it is in (set in doSend).
+ */
+LibpurpleAdapter::SendResult SendOneCommandHandler::downloadFile(const MojObject& imCmd) {
+	MojObject params;
+	imCmd.get(MOJDB_PARAMS, params);
+	std::string const messageId = WebosSendSignals::downloadFileMessageId(params);
+	return LibpurpleAdapter::downloadFile(m_serviceName.data(), m_username.data(), m_buddyName.data(),
+			messageId.c_str());
 }
 
 /*

@@ -112,3 +112,43 @@ TEST(MessageChanges, AnEditAfterADeleteChangesNothingTheAppShows)
 	ASSERT_FALSE(MessageChanges::editApplies(row));
 	EXPECT_EQ("This message was deleted.", getString(row, MOJDB_MSG_TEXT));
 }
+
+TEST(MessageChanges, APrplsRewriteReplacesTheTextOnly)
+{
+	// "webos-im-replace": the prpl's own rewrite (a file's card as it downloads). The text changes;
+	// edited is not written, so a message never edited by its sender is not drawn "Edited", and one
+	// that was keeps it.
+	MojObject out;
+	ASSERT_EQ(MojErrNone, MessageChanges::replaced(str("++abc"), str("file:///a%20b.mp4\ncap"), out));
+	EXPECT_EQ("++abc", getString(out, MOJDB_ID));
+	EXPECT_EQ("file:///a%20b.mp4\ncap", getString(out, MOJDB_MSG_TEXT));
+	EXPECT_FALSE(out.contains(MOJDB_EDITED));
+	EXPECT_FALSE(out.contains(MOJDB_DELETED));
+	EXPECT_EQ(2u, keys(out));
+}
+
+TEST(MessageChanges, TheSendersEditIsMarkedThePrplsRewriteIsNot)
+{
+	// What EditHandler writes for "webos-im-edit" (by the sender) and "webos-im-replace" (not).
+	MojObject bySender;
+	ASSERT_EQ(MojErrNone, MessageChanges::textChanged(str("++abc"), str("new"), true, bySender));
+	EXPECT_EQ("new", getString(bySender, MOJDB_MSG_TEXT));
+	EXPECT_TRUE(getBool(bySender, "edited"));
+	EXPECT_EQ(3u, keys(bySender));
+
+	MojObject byPrpl;
+	ASSERT_EQ(MojErrNone, MessageChanges::textChanged(str("++abc"),
+			str("luneos-file:?name=a.zip&amp;size=2000000&amp;type=document&amp;state=downloading"), false, byPrpl));
+	EXPECT_EQ("luneos-file:?name=a.zip&amp;size=2000000&amp;type=document&amp;state=downloading",
+			getString(byPrpl, MOJDB_MSG_TEXT));
+	EXPECT_FALSE(byPrpl.contains(MOJDB_EDITED));
+	EXPECT_EQ(2u, keys(byPrpl));
+}
+
+TEST(MessageChanges, ARewriteAfterADeleteIsNotApplied)
+{
+	// EditHandler checks editApplies for a rewrite as for an edit: a deleted file's card stays deleted.
+	MojObject row;
+	ASSERT_EQ(MojErrNone, MessageChanges::deleted(str("++abc"), row));
+	EXPECT_FALSE(MessageChanges::editApplies(row));
+}

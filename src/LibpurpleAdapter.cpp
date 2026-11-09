@@ -253,6 +253,9 @@ static void im_reaction_cb(PurpleAccount* account, const char* targetServiceMess
 static void im_outbox_id_cb(PurpleAccount* account, const char* serviceMessageId, const char* text, void* data);
 // webOS: handler for "webos-im-edit" - the sender edited a message; update its stored bubble text in place.
 static void im_edit_cb(PurpleAccount* account, const char* serviceMessageId, const char* newText, void* data);
+// webOS: handler for "webos-im-replace" - the prpl rewrote what it gave for a message (a file's card
+// as it downloads); update the stored text in place, without marking it edited.
+static void im_replace_cb(PurpleAccount* account, const char* serviceMessageId, const char* newText, void* data);
 // webOS: handler for "webos-im-delete" - the sender deleted a message "for everyone"; replace its
 // stored bubble text with a placeholder in place.
 static void im_delete_cb(PurpleAccount* account, const char* serviceMessageId, void* data);
@@ -2703,7 +2706,23 @@ static void im_edit_cb(PurpleAccount* account, const char* serviceMessageId, con
 	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
 	std::string ownerWebos = getWebosUsername(account->username, serviceName, account);
 	s_imServiceHandler->handleMessageEdit(serviceName.c_str(), ownerWebos.c_str(), serviceMessageId,
-			newText ? newText : "");
+			newText ? newText : "", true);
+}
+
+/*
+ * webOS: a prpl rewrote the text it gave for a message itself (tdlib-purple: a file's card, as the
+ * file the user tapped downloads). Stored in place as an edit is, but not marked edited: the app
+ * says "Edited" for the sender's edits only.
+ */
+static void im_replace_cb(PurpleAccount* account, const char* serviceMessageId, const char* newText, void* data)
+{
+	(void)data;
+	if (account == NULL || serviceMessageId == NULL || *serviceMessageId == '\0' || s_imServiceHandler == NULL)
+		return;
+	std::string const& serviceName = getServiceNameFromPurpleAccount(account);
+	std::string ownerWebos = getWebosUsername(account->username, serviceName, account);
+	s_imServiceHandler->handleMessageEdit(serviceName.c_str(), ownerWebos.c_str(), serviceMessageId,
+			newText ? newText : "", false);
 }
 
 /*
@@ -5183,6 +5202,19 @@ LibpurpleAdapter::SendResult LibpurpleAdapter::sendDelete(const char* serviceNam
 	return actionResult("sendDelete", serviceName, taken);
 }
 
+LibpurpleAdapter::SendResult LibpurpleAdapter::downloadFile(const char* serviceName, const char* username, const char* chat, const char* serviceMessageId)
+{
+	if (!serviceName || !username || !chat || !*chat || !serviceMessageId || !*serviceMessageId)
+		return LibpurpleAdapter::INVALID_PARAMS;
+	PurpleAccount* account = onlineAccount(serviceName, username);
+	if (account == NULL)
+		return LibpurpleAdapter::USER_NOT_LOGGED_IN;
+	std::string const purpleName = getPurpleUsername(chat, serviceName);
+	bool const taken = WebosSendSignals::downloadFile(purple_conversations_get_handle(), account,
+			purpleName.c_str(), serviceMessageId);
+	return actionResult("downloadFile", serviceName, taken);
+}
+
 LibpurpleAdapter::SendResult LibpurpleAdapter::createGroup(const char* serviceName, const char* username, const char* name, const char* membersJoined)
 {
 	if (!serviceName || !username || !name || !*name)
@@ -5823,6 +5855,16 @@ static void registerWebosReactionSignals()
 	purple_signal_connect(convHandle, "webos-im-edit", &webosHandle,
 			PURPLE_CALLBACK(im_edit_cb), NULL);
 
+	// the prpl's own rewrite of a message it gave (tdlib-purple: a file's card as it downloads):
+	// (account, serviceMessageId, newText), stored as an edit is but not marked edited.
+	purple_signal_register(convHandle, "webos-im-replace",
+			purple_marshal_VOID__POINTER_POINTER_POINTER, NULL, 3,
+			purple_value_new(PURPLE_TYPE_SUBTYPE, PURPLE_SUBTYPE_ACCOUNT),
+			purple_value_new(PURPLE_TYPE_STRING),
+			purple_value_new(PURPLE_TYPE_STRING));
+	purple_signal_connect(convHandle, "webos-im-replace", &webosHandle,
+			PURPLE_CALLBACK(im_replace_cb), NULL);
+
 	// "delete for everyone" (WhatsApp): a prpl emits (account, serviceMessageId) when the sender
 	// revokes a previously-sent message; DeleteHandler replaces the stored bubble's text in place.
 	purple_signal_register(convHandle, "webos-im-delete",
@@ -5879,7 +5921,7 @@ static void registerWebosReactionSignals()
 	purple_signal_connect(convHandle, ChannelOptions::CHANGED_SIGNAL, &webosHandle,
 			PURPLE_CALLBACK(channelsChangedCb), NULL);
 
-	MojLogInfo(IMServiceApp::s_log, _T("registered webos-im-reaction + webos-im-reaction-set + webos-im-outbox-id + webos-im-send-reaction + webos-im-send-poll-vote + edit/delete/group + channel option signals (early)"));
+	MojLogInfo(IMServiceApp::s_log, _T("registered webos-im-reaction + webos-im-reaction-set + webos-im-outbox-id + webos-im-send-reaction + webos-im-send-poll-vote + webos-im-replace + edit/delete/group/download + channel option signals (early)"));
 }
 
 void LibpurpleAdapter::assignIMLoginState(LoginCallbackInterface* loginState)

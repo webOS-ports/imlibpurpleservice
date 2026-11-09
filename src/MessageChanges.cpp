@@ -30,6 +30,18 @@ MojErr edited(const MojString& dbId, const MojString& newText, MojObject& out)
 	return MojErrNone;
 }
 
+MojErr replaced(const MojString& dbId, const MojString& newText, MojObject& out)
+{
+	MojErr err = out.putString(MOJDB_ID, dbId);       MojErrCheck(err);
+	err = out.putString(MOJDB_MSG_TEXT, newText);     MojErrCheck(err);
+	return MojErrNone;
+}
+
+MojErr textChanged(const MojString& dbId, const MojString& newText, bool bySender, MojObject& out)
+{
+	return bySender ? edited(dbId, newText, out) : replaced(dbId, newText, out);
+}
+
 MojErr deleted(const MojString& dbId, MojObject& out)
 {
 	MojErr err = out.putString(MOJDB_ID, dbId);       MojErrCheck(err);

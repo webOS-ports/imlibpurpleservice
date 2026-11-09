@@ -67,7 +67,7 @@ public:
 	// webOS: the sender edited a message they'd previously sent; update the stored bubble's text in place
 	// (found by serviceMessageId) instead of showing a separate "[EDIT]" message. See EditHandler.
 	virtual bool handleMessageEdit(const char* serviceName, const char* username, const char* serviceMessageId,
-			const char* newText);
+			const char* newText, bool bySender);
 	// webOS: the sender deleted a message they'd previously sent "for everyone"; replace the stored
 	// bubble's text with a placeholder in place (found by serviceMessageId). See DeleteHandler.
 	virtual bool handleMessageDelete(const char* serviceName, const char* username, const char* serviceMessageId);
