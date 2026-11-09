@@ -1543,7 +1543,7 @@ MojErr IMServiceHandler::IMSendCmd(MojServiceMessage* serviceMsg, const MojObjec
 bool IMServiceHandler::incomingIM(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp,
 		const char* channelName, const char* channelDisplayName, const char* serverId, const char* serverName, bool muted,
 		const char* usernameFromDisplay, const char* serviceMessageId,
-		const char* quotedMessageId, const char* quotedText, const char* quotedFrom, bool outgoing)
+		const char* quotedMessageId, const char* quotedText, const char* quotedFrom, bool outgoing, bool history)
 {
 
 	MojLogTrace(IMServiceApp::s_log);
@@ -1551,8 +1551,8 @@ bool IMServiceHandler::incomingIM(const char* serviceName, const char* username,
 	// log the parameters
 	// don't log the message text
 	// webOS Servers/Rooms: also log channel/server for multi-user-chat messages
-	MojLogInfo (IMServiceApp::s_log, _T("incomingIM - IM received. serviceName: %s username: %s usernameFrom: %s channel: %s server: %s muted: %d"),
-			serviceName, username, usernameFrom, channelName ? channelName : "", serverName ? serverName : "", muted);
+	MojLogInfo (IMServiceApp::s_log, _T("incomingIM - IM received. serviceName: %s username: %s usernameFrom: %s channel: %s server: %s muted: %d history: %d"),
+			serviceName, username, usernameFrom, channelName ? channelName : "", serverName ? serverName : "", muted, history);
 
 	// no error - process the IM
 	MojRefCountedPtr<IMMessage> imMessage(new IMMessage);
@@ -1561,6 +1561,11 @@ bool IMServiceHandler::incomingIM(const char* serviceName, const char* username,
 	// side, e.g. a muted Telegram chat) becomes flags.noNotification so the Messaging app stores
 	// the message but suppresses the notification banner.
 	MojErr err = imMessage->initFromCallback(serviceName, username, usernameFrom, message, timestamp, channelName, channelDisplayName, serverId, serverName, muted, usernameFromDisplay, outgoing);
+
+	// An old message from the history the prpl was given: stored read and without a banner.
+	if (!err) {
+		imMessage->setHistory(history);
+	}
 
 	// webOS reactions: remember the prpl's own id for this message so a later reaction can target it.
 	if (!err && serviceMessageId != NULL && *serviceMessageId != '\0') {

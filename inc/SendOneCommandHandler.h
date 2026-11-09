@@ -99,6 +99,8 @@ private:
 	LibpurpleAdapter::SendResult deleteMessage(const MojObject imCmd);
 	// A file the prpl offered, on a tap: synchronous too.
 	LibpurpleAdapter::SendResult downloadFile(const MojObject& imCmd);
+	// Older messages of a chat, asked for in the app: synchronous too.
+	LibpurpleAdapter::SendResult loadHistory(const MojObject& imCmd);
 	LibpurpleAdapter::SendResult createGroup(const MojObject imCmd);
 	LibpurpleAdapter::SendResult inviteToGroup(const MojObject imCmd);
 	LibpurpleAdapter::SendResult removeFromGroup(const MojObject imCmd);

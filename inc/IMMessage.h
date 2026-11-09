@@ -145,6 +145,8 @@ public:
 
 	// webOS reactions: set the prpl's own id for this message (persisted so a later reaction targets it).
 	MojErr setServiceMessageId(const char* id) { return serviceMessageId.assign(id ? id : ""); }
+	// An old message from the history the prpl was given (see MessageChanges::incomingFlags).
+	void setHistory(bool old) { history = old; }
 	// webOS replies: set the quoted-original this message replies to (id/text/sender).
 	MojErr setQuotedMessageId(const char* id) { return quotedMessageId.assign(id ? id : ""); }
 	MojErr setQuotedText(const char* t) { return quotedText.assign(t ? t : ""); }
@@ -186,6 +188,8 @@ private:
 	// the message is stored with flags.noNotification so the Messaging app suppresses the banner
 	// (the message still appears/counts as unread, matching native Telegram behaviour).
 	bool muted;
+	// history: an old message from the history the prpl was given -> stored read, without a banner.
+	bool history;
 
 };
 

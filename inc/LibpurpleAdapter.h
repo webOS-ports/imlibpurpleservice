@@ -89,10 +89,13 @@ public:
 	// routable id). Set for group messages on flat protocols (Telegram) so from.name shows the name while
 	// from.addr stays the id; NULL for 1:1 IMs and where usernameFrom is already the display name (Discord).
 	// `outgoing` = a carbon of a message we sent from another client -> stored as an Outbox row.
+	// `history` = an old message from the history the prpl was given (it marks the conversation
+	// "webos-msg-history" while it hands it on) -> stored as read and without a banner.
 	virtual bool incomingIM(const char* serviceName, const char* username, const char* usernameFrom, const char* message, time_t timestamp = 0,
 				const char* channelName = NULL, const char* channelDisplayName = NULL, const char* serverId = NULL, const char* serverName = NULL, bool muted = false,
 				const char* usernameFromDisplay = NULL, const char* serviceMessageId = NULL,
-				const char* quotedMessageId = NULL, const char* quotedText = NULL, const char* quotedFrom = NULL, bool outgoing = false) = 0;
+				const char* quotedMessageId = NULL, const char* quotedText = NULL, const char* quotedFrom = NULL, bool outgoing = false,
+				bool history = false) = 0;
 	// webOS reactions: `sender` reacted (emoji, or "" to remove) to the message the prpl identifies by
 	// `targetServiceMessageId`. Attaches to that message's `reactions` array (see ReactionHandler)
 	// rather than storing a new message. Cross-prpl: driven by the "webos-im-reaction" signal.
@@ -257,6 +260,11 @@ public:
 	// message's. Emits "webos-im-download-file"; the prpl rewrites the message as the file comes
 	// ("webos-im-replace"). SEND_FAILED when no prpl took it.
 	static SendResult downloadFile(const char *serviceName, const char *username, const char *chat, const char *serviceMessageId);
+	// The messages of chat before the oldest one the app has (serviceMessageId, its time as the app
+	// keeps it, whether we sent it). Emits "webos-im-load-history"; the prpl gives them as old
+	// messages. SEND_FAILED when no prpl took it.
+	static SendResult loadHistory(const char *serviceName, const char *username, const char *chat, const char *serviceMessageId,
+			const char *timestamp, bool outgoing);
 	// Groups (B4): create one with a name and members, add members to or remove them from one,
 	// rename one, leave one. Members are "\x1f"-joined buddy names as the app has them. Emits
 	// "webos-im-group-create", "-invite", "-remove", "-rename" and "-leave"; SEND_FAILED when no prpl took it. A new group appears as messages into it do.

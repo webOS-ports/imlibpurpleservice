@@ -410,3 +410,58 @@ TEST_F(Signals, DownloadFileNotTakenForAnotherAccount)
 	EXPECT_FALSE(WebosSendSignals::downloadFile(handle, Ours, "chat-100", "-100:7"));
 	EXPECT_EQ(1, others.calls);
 }
+
+namespace {
+gboolean history_cb(PurpleAccount* account, const char* chat, const char* id, const char* timestamp,
+		const char* outgoing, gpointer data)
+{
+	Seen* seen = static_cast<Seen*>(data);
+	seen->calls++;
+	seen->args = std::string(chat) + "|" + id + "|" + timestamp + "|" + outgoing;
+	return account == Ours;
+}
+} // namespace
+
+TEST(LoadHistory, TheOldestMessageOfTheCommand)
+{
+	// imcommand loadHistory: params { messageId, timestamp, outgoing }, as the app sends them.
+	MojObject params;
+	WebosSendSignals::HistoryAnchor anchor = WebosSendSignals::loadHistoryAnchor(params);
+	EXPECT_EQ("", anchor.messageId);
+	EXPECT_EQ("", anchor.timestamp);
+	EXPECT_FALSE(anchor.outgoing);
+
+	ASSERT_EQ(MojErrNone, params.putString(_T("messageId"), "3EB0ABCDEF"));
+	ASSERT_EQ(MojErrNone, params.put(_T("timestamp"), MojObject((MojInt64)1700000000123LL)));
+	ASSERT_EQ(MojErrNone, params.putBool(_T("outgoing"), true));
+	anchor = WebosSendSignals::loadHistoryAnchor(params);
+	EXPECT_EQ("3EB0ABCDEF", anchor.messageId);
+	EXPECT_EQ("1700000000123", anchor.timestamp) << "milliseconds, in decimal, as db8 keeps them";
+	EXPECT_TRUE(anchor.outgoing);
+
+	ASSERT_EQ(MojErrNone, params.putString(_T("timestamp"), "1700000000"));
+	EXPECT_EQ("1700000000", WebosSendSignals::loadHistoryAnchor(params).timestamp) << "a string of digits";
+	for (const char* bad : { "", "-5", "soon", "17e8" }) {
+		ASSERT_EQ(MojErrNone, params.putString(_T("timestamp"), bad));
+		EXPECT_EQ("", WebosSendSignals::loadHistoryAnchor(params).timestamp) << bad;
+	}
+	ASSERT_EQ(MojErrNone, params.put(_T("timestamp"), MojObject((MojInt64)-1)));
+	EXPECT_EQ("", WebosSendSignals::loadHistoryAnchor(params).timestamp) << "no time before 1970";
+}
+
+TEST_F(Signals, LoadHistoryIsItsOwnSignal)
+{
+	// The chat and the oldest message reach the prpl that owns the account, and no other signal.
+	Seen history = { 0, "" }, download = { 0, "" };
+	purple_signal_connect(handle, "webos-im-download-file", &owner, PURPLE_CALLBACK(three_cb), &download);
+	EXPECT_FALSE(WebosSendSignals::loadHistory(handle, Ours, "chat-100", "ID1", "1700000000123", false)) << "no prpl connected";
+	purple_signal_connect(handle, "webos-im-load-history", &owner, PURPLE_CALLBACK(history_cb), &history);
+	EXPECT_TRUE(WebosSendSignals::loadHistory(handle, Ours, "chat-100", "ID1", "1700000000123", false));
+	EXPECT_EQ("chat-100|ID1|1700000000123|0", history.args);
+	EXPECT_TRUE(WebosSendSignals::loadHistory(handle, Ours, "chat-100", "ID2", "1700000000", true));
+	EXPECT_EQ("chat-100|ID2|1700000000|1", history.args);
+	EXPECT_EQ(2, history.calls);
+	EXPECT_EQ(0, download.calls);
+	EXPECT_FALSE(WebosSendSignals::loadHistory(handle, Theirs, "chat-100", "ID1", "1700000000123", false)) << "not its account";
+	EXPECT_EQ(3, history.calls);
+}
