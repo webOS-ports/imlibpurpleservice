@@ -206,17 +206,42 @@ TEST(ChatMembers, DiscordAndTheRestAreNotOpened)
 	EXPECT_FALSE(ChatMembers::joinOpensMembers("prpl-discord", "1410895923755880"));
 	EXPECT_FALSE(ChatMembers::joinOpensMembers("prpl-eionrobb-discord", "1410895923755880"));
 	EXPECT_FALSE(ChatMembers::joinOpensMembers("prpl-irc", "#luneos"));
-	EXPECT_FALSE(ChatMembers::joinOpensMembers("prpl-gometa", "123"));
 	EXPECT_FALSE(ChatMembers::joinOpensMembers("", "chat-1"));
 	// A prefix of an allowed id is another prpl.
 	EXPECT_FALSE(ChatMembers::joinOpensMembers("prpl-telegram-x", "chat-1"));
 	EXPECT_FALSE(ChatMembers::joinOpensMembers("prpl-tele", "chat-1"));
 }
 
+// purple-combined's Facebook: join_chat opens the group and the members it knows are put on it.
+TEST(ChatMembers, FacebookGroupsAreOpenedForTheirMembers)
+{
+	EXPECT_TRUE(ChatMembers::joinOpensMembers("prpl-gometa", "1234567890123456"));
+	EXPECT_EQ(ChatMembers::OpenByJoin, ChatMembers::openWay("prpl-gometa", "1234567890123456", true, true));
+	EXPECT_EQ(ChatMembers::OpenByJoinDefaults, ChatMembers::openWay("prpl-gometa", "1234567890123456", false, true));
+	EXPECT_EQ(ChatMembers::DontOpen, ChatMembers::openWay("prpl-gometa", "Friends", false, true));
+	EXPECT_EQ(ChatMembers::DontOpen, ChatMembers::openWay("prpl-gometa", "1234567890123456", true, false));
+	EXPECT_FALSE(ChatMembers::joinOpensMembers("prpl-gometa-x", "1234567890123456"));
+}
+
+TEST(ChatMembers, FacebookDefaultsOnlyForAThreadKey)
+{
+	EXPECT_TRUE(ChatMembers::joinFromDefaults("prpl-gometa", "1"));
+	EXPECT_TRUE(ChatMembers::joinFromDefaults("prpl-gometa", "9223372036854775807"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-gometa", ""));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-gometa", "0"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-gometa", "01"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-gometa", "-1"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-gometa", "12345678901234567890"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-gometa", "12a"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-gometa", "Friends"));
+	EXPECT_FALSE(ChatMembers::joinFromDefaults("prpl-telegram", "1234567890123456"));
+}
+
 TEST(ChatMembers, NoChatNoJoin)
 {
 	EXPECT_FALSE(ChatMembers::joinOpensMembers("prpl-telegram", ""));
 	EXPECT_FALSE(ChatMembers::joinOpensMembers("prpl-hehoe-whatsmeow", ""));
+	EXPECT_FALSE(ChatMembers::joinOpensMembers("prpl-gometa", ""));
 }
 
 // How a chat with no conversation is opened (openWay): joined where the join only opens it,

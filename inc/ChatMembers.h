@@ -70,6 +70,9 @@ std::vector<Member> clean(const std::vector<Member>& members, const std::string&
  *  - prpl-hehoe-whatsmeow (purple-combined): gowhatsapp_enter_group_chat opens it and asks WhatsApp
  *    for the participants (GetGroupInfo), waiting for the answer. Not a Channel ("@newsletter"),
  *    whose join fetches its posts, nor "status@broadcast", which has no participants.
+ *  - prpl-gometa (purple-combined's Facebook): gometa_join_chat only opens the conversation; the
+ *    Go half then puts the members it has from Facebook's thread rows on it (gometa_go_chat_joined,
+ *    a moment later, as a queued message), and asks Facebook for nothing.
  * Not purple-discord: its join_chat fetches the channel's messages every time. Nor any other prpl.
  */
 bool joinOpensMembers(const std::string& protocolId, const std::string& chat);
@@ -89,6 +92,9 @@ bool joinOpensMembers(const std::string& protocolId, const std::string& chat);
  *    tgprpl_chat_info_defaults gives {id: chat}; tgprpl_chat_join opens it only from what tdlib
  *    already has, sending nothing, and reports chat-join-failed for one it does not know or is
  *    not a member of.
+ *  - prpl-gometa: a thread key, a positive decimal int64 (at most 19 digits, no leading zero).
+ *    gometa_chat_info_defaults gives {id: chat}; gometa_join_chat opens it, sending nothing, and
+ *    the Go half puts members on it only for a group it knows.
  */
 bool joinFromDefaults(const std::string& protocolId, const std::string& chat);
 

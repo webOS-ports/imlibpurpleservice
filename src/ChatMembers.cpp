@@ -97,6 +97,8 @@ bool joinOpensMembers(const std::string& protocolId, const std::string& chat)
 			return false;
 		return chat != "status@broadcast";
 	}
+	if (protocolId == "prpl-gometa")
+		return true;
 	return false;
 }
 
@@ -140,6 +142,12 @@ bool isTelegramChatName(const std::string& chat)
 	return chat.size() - from <= 19 && allDigits(chat, from, chat.size());
 }
 
+/* A Facebook thread key: a positive int64 in decimal, at most 19 digits. */
+bool isFacebookThreadKey(const std::string& chat)
+{
+	return !chat.empty() && chat.size() <= 19 && chat[0] != '0' && allDigits(chat, 0, chat.size());
+}
+
 } // namespace
 
 bool joinFromDefaults(const std::string& protocolId, const std::string& chat)
@@ -148,6 +156,8 @@ bool joinFromDefaults(const std::string& protocolId, const std::string& chat)
 		return isWhatsAppGroupJid(chat);
 	if (protocolId == "prpl-telegram")
 		return isTelegramChatName(chat);
+	if (protocolId == "prpl-gometa")
+		return isFacebookThreadKey(chat);
 	return false;
 }
 
