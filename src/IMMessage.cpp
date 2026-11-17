@@ -269,6 +269,16 @@ MojErr IMMessage::initFromCallback(const char* serviceName, const char* username
 			MojErrCheck(err);
 		}
 	}
+	// webOS Telegram: a 1:1 sender is a routable id ("id<userId>"); its name, the buddy's alias, comes
+	// as usernameFromDisplay and is the thread's name until the buddy is a contact. Only for
+	// Telegram: what the other services pass there for a 1:1 has not been tried as a thread name.
+	else if (!outgoing && serviceName != NULL && strcmp(serviceName, "type_telegram") == 0 &&
+	         usernameFromDisplay != NULL && *usernameFromDisplay != '\0') {
+		char *safeSender = encodeAstralEntities(usernameFromDisplay);
+		err = fromDisplayName.assign(safeSender ? safeSender : usernameFromDisplay);
+		if (safeSender) free(safeSender);
+		MojErrCheck(err);
+	}
 
 	return MojErrNone;
 }
