@@ -2593,6 +2593,20 @@ void incoming_message_cb(PurpleConversation* conv, const char* who, const char* 
 		}
 	}
 
+	// webOS Telegram: a 1:1 sender is the buddy "id<userId>", which is all the app has to show until
+	// the account's buddies are synced as contacts: not yet while logging in, when the login chat
+	// (buddy "id0", aliased "Telegram") asks for the code. Name the sender by the buddy's alias.
+	if (usernameFromDisplay == NULL && channelName == NULL && serviceName == "type_telegram")
+	{
+		PurpleBuddy* senderBuddy = purple_find_buddy(account, usernameFrom);
+		const char* senderAlias = senderBuddy ? purple_buddy_get_alias_only(senderBuddy) : NULL;
+		if (senderAlias && *senderAlias && strcmp(senderAlias, usernameFrom) != 0)
+		{
+			usernameFromDisplayBuf = senderAlias;
+			usernameFromDisplay = usernameFromDisplayBuf.c_str();
+		}
+	}
+
 	// call the transport service incoming message handler
 	// webOS Teams port: forward the libpurple message time (mtime, secs) so history/
 	// offline messages are stored with their original send time, not the arrival time.
