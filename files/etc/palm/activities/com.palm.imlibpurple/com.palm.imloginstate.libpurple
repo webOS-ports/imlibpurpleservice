@@ -5,7 +5,6 @@
 		"description": "Watch for changes to the imloginstate",
 		"type": {
           	"explicit":true,
-          	"power":true,
           	"foreground": true
         },
         "requirements": {

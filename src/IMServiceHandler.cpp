@@ -178,7 +178,9 @@ MojErr IMServiceHandler::init()
  * activitymanager cannot deliver a callback to a transport it did not launch, which is the case
  * under systemd.
  *
- * Additive: the activity is untouched, and handleLoginStateChange() tolerates no $activity.
+ * Additive: the activity still exists, and handleLoginStateChange() tolerates no $activity. It no
+ * longer declares power: nothing completes it, so activitymanager held the phone awake for its full
+ * 900 s each time it was created.
  */
 MojErr IMServiceHandler::subscribeLoginStateDirect()
 {
