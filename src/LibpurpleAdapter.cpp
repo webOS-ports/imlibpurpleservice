@@ -992,12 +992,37 @@ static void disableServerQueueForAccount(PurpleAccount* account)
 	}
 }
 
+/*
+ * webOS: tell a prpl that the user is idle while the display is off. Only Telegram so far:
+ * tdlib-purple then sets TDLib's "online" option false, as TDLib asks of a client nobody looks at;
+ * on a Q25 with the display off its connection had taken about 49 packets a minute. Discord and
+ * Teams are left out: their idle is what buddies see (Discord "idle", Teams an inactive endpoint,
+ * which may stop calls ringing here).
+ */
+static bool s_displayOff = false;
+
+static void setIdleForDisplay(PurpleAccount* account, bool idle)
+{
+	if (account == NULL || account->protocol_id == NULL || strcmp(account->protocol_id, "prpl-telegram") != 0)
+		return;
+
+	PurplePresence* presence = purple_account_get_presence(account);
+	if (presence == NULL)
+		return;
+
+	// The prpl is told how long the user has been idle, and 0 means not idle: idle starts a minute
+	// back.
+	purple_presence_set_idle(presence, idle ? TRUE : FALSE, idle ? time(NULL) - 60 : 0);
+}
+
 /**
  * Asking the gtalk server to enable/disable queueing of presence updates
  * This is called when the screen is turned off (enable:true) or turned on (enable:false)
  */
 bool LibpurpleAdapter::queuePresenceUpdates(bool enable)
 {
+	s_displayOff = enable;
+
 	typedef std::unordered_map<std::string, PurpleAccount*>::const_iterator
 		iter_type;
 
@@ -1006,6 +1031,8 @@ bool LibpurpleAdapter::queuePresenceUpdates(bool enable)
 		PurpleAccount* account = i->second;
 		if (account)
 		{
+			setIdleForDisplay(account, enable);
+
 			/*
 			 * enabling/disabling server queue is supported by gtalk (jabber) or aim
 			 */
@@ -1752,6 +1779,14 @@ static void account_logged_in_cb(PurpleConnection* gc, gpointer loginState)
 	s_pendingAccountData.erase(accountKey);
 
 	MojLogInfo(IMServiceApp::s_log, _T("Account connected..."));
+
+	// Signed on with the display off: a new connection starts active, and an account presence
+	// still idle from before it would not tell the prpl again, so clear it and set it anew.
+	if (s_displayOff)
+	{
+		setIdleForDisplay(loggedInAccount, false);
+		setIdleForDisplay(loggedInAccount, true);
+	}
 
 	// reply with login success
 	if (loginState)
